@@ -65,8 +65,15 @@ PLAN_SYSTEM = """你是 EvoMind 的学习规划器。你的任务不是复述已
 规则：
 1. 先看「已掌握知识」，任何已被覆盖的内容都不要再搜。
 2. 缺口要具体：从「概念定义」推进到「机制原理 / 量化数据 / 边界条件 / 工程实践 / 最新进展 / 争议点」。
-3. 检索式要像真正的搜索词，不要写成问句长句。中英文混合，各自发挥优势。
-4. 每轮必须比上一轮更深一层，禁止与「历史检索式」重复。"""
+3. 每轮必须比上一轮更深一层，禁止与「历史检索式」重复。
+4. **queries 里的每条检索式必须用英文书写**（专有名词保持原样，如 ZBrush / DynaMesh / SLA）。
+   所有高质量检索源（arXiv、GitHub、StackExchange、HuggingFace）都是英文索引，
+   中文检索式命中率极低，只会拿回产品页和安装教程。
+   正确：「ZBrush DynaMesh polygon count tradeoff」，错误：「ZBrush 面数取舍怎么选」。
+5. gaps 和 focus 用中文写（给人看），queries 用英文写（给搜索引擎看）。
+6. 避开产品介绍、安装教程、购买链接这类无信息量的检索角度。
+7. 优先能搜到「具体参数和判据」的角度，比如 minimum wall thickness、layer height limit、
+   shrinkage compensation、polygon budget、resolution limit。"""
 
 PLAN_USER = """## 学习方向
 {direction}
@@ -154,6 +161,7 @@ class Engine:
         self._used_queries: list[str] = []
         self._visited: set[str] = set()
         self._gaps: list[str] = []
+        self._sources: list[str] | None = None
 
     # ---------------- 对外接口 ----------------
     def start(self, direction: str, rounds: int | None = None) -> dict:
@@ -167,6 +175,12 @@ class Engine:
         self._used_queries = []
         self._visited = set()
         self._gaps = []
+        # 按「方向」判断要不要查 arXiv。软件操作、工艺参数这类方向查 arXiv
+        # 只会拿回同名但不同义的论文（比如 ZBrush 的 DynaMesh vs 学术的 DynaMesh）。
+        if search.should_use_arxiv(direction):
+            self._sources = None  # 用默认全套
+        else:
+            self._sources = [s for s in search.DEFAULT_SOURCES if s != "arxiv"]
         sid = memory.start_session(direction)
         self.state.update(
             running=True, direction=direction, session_id=sid, round=0,
@@ -356,32 +370,101 @@ class Engine:
 
     def _search_all(self, queries: list[str]) -> list[dict]:
         all_results: list[dict] = []
+        srcs = self._sources
 
         def one(q: str) -> list[dict]:
             try:
-                return search.search(q, limit=10)
+                return search.search(q, limit=10, sources=srcs)
             except Exception:
                 return []
+
+        self._emit("info", "检索式：" + " ｜ ".join(queries))
 
         with ThreadPoolExecutor(max_workers=min(4, len(queries))) as ex:
             for res in ex.map(one, queries):
                 all_results.extend(res)
+
+        # 把各源命中数打出来，检索源失效时能一眼看出来
+        from collections import Counter
+
+        cnt = Counter(r.get("source", "?") for r in all_results)
+        if cnt:
+            detail = " ".join(f"{k}×{v}" for k, v in cnt.most_common())
+            self._emit("info", f"各源命中：{detail}")
+        else:
+            self._emit("warn", "所有检索源都返回空（大概率被限流），本轮没有新资料")
+
         return search.dedupe(all_results)
 
     def _pick_targets(self, results: list[dict]) -> list[dict]:
+        """先做基础过滤，再让模型从候选里挑真正值得读的。
+
+        没有这道预筛，检索到的产品页、安装教程、新闻会把抓取配额占满，
+        提炼阶段全是无关内容，最后一条知识都入不了库。
+        """
         limit = int(config.get("fetch_per_round", 8))
-        picked: list[dict] = []
+        candidates: list[dict] = []
         for r in results:
             url = r.get("url", "")
             if not url or url in self._visited or memory.doc_seen(url):
                 continue
-            # 跳过明显无正文的
-            if any(x in url for x in (".pdf", ".zip", ".png", ".jpg", "/login", "/signup")):
+            if any(x in url for x in (".pdf", ".zip", ".png", ".jpg", ".jpeg",
+                                      "/login", "/signup", "/cart", "/pricing")):
                 continue
-            picked.append(r)
-            if len(picked) >= limit:
-                break
-        return picked
+            candidates.append(r)
+
+        if not candidates:
+            return []
+        if len(candidates) <= 3:
+            return candidates[:limit]
+
+        # 候选多于配额时，用模型判断哪些真的对得上
+        listing = []
+        for i, r in enumerate(candidates[:24], 1):
+            title = (r.get("title") or "")[:80]
+            snip = (r.get("snippet") or "")[:110]
+            listing.append(f"{i}. [{r.get('source','')}] {title} | {snip}")
+
+        try:
+            verdict = llm.chat_json(
+                "你是资料筛选器。判断候选资料是否真的有助于理解给定学习方向。\n"
+                "优先保留：讲原理、给具体参数/数值、有判据或对比的内容。\n"
+                "坚决排除：产品介绍页、购买/下载页、安装教程、新闻通稿、"
+                "纯目录页、与方向只是关键词巧合命中的内容。\n"
+                '输出 JSON: {"pick": [编号, ...], "why": "一句话"}',
+                f"## 学习方向\n{self.state.get('direction','')}\n\n"
+                f"## 本轮重点\n{self.state.get('focus','')}\n\n"
+                f"## 候选资料\n" + "\n".join(listing) +
+                f"\n\n挑出最多 {limit} 条最值得读的，按有用程度排序。宁缺毋滥。",
+                temperature=0.1,
+            )
+            idxs = verdict.get("pick") or []
+            picked = []
+            for i in idxs:
+                try:
+                    n = int(i)
+                except Exception:
+                    continue
+                if 1 <= n <= len(candidates):
+                    item = candidates[n - 1]
+                    if item not in picked:
+                        picked.append(item)
+                if len(picked) >= limit:
+                    break
+            if picked:
+                self._emit(
+                    "info",
+                    f"预筛：{len(candidates)} 条候选 → 选出 {len(picked)} 条值得读的",
+                    picked=[p.get("title", "")[:60] for p in picked[:4]],
+                )
+                return picked
+            self._emit("warn", f"预筛判定 {len(candidates)} 条候选都不够相关，本轮跳过抓取")
+            return []
+        except Exception as e:  # noqa: BLE001
+            self._emit("warn", f"预筛失败（{str(e)[:60]}），按原顺序取前 {limit} 条")
+
+        # 预筛失败就退回原始顺序
+        return candidates[:limit]
 
     def _fetch_all(self, targets: list[dict]) -> list[dict]:
         def one(t: dict) -> dict:

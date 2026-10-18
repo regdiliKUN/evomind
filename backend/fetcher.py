@@ -61,9 +61,81 @@ def _github_readme(url: str) -> str:
     return ""
 
 
+def _html_to_text(html: str) -> str:
+    if not html:
+        return ""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        return _clean(soup.get_text("\n", strip=True))
+    except Exception:
+        return _clean(re.sub(r"<[^>]+>", " ", html))
+
+
+def _stackexchange_fetch(url: str) -> Doc | None:
+    """StackExchange 有 Cloudflare 保护，直接抓 HTML 会被拦。
+
+    改走开放 API：拿问题正文 + 前几条高票答案，内容质量比抓页面还好。
+    """
+    m = re.search(r"https?://([a-z0-9]+)\.stackexchange\.com/questions/(\d+)", url)
+    if not m:
+        return None
+    site, qid = m.group(1), m.group(2)
+    try:
+        with _client(25) as c:
+            r = c.get(
+                f"https://api.stackexchange.com/2.3/questions/{qid}",
+                params={"site": site, "filter": "withbody"},
+            )
+            if r.status_code != 200:
+                return None
+            items = (r.json() or {}).get("items") or []
+            if not items:
+                return None
+            q = items[0]
+            title = q.get("title", "")
+            parts = [f"# {title}", _html_to_text(q.get("body", ""))]
+
+            ra = c.get(
+                f"https://api.stackexchange.com/2.3/questions/{qid}/answers",
+                params={
+                    "site": site,
+                    "filter": "withbody",
+                    "sort": "votes",
+                    "order": "desc",
+                    "pagesize": 3,
+                },
+            )
+            if ra.status_code == 200:
+                for a in (ra.json() or {}).get("items") or []:
+                    body = _html_to_text(a.get("body", ""))
+                    if len(body) > 60:
+                        parts.append(f"## 回答（{a.get('score', 0)} 赞）\n{body}")
+
+            text = _clean("\n\n".join(p for p in parts if p))
+            if len(text) < 120:
+                return None
+            return {
+                "ok": True,
+                "url": url,
+                "title": title or url,
+                "text": text[:MAX_CHARS],
+                "error": "",
+            }
+    except Exception:
+        return None
+
+
 def fetch(url: str) -> Doc:
     """抓取单页并提取正文。返回 {ok, url, title, text, error}。"""
     doc: Doc = {"ok": False, "url": url, "title": "", "text": "", "error": ""}
+
+    # StackExchange 问答：走 API
+    if "stackexchange.com/questions/" in url:
+        got = _stackexchange_fetch(url)
+        if got:
+            return got
+        doc["error"] = "StackExchange API 未返回内容"
+        return doc
 
     # arXiv 摘要页
     if "arxiv.org/abs/" in url:

@@ -280,6 +280,15 @@
             <label class="field"><span>每轮检索式数量</span><input id="cfg-qpr" type="number" min="1" max="8" /></label>
             <label class="field"><span>每轮抓取网页数</span><input id="cfg-fpr" type="number" min="1" max="20" /></label>
             <label class="field"><span>知识点入库最低相关度</span><input id="cfg-rel" type="number" step="0.05" min="0" max="1" /></label>
+            <label class="field">
+              <span>Brave 搜索 API Key（可选，强烈建议填）</span>
+              <input id="cfg-search-key" placeholder="留空则只用免 Key 源（质量差一些）" />
+            </label>
+            <div class="hint" style="margin-top:-6px">
+              国内网络下通用搜索引擎会被反爬污染。填一个 Brave Key（免费 2000 次/月，
+              <a href="https://brave.com/search/api/" target="_blank" rel="noreferrer" style="color:#7ba7ee">申请地址</a>）
+              能明显提升检索质量，尤其是 ZBrush 这类软件操作方向。
+            </div>
           </div>
           <div class="card">
             <div class="card-title">资源下载</div>

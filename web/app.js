@@ -607,6 +607,7 @@ async function fillSettings() {
     $("#cfg-auto").value = cfg.auto_download ? "1" : "0";
     $("#cfg-hf").value = cfg.hf_endpoint || "";
     $("#cfg-proxy").value = cfg.proxy || "";
+    $("#cfg-search-key").value = cfg.search_api_key || "";
   } catch (e) {
     toast("设置加载失败：" + e.message, "err");
   }
@@ -627,6 +628,7 @@ $("#btn-save-cfg").addEventListener("click", async () => {
         auto_download: $("#cfg-auto").value === "1",
         hf_endpoint: $("#cfg-hf").value.trim(),
         proxy: $("#cfg-proxy").value.trim(),
+        search_api_key: $("#cfg-search-key").value.trim(),
       },
     });
     toast("设置已保存", "ok");

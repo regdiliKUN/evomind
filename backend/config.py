@@ -56,6 +56,10 @@ DEFAULTS: dict[str, Any] = {
     "request_timeout": 20,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
     "proxy": "",                     # 可选，如 http://127.0.0.1:7890
+    # Brave Search API Key（可选）。国内网络下通用搜索引擎会被反爬污染，
+    # 填一个免费 Key（2000 次/月）能显著提升检索质量。
+    "search_api_key": "",
+    "hf_endpoint": "",               # 可选 HF 镜像，如 https://hf-mirror.com
 }
 
 _lock = threading.RLock()
