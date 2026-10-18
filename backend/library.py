@@ -403,12 +403,38 @@ def parse_pdf(p: Path) -> dict:
 
     r = PdfReader(str(p))
     pages = len(r.pages)
-    texts = []
-    empty = 0
-    for pg in r.pages:
+    if not pages:
+        return {"text": "", "pages": 0, "chars": 0, "text_ratio": 0.0, "scanned": True}
+
+    # 先采样前几页判断有没有文字层。
+    # 画集/扫描版整本都没文字，逐页解析 359MB 的图集要十几分钟、吃掉几个 G 内存，
+    # 期间进度一直是 0，看起来就像卡死了。采样几页就能定性。
+    sample_n = min(8, pages)
+    sample: list[str] = []
+    for i in range(sample_n):
         try:
-            t = pg.extract_text() or ""
-        except Exception:
+            sample.append(r.pages[i].extract_text() or "")
+        except Exception:  # noqa: BLE001
+            sample.append("")
+    sample_ratio = sum(len(t.strip()) for t in sample) / sample_n
+
+    if sample_ratio < MIN_CHARS_PER_PAGE:
+        # 采样就判定没文字，剩余页不必再看
+        return {
+            "text": "",
+            "pages": pages,
+            "chars": 0,
+            "text_ratio": round(sample_ratio, 1),
+            "scanned": True,
+        }
+
+    # 采样有文字，说明是文字版，才值得解析全书
+    texts = sample
+    empty = sum(1 for t in sample if len(t.strip()) < 10)
+    for i in range(sample_n, pages):
+        try:
+            t = r.pages[i].extract_text() or ""
+        except Exception:  # noqa: BLE001
             t = ""
         if len(t.strip()) < 10:
             empty += 1
@@ -776,8 +802,17 @@ def parse_books_async(book_ids: list[str], *, on_event: Event | None = None) -> 
     def go() -> None:
         _task.update(running=True, kind="parse", total=len(ids), done=0,
                      stage="parsing", points=0, stop=False, current="")
+        # 按体积升序：小书先跑，进度很快就能动起来。
+        # 一上来就啃 300MB 的图集，看起来像卡死，实际在慢慢解析。
+        def _size(bid: str) -> int:
+            row = memory.conn().execute(
+                "SELECT size_bytes FROM books WHERE id=?", (bid,)
+            ).fetchone()
+            return row["size_bytes"] or 0 if row else 0
+
+        ordered = sorted(ids, key=_size)
         ok = scan = bad = 0
-        for i, bid in enumerate(ids):
+        for i, bid in enumerate(ordered):
             if _task["stop"]:
                 _emit(on_event, "warn", "收到停止指令，中断解析")
                 break
@@ -841,8 +876,15 @@ def import_books_async(
     def go() -> None:
         _task.update(running=True, kind="import", total=len(book_ids), done=0,
                      stage="importing", points=0, stop=False, current="")
+        # 同样按体积升序，避免第一本是大图集导致进度长时间停在 0
+        def _size(bid: str) -> int:
+            row = memory.conn().execute(
+                "SELECT size_bytes FROM books WHERE id=?", (bid,)
+            ).fetchone()
+            return row["size_bytes"] or 0 if row else 0
+
         total_pts = 0
-        for i, bid in enumerate(book_ids):
+        for i, bid in enumerate(sorted(book_ids, key=_size)):
             if _task["stop"]:
                 _emit(on_event, "warn", "收到停止指令，中断导入")
                 break
