@@ -12,7 +12,7 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, downloader, evolve, finetune, llm, memory, scheduler
+from . import config, downloader, evolve, finetune, library, llm, memory, scheduler
 
 app = FastAPI(title="EvoMind", version="1.0.0")
 
@@ -322,15 +322,139 @@ def api_models_use(body: dict = Body(...)) -> dict:
     return config.update({"model": name})
 
 
+# --------------------------------------------------------------------------
+# 本地书库
+# --------------------------------------------------------------------------
+def _lib_evt(lv: str, msg: str, payload: dict) -> None:
+    evolve.bus.publish({"level": lv, "msg": msg, **payload})
+
+
+@app.get("/api/library/stats")
+def api_lib_stats() -> dict:
+    return {"stats": library.library_stats(), "task": library.state()}
+
+
+@app.get("/api/library/dirs")
+def api_lib_dirs() -> list[dict]:
+    return library.list_dirs()
+
+
+@app.post("/api/library/dirs")
+def api_lib_add_dir(body: dict = Body(...)) -> dict:
+    path = (body.get("path") or "").strip().strip('"')
+    if not path:
+        raise HTTPException(400, "缺少目录路径")
+    return library.add_dir(
+        path,
+        body.get("label") or "",
+        body.get("excludes") if isinstance(body.get("excludes"), list) else None,
+    )
+
+
+@app.patch("/api/library/dirs/{did}")
+def api_lib_update_dir(did: str, body: dict = Body(...)) -> dict:
+    return library.update_dir(did, **body)
+
+
+@app.delete("/api/library/dirs/{did}")
+def api_lib_del_dir(did: str, purge: bool = False) -> dict:
+    return library.remove_dir(did, purge)
+
+
+@app.post("/api/library/scan")
+def api_lib_scan(body: dict = Body(default={})) -> dict:
+    dirs = (body or {}).get("dirs") or None
+    return library.scan(dirs, on_event=_lib_evt)
+
+
+@app.get("/api/library/books")
+def api_lib_books(
+    status: str | None = None,
+    dir_id: str | None = None,
+    fmt: str | None = None,
+    q: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> dict:
+    return library.list_books(
+        status=status, dir_id=dir_id, fmt=fmt, q=q, limit=limit, offset=offset
+    )
+
+
+@app.get("/api/library/books/{bid}")
+def api_lib_book(bid: str) -> dict:
+    d = library.book_detail(bid)
+    if not d:
+        raise HTTPException(404, "书目不存在")
+    return d
+
+
+@app.post("/api/library/books/{bid}/parse")
+def api_lib_parse(bid: str) -> dict:
+    return library.parse_book(bid, on_event=_lib_evt)
+
+
+@app.post("/api/library/import")
+def api_lib_import(body: dict = Body(...)) -> dict:
+    ids = body.get("book_ids") or []
+    if not ids:
+        raise HTTPException(400, "请选择要导入的书")
+    return library.import_books_async(
+        ids,
+        topic=(body.get("topic") or "").strip(),
+        max_chunks=int(body.get("max_chunks") or library.MAX_CHUNKS_PER_BOOK),
+        on_event=_lib_evt,
+    )
+
+
+@app.post("/api/library/import-url")
+def api_lib_import_url(body: dict = Body(...)) -> dict:
+    url = (body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(400, "缺少链接")
+    return library.import_url(url, (body.get("topic") or "").strip(), on_event=_lib_evt)
+
+
+@app.get("/api/library/state")
+def api_lib_state() -> dict:
+    return library.state()
+
+
+@app.post("/api/library/stop")
+def api_lib_stop() -> dict:
+    return library.stop_task()
+
+
+@app.delete("/api/library/books/{bid}")
+def api_lib_del_book(bid: str, purge_points: bool = False) -> dict:
+    return library.delete_book(bid, purge_points)
+
+
 @app.on_event("startup")
 def _startup() -> None:
     memory.log_event("boot", "EvoMind 启动")
+    try:
+        library.init_db()
+    except Exception:
+        pass
     if not llm.healthy():
         memory.log_event("warn", "Ollama 未运行")
     try:
         scheduler.start_auto_if_needed()
     except Exception:
         pass
+
+    # 后台预热 ZBrushCentral 的主题索引（首次要拉十几页，别让用户等）
+    def _warm() -> None:
+        try:
+            from . import search as _s
+
+            n = len(_s._load_zbc_topics())
+            memory.log_event("info", f"ZBrushCentral 索引就绪：{n} 个主题")
+        except Exception:
+            pass
+
+    threading.Thread(target=_warm, daemon=True).start()
 
 
 def run(host: str = "127.0.0.1", port: int = 8765) -> None:

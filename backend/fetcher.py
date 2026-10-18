@@ -125,6 +125,47 @@ def _stackexchange_fetch(url: str) -> Doc | None:
         return None
 
 
+def _discourse_fetch(url: str) -> Doc | None:
+    """Discourse 论坛（ZBrushCentral 等）：走 .json 端点拿结构化楼层。
+
+    比抓 HTML 干净得多 —— 直接拿到每层楼的 cooked HTML，不用猜正文在哪。
+    robots.txt 未禁止 /t/ 路径，属于允许范围。
+    """
+    base = url.split("?")[0].rstrip("/")
+    if base.endswith(".json"):
+        base = base[:-5]
+    try:
+        with _client(25) as c:
+            r = c.get(base + ".json")
+            if r.status_code != 200:
+                return None
+            j = r.json()
+            title = j.get("title", "")
+            posts = (j.get("post_stream") or {}).get("posts") or []
+            if not posts:
+                return None
+
+            parts = [f"# {title}"]
+            for p in posts[:6]:
+                body = _html_to_text(p.get("cooked", ""))
+                if len(body) > 80:
+                    n = p.get("post_number", "?")
+                    parts.append(f"## 楼层 {n}\n{body}")
+
+            text = _clean("\n\n".join(parts))
+            if len(text) < 120:
+                return None
+            return {
+                "ok": True,
+                "url": url,
+                "title": title or url,
+                "text": text[:MAX_CHARS],
+                "error": "",
+            }
+    except Exception:
+        return None
+
+
 def fetch(url: str) -> Doc:
     """抓取单页并提取正文。返回 {ok, url, title, text, error}。"""
     doc: Doc = {"ok": False, "url": url, "title": "", "text": "", "error": ""}
@@ -135,6 +176,14 @@ def fetch(url: str) -> Doc:
         if got:
             return got
         doc["error"] = "StackExchange API 未返回内容"
+        return doc
+
+    # Discourse 论坛（ZBrushCentral 等）：走 .json
+    if "zbrushcentral.com/t/" in url:
+        got = _discourse_fetch(url)
+        if got:
+            return got
+        doc["error"] = "Discourse JSON 未返回内容"
         return doc
 
     # arXiv 摘要页

@@ -22,6 +22,7 @@
       <div class="nav-item active" data-view="dashboard"><span class="ico">◈</span>总览</div>
       <div class="nav-item" data-view="learn"><span class="ico">◐</span>自主进化</div>
       <div class="nav-item" data-view="knowledge"><span class="ico">▤</span>知识库</div>
+      <div class="nav-item" data-view="library"><span class="ico">▦</span>书库</div>
       <div class="nav-item" data-view="resources"><span class="ico">⤓</span>资源获取</div>
       <div class="nav-item" data-view="finetune"><span class="ico">⚙</span>权重进化</div>
       <div class="nav-item" data-view="chat"><span class="ico">✎</span>检验所学</div>
@@ -179,6 +180,80 @@
           </div>
         </div>
         <div class="list" id="kb-list"><div class="empty">暂无知识点</div></div>
+      </section>
+
+      <!-- ---------- 书库 ---------- -->
+      <section class="view" id="view-library">
+        <div class="grid g4" style="margin-bottom:16px">
+          <div class="stat">
+            <div class="k">书库目录</div>
+            <div class="v" id="lib-dirs">0</div>
+            <div class="s">可添加多个</div>
+          </div>
+          <div class="stat">
+            <div class="k">已登记书目</div>
+            <div class="v" id="lib-books">0</div>
+            <div class="s" id="lib-pending">待解析 0</div>
+          </div>
+          <div class="stat">
+            <div class="k">已导入</div>
+            <div class="v" id="lib-done">0</div>
+            <div class="s" id="lib-skipped">跳过 0</div>
+          </div>
+          <div class="stat">
+            <div class="k">书中知识点</div>
+            <div class="v" id="lib-points">0</div>
+            <div class="s">已进入知识库</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">书库目录<span class="tag">可多个</span></div>
+          <div class="rowflex" style="margin-bottom:12px">
+            <input id="lib-path" placeholder="目录路径，例如 K:\书籍\我的电子书库" />
+            <input id="lib-excludes" placeholder="排除关键词（逗号分隔）" value="成人" style="max-width:200px" />
+            <button class="btn" id="btn-lib-add">添加目录</button>
+          </div>
+          <div class="list" id="lib-dir-list"><div class="empty">还没有添加目录</div></div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">导入操作</div>
+          <div class="rowflex" style="flex-wrap:wrap;margin-bottom:12px">
+            <button class="btn primary" id="btn-lib-scan">扫描目录</button>
+            <input id="lib-topic" placeholder="导入到哪个学习方向（留空用书名）" style="flex:1;min-width:220px" />
+            <button class="btn" id="btn-lib-import" disabled>导入选中（0）</button>
+            <button class="btn danger" id="btn-lib-stop" disabled>停止</button>
+          </div>
+          <div class="rowflex" style="flex-wrap:wrap">
+            <input id="lib-url" placeholder="或粘贴一个链接（网页 / PDF / EPUB 直链）" style="flex:1;min-width:260px" />
+            <button class="btn" id="btn-lib-url">从链接导入</button>
+          </div>
+          <div class="hint" id="lib-task-hint">
+            扫描只是登记书目，不会解析内容。选好书再点「导入选中」才会真正提炼入库。
+          </div>
+          <div class="bar" style="display:none" id="lib-bar-wrap"><i id="lib-bar" style="width:0%"></i></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            书目清单
+            <span class="tag" id="lib-total">0</span>
+            <div class="rowflex" style="margin-left:auto;gap:8px">
+              <select id="lib-filter" style="width:auto;padding:5px 9px;font-size:12px">
+                <option value="">全部状态</option>
+                <option value="pending">待解析</option>
+                <option value="ready">可导入</option>
+                <option value="done">已导入</option>
+                <option value="skipped">已跳过</option>
+                <option value="failed">失败</option>
+              </select>
+              <input id="lib-search" placeholder="搜索书名" style="width:180px;padding:5px 9px;font-size:12px" />
+              <button class="btn sm" id="btn-lib-selectall">全选可导入</button>
+            </div>
+          </div>
+          <div class="list scroll-y" id="lib-book-list"><div class="empty">还没有扫描到书目</div></div>
+        </div>
       </section>
 
       <!-- ---------- 资源 ---------- -->

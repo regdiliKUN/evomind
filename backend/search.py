@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import re
+import threading
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -358,6 +360,102 @@ def search_stackexchange(query: str, limit: int = 6, site: str | None = None) ->
 
 
 # --------------------------------------------------------------------------
+# ZBrushCentral（Discourse 论坛）：ZBrush 操作知识的核心来源
+# --------------------------------------------------------------------------
+# 合规说明：
+#   - robots.txt 只禁了 /search、/c/*.rss、/u/、/my，未禁 /c/{id}.json 与 /t/ 路径
+#   - 因此这里走「分类主题列表 + 帖子页」，不碰站内搜索和 RSS
+#   - 主题列表本地缓存 30 分钟，避免重复请求
+_ZBC_CATEGORIES = [
+    ("zbrush-usage-questions", 6, 10),   # 4.5 万主题，技术问答主阵地
+    ("zscripting-help", 14, 4),          # 脚本与 API
+]
+_zbc_cache: dict[str, Any] = {"ts": 0.0, "topics": []}
+_zbc_lock = threading.Lock()
+ZBC_BASE = "https://www.zbrushcentral.com"
+
+
+def _load_zbc_topics(max_age: float = 1800.0) -> list[dict]:
+    with _zbc_lock:
+        if _zbc_cache["topics"] and (time.time() - _zbc_cache["ts"]) < max_age:
+            return _zbc_cache["topics"]
+
+        topics: list[dict] = []
+        with httpx.Client(
+            timeout=20, headers=_headers(), follow_redirects=True,
+            proxy=config.get("proxy") or None, trust_env=False,
+        ) as c:
+            for slug, cid, pages in _ZBC_CATEGORIES:
+                for page in range(pages):
+                    try:
+                        r = c.get(
+                            f"{ZBC_BASE}/c/{slug}/{cid}.json",
+                            params={"page": page},
+                        )
+                        if r.status_code != 200:
+                            break
+                        data = r.json()
+                        batch = data.get("topic_list", {}).get("topics", [])
+                        if not batch:
+                            break
+                        topics.extend(batch)
+                    except Exception:
+                        break
+        _zbc_cache["topics"] = topics
+        _zbc_cache["ts"] = time.time()
+        return topics
+
+
+def search_zbrushcentral(query: str, limit: int = 8) -> list[Result]:
+    """在 ZBrushCentral 的本地主题索引里按标题匹配。
+
+    不调用站内搜索（robots 禁止），改为拉分类列表后本地过滤。
+    """
+    out: list[Result] = []
+    try:
+        topics = _load_zbc_topics()
+    except Exception:
+        return out
+    if not topics:
+        return out
+
+    kws = _en_tokens(query)
+    # 中文查询词也要参与匹配（论坛标题以英文为主，但偶有中文）
+    kws |= {w for w in re.findall(r"[\u4e00-\u9fa5]{2,}", query)}
+
+    scored: list[tuple[int, dict]] = []
+    for t in topics:
+        title = (t.get("title") or "").lower()
+        if not title:
+            continue
+        hit = sum(1 for k in kws if k in title)
+        if hit:
+            scored.append((hit, t))
+    if not scored:
+        return out
+
+    # 命中词多的优先，其次看回复数（有讨论说明有答案）
+    scored.sort(key=lambda x: (-x[0], -(x[1].get("posts_count") or 0)))
+
+    for _, t in scored[:limit]:
+        tid = t.get("id")
+        slug = t.get("slug") or "topic"
+        out.append(
+            {
+                "title": t.get("title", ""),
+                "url": f"{ZBC_BASE}/t/{slug}/{tid}",
+                "snippet": (
+                    f"ZBrushCentral · {t.get('posts_count', 0)} 回复"
+                    + (f" · {t.get('views', 0)} 浏览" if t.get("views") else "")
+                ),
+                "source": "zbrushcentral",
+                "kind": "qa",
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
 # Brave Search API（需 Key，但质量最好，免费额度 2000 次/月）
 # --------------------------------------------------------------------------
 def search_brave(query: str, limit: int = 10) -> list[Result]:
@@ -415,6 +513,7 @@ def should_use_arxiv(query: str) -> bool:
 SOURCES = {
     "brave": search_brave,
     "se": search_stackexchange,
+    "zbc": search_zbrushcentral,
     "arxiv": search_arxiv,
     "github": search_github,
     "wiki": search_wiki,
@@ -423,7 +522,7 @@ SOURCES = {
 }
 
 # 主力源。通用搜索（bing/web）在国内网络下容易被反爬污染，放最后兜底。
-DEFAULT_SOURCES = ["brave", "se", "arxiv", "github", "wiki"]
+DEFAULT_SOURCES = ["brave", "se", "zbc", "arxiv", "github", "wiki"]
 
 
 def search(

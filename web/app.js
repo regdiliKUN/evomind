@@ -53,6 +53,7 @@ const TITLES = {
   dashboard: "总览",
   learn: "自主进化",
   knowledge: "知识库",
+  library: "书库",
   resources: "资源获取",
   finetune: "权重进化",
   chat: "检验所学",
@@ -67,6 +68,7 @@ function switchView(v, fromHash) {
   $$(".view").forEach((s) => s.classList.toggle("active", s.id === "view-" + v));
   $("#page-title").textContent = TITLES[v] || v;
   if (v === "knowledge") loadKnowledge();
+  if (v === "library") loadLibrary();
   if (v === "resources") loadResources();
   if (v === "finetune") loadFinetune();
   if (v === "dashboard") loadDashboard();
@@ -393,6 +395,272 @@ $("#kb-search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("#btn-kb-search").click();
 });
 $("#kb-topic").addEventListener("change", () => loadKnowledge());
+
+/* ---------------- 书库 ---------------- */
+let libSelected = new Set();
+let libPoll = null;
+
+const BOOK_STATUS = {
+  pending: ["待解析", "var(--text-dim)"],
+  parsing: ["解析中", "var(--accent)"],
+  ready: ["可导入", "var(--green)"],
+  importing: ["导入中", "var(--accent)"],
+  done: ["已导入", "var(--green)"],
+  skipped: ["已跳过", "var(--amber)"],
+  failed: ["失败", "var(--red)"],
+};
+
+async function loadLibrary() {
+  try {
+    const [st, dirs] = await Promise.all([
+      api("/api/library/stats"),
+      api("/api/library/dirs"),
+    ]);
+    const s = st.stats;
+    $("#lib-dirs").textContent = s.dirs;
+    $("#lib-books").textContent = s.books;
+    $("#lib-pending").textContent = `待解析 ${s.pending}`;
+    $("#lib-done").textContent = s.done;
+    $("#lib-skipped").textContent = `跳过 ${s.skipped}`;
+    $("#lib-points").textContent = s.points;
+    renderLibDirs(dirs);
+    await loadLibBooks();
+    paintLibTask(st.task);
+  } catch (e) {
+    toast("书库加载失败：" + e.message, "err");
+  }
+}
+
+function renderLibDirs(dirs) {
+  const box = $("#lib-dir-list");
+  if (!dirs.length) {
+    box.innerHTML = '<div class="empty">还没有添加目录</div>';
+    return;
+  }
+  box.innerHTML = dirs
+    .map(
+      (d) => `<div class="row">
+        <div class="rowflex" style="justify-content:space-between">
+          <span style="font-size:13.5px;font-weight:600">${esc(d.label || d.path)}</span>
+          <div class="rowflex" style="gap:6px">
+            <span class="tagmini">${d.book_count} 个文件</span>
+            <button class="btn sm" data-dir-scan="${d.id}">扫描</button>
+            <button class="btn sm danger" data-dir-del="${d.id}">移除</button>
+          </div>
+        </div>
+        <div class="meta">
+          <span class="mono" style="font-size:11px">${esc(d.path)}</span>
+          ${(d.excludes || []).length ? `<span class="tagmini">排除 ${esc(d.excludes.join("、"))}</span>` : ""}
+          <span>已导入 ${d.imported_count} 本</span>
+        </div>
+      </div>`
+    )
+    .join("");
+
+  $$("#lib-dir-list [data-dir-scan]").forEach((b) =>
+    b.addEventListener("click", () => doScan(b.dataset.dirScan))
+  );
+  $$("#lib-dir-list [data-dir-del]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      if (!confirm("移除这个目录？（已登记的书目记录会保留）")) return;
+      await api("/api/library/dirs/" + b.dataset.dirDel, { method: "DELETE" });
+      toast("已移除");
+      loadLibrary();
+    })
+  );
+}
+
+async function loadLibBooks() {
+  const status = $("#lib-filter").value;
+  const q = $("#lib-search").value.trim();
+  const params = new URLSearchParams({ limit: "300" });
+  if (status) params.set("status", status);
+  if (q) params.set("q", q);
+  try {
+    const r = await api("/api/library/books?" + params);
+    renderLibBooks(r.items, r.total);
+  } catch (e) {
+    toast("书目加载失败：" + e.message, "err");
+  }
+}
+
+function renderLibBooks(items, total) {
+  const box = $("#lib-book-list");
+  $("#lib-total").textContent = total;
+  if (!items.length) {
+    box.innerHTML = '<div class="empty">没有匹配的书目</div>';
+    return;
+  }
+  box.innerHTML = items
+    .map((b) => {
+      const [txt, color] = BOOK_STATUS[b.status] || [b.status, "var(--text-dim)"];
+      const canPick = ["pending", "ready"].includes(b.status);
+      const size = b.size_bytes
+        ? (b.size_bytes / 1024 / 1024).toFixed(1) + "MB"
+        : "";
+      return `<div class="row" style="display:flex;gap:11px;align-items:flex-start">
+        <input type="checkbox" class="lib-ck" data-id="${b.id}"
+               ${canPick ? "" : "disabled"}
+               ${libSelected.has(b.id) ? "checked" : ""}
+               style="width:15px;height:15px;margin-top:3px;flex-shrink:0;cursor:pointer" />
+        <div style="flex:1;min-width:0">
+          <div class="rowflex" style="justify-content:space-between;gap:10px">
+            <span style="font-size:13.3px">${esc(b.title || b.path)}</span>
+            <span style="color:${color};font-size:11.5px;white-space:nowrap">${txt}</span>
+          </div>
+          <div class="meta">
+            <span class="tagmini">${esc(b.format)}</span>
+            ${size ? `<span>${size}</span>` : ""}
+            ${b.chars ? `<span>${b.chars} 字</span>` : ""}
+            ${b.points_count ? `<span style="color:var(--green)">${b.points_count} 条知识</span>` : ""}
+            ${b.topic ? `<span class="tagmini">${esc(b.topic).slice(0, 24)}</span>` : ""}
+          </div>
+          ${b.skip_reason ? `<div class="detail" style="color:var(--amber)">${esc(b.skip_reason)}</div>` : ""}
+          ${b.error ? `<div class="detail" style="color:var(--red)">${esc(b.error)}</div>` : ""}
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  $$("#lib-book-list .lib-ck").forEach((ck) =>
+    ck.addEventListener("change", () => {
+      if (ck.checked) libSelected.add(ck.dataset.id);
+      else libSelected.delete(ck.dataset.id);
+      updateLibImportBtn();
+    })
+  );
+  updateLibImportBtn();
+}
+
+function updateLibImportBtn() {
+  const n = libSelected.size;
+  const btn = $("#btn-lib-import");
+  btn.textContent = `导入选中（${n}）`;
+  btn.disabled = n === 0;
+}
+
+function paintLibTask(t) {
+  const running = t && t.running;
+  $("#btn-lib-scan").disabled = running;
+  $("#btn-lib-stop").disabled = !running;
+  $("#btn-lib-url").disabled = running;
+  const wrap = $("#lib-bar-wrap");
+  if (running) {
+    wrap.style.display = "block";
+    const pct = t.total ? Math.round((t.done / t.total) * 100) : 0;
+    $("#lib-bar").style.width = pct + "%";
+    const stage = t.kind === "scan" ? "扫描中" : "导入中";
+    $("#lib-task-hint").textContent = `${stage} ${t.done}/${t.total}${t.current ? " · " + t.current.slice(0, 40) : ""}${t.points ? " · 已入库 " + t.points + " 条" : ""}`;
+    if (!libPoll) libPoll = setInterval(pollLibTask, 2500);
+  } else {
+    wrap.style.display = "none";
+    if (libPoll) {
+      clearInterval(libPoll);
+      libPoll = null;
+    }
+  }
+}
+
+async function pollLibTask() {
+  try {
+    const t = await api("/api/library/state");
+    paintLibTask(t);
+    if (!t.running) {
+      loadLibrary();
+    }
+  } catch (_) {}
+}
+
+async function doScan(dirId) {
+  toast("开始扫描…");
+  try {
+    const r = await api("/api/library/scan", {
+      method: "POST",
+      body: dirId ? { dirs: [dirId] } : {},
+    });
+    if (r.ok) toast(`扫描完成：发现 ${r.found} 个，新增 ${r.added} 个`, "ok");
+    loadLibrary();
+  } catch (e) {
+    toast("扫描失败：" + e.message, "err");
+  }
+}
+
+$("#btn-lib-add").addEventListener("click", async () => {
+  const path = $("#lib-path").value.trim();
+  if (!path) return toast("填一个目录路径", "err");
+  const ex = $("#lib-excludes")
+    .value.split(/[,，]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  try {
+    const r = await api("/api/library/dirs", {
+      method: "POST",
+      body: { path, excludes: ex },
+    });
+    if (!r.ok) return toast(r.msg || "添加失败", "err");
+    toast("目录已添加", "ok");
+    $("#lib-path").value = "";
+    loadLibrary();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+});
+
+$("#btn-lib-scan").addEventListener("click", () => doScan(null));
+
+$("#btn-lib-import").addEventListener("click", async () => {
+  const ids = Array.from(libSelected);
+  if (!ids.length) return toast("先勾选要导入的书", "err");
+  try {
+    const r = await api("/api/library/import", {
+      method: "POST",
+      body: { book_ids: ids, topic: $("#lib-topic").value.trim() },
+    });
+    if (!r.ok) return toast(r.msg || "启动失败", "err");
+    toast(`已开始导入 ${ids.length} 本，后台运行`, "ok");
+    libSelected.clear();
+    updateLibImportBtn();
+    pollLibTask();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+});
+
+$("#btn-lib-stop").addEventListener("click", async () => {
+  await api("/api/library/stop", { method: "POST" });
+  toast("已发送停止指令");
+});
+
+$("#btn-lib-url").addEventListener("click", async () => {
+  const url = $("#lib-url").value.trim();
+  if (!url) return toast("粘贴一个链接", "err");
+  toast("正在获取链接内容…");
+  try {
+    const r = await api("/api/library/import-url", {
+      method: "POST",
+      body: { url, topic: $("#lib-topic").value.trim() },
+    });
+    toast(r.ok ? `导入完成：${r.points || 0} 条知识` : r.msg || "失败", r.ok ? "ok" : "err");
+    if (r.ok) $("#lib-url").value = "";
+    loadLibrary();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+});
+
+$("#lib-filter").addEventListener("change", loadLibBooks);
+$("#lib-search").addEventListener("input", () => {
+  clearTimeout(window.__libT);
+  window.__libT = setTimeout(loadLibBooks, 400);
+});
+
+$("#btn-lib-selectall").addEventListener("click", () => {
+  $$("#lib-book-list .lib-ck:not(:disabled)").forEach((ck) => {
+    ck.checked = true;
+    libSelected.add(ck.dataset.id);
+  });
+  updateLibImportBtn();
+});
 
 /* ---------------- 资源 ---------------- */
 async function loadResources() {

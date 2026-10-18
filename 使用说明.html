@@ -269,6 +269,54 @@
     <p style="margin-top:8px">持续自学开着的时候，显卡和网络会一直被占用。你要玩游戏、跑渲染、或者要用电脑干重活之前，记得先关掉。</p>
   </div>
 
+  <h2>导入自己的电子书（书库）</h2>
+
+  <p>网上搜不到的内容，可以把你自己的书导进去。左边点「书库」。</p>
+
+  <div class="card info">
+    <div class="t">三步走</div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">1</div>
+      <div class="body"><b>添加目录</b>
+        <span>填书所在的文件夹路径，比如 <code>K:\书籍\我的电子书库</code>。可以加很多个。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">2</div>
+      <div class="body"><b>点「扫描目录」</b>
+        <span>它只登记有哪些书，不会解析。十几万文件大约十几秒。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">3</div>
+      <div class="body"><b>勾选想要的书 → 点「导入选中」</b>
+        <span>这一步才会真的读书、提炼知识点。后台跑，可以干别的。</span></div>
+    </div>
+  </div>
+
+  <h3>能读哪些格式</h3>
+  <p><code>txt</code> <code>md</code> <code>epub</code> <code>pdf</code> <code>docx</code> <code>html</code>，
+  或者直接粘贴一个链接。</p>
+
+  <div class="card warn">
+    <div class="t">扫描版 PDF 读不了</div>
+    <p style="margin-top:8px">PDF 有两种：一种是电子排版的（能提取文字），一种是扫描的（本质是图片）。<br>
+    扫描版提取不出文字，系统会自动跳过并标注「扫描版 PDF，需 OCR」。<br><br>
+    <b>所以优先导 txt / epub / docx</b>，这些一定能读。</p>
+  </div>
+
+  <h3>排除不想导入的目录</h3>
+  <p>添加目录时可以填「排除关键词」，路径里含这些词的会自动跳过。<br>
+  比如填 <code>成人</code>，那所有路径带这个词的文件夹都不会被扫描。</p>
+
+  <h3>导入之后在哪看</h3>
+  <p>知识点会进「知识库」，每条都标着出自哪本书的哪一章。<br>
+  也可以直接去「检验所学」提问，书里的内容会和网上学的一起被检索到。</p>
+
+  <div class="card">
+    <div class="t">一个小限制</div>
+    <p style="margin-top:8px">每本书默认最多提炼 40 个块（约 8 万字）。太厚的书会只学前半部分——
+    这是为了避免一本书跑一整天。需要更多可以在导入时调整。</p>
+  </div>
+
   <h2>几个页面分别干什么</h2>
 
   <table>
@@ -276,6 +324,7 @@
     <tr><td>总览</td><td>看总共学了多少、各方向分布、最近在干什么</td></tr>
     <tr><td>自主进化</td><td>设定方向、启动学习、看实时过程</td></tr>
     <tr><td>知识库</td><td>看学到的每一条知识，能语义搜索，能删除错的</td></tr>
+    <tr><td>书库</td><td>导入自己的电子书，支持多个目录</td></tr>
     <tr><td>资源获取</td><td>看它自己下了什么，也可以手动指定要下哪个模型</td></tr>
     <tr><td>权重进化</td><td>把知识做成训练集，微调出新模型</td></tr>
     <tr><td>检验所学</td><td>直接问它问题，它只用学过的知识回答并标出处</td></tr>
