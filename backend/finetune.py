@@ -96,27 +96,72 @@ def install_env(on_event: Event | None = None) -> dict:
 # --------------------------------------------------------------------------
 DATASET_SYSTEM = "你是一个在特定领域经过深度学习的助手。请准确、具体地回答问题。"
 
+REWRITE_SYSTEM = """你是训练数据构造器。为每条知识陈述生成一个人类会真实提出的问题。
+
+要求：
+- 问题必须能被对应的陈述直接回答，不要问陈述里没有的信息
+- 不要出现「这个要点」「上述内容」「该领域」这类指代
+- 不要提及书名、章节、来源
+- 用自然口语，像真人提问，长度 10-40 字
+- 只输出 JSON，格式：{"questions": ["问题1", "问题2", ...]}，顺序与输入一致"""
+
 
 def build_dataset(
     topic: str | None = None,
     *,
     min_samples: int | None = None,
+    rewrite: bool = True,
+    rewrite_limit: int | None = None,
     on_event: Event | None = None,
 ) -> dict:
-    """把知识点转成训练样本，并用模型补足多样性。"""
+    """把知识点转成训练样本。
+
+    先用模型把模板问句改写成自然提问（默认开启）——模板问句训出来的模型
+    只会复读，不会回答问题。样本仍不足时再扩写补量。
+
+    改写很慢（27B 模型每批 8 条约 30-60 秒），rewrite_limit 可用于快速验证。
+    """
     min_samples = int(min_samples or config.get("finetune_min_samples", 300))
     pairs = memory.export_training_pairs(topic, limit=8000)
     _emit(on_event, "info", f"知识库导出 {len(pairs)} 条原始样本")
     if not pairs:
         return {"ok": False, "msg": "知识库为空，先去学习一轮"}
 
-    # 用模型把「陈述句」改写成「多样化的问答」，提升泛化
-    if len(pairs) < min_samples * 3:
-        _emit(on_event, "info", "样本多样性不足，用模型扩写中…")
-        expanded: list[dict] = []
-        batch = 6
-        for i in range(0, min(len(pairs), 120), batch):
+    # ---- 1. 改写问句（质量优先）----
+    if rewrite:
+        target = int(rewrite_limit) if rewrite_limit else min(len(pairs), max(min_samples, 120))
+        target = min(target, len(pairs))
+        _emit(on_event, "info", f"用模型改写 {target} 条问句，让问题和答案真正对得上…")
+        batch = 8
+        done = 0
+        for i in range(0, target, batch):
             chunk = pairs[i : i + batch]
+            payload = "\n".join(
+                f"{j+1}. {p['output'][:180]}" for j, p in enumerate(chunk)
+            )
+            try:
+                data = llm.chat_json(
+                    REWRITE_SYSTEM, f"知识陈述：\n{payload}", temperature=0.6
+                )
+                qs = data.get("questions") or []
+                for j, q in enumerate(qs):
+                    if j < len(chunk) and isinstance(q, str) and len(q.strip()) > 8:
+                        chunk[j]["instruction"] = q.strip()
+                done += len(chunk)
+            except Exception as e:  # noqa: BLE001
+                _emit(on_event, "warn", f"第 {i//batch+1} 批改写失败（{str(e)[:40]}），保留模板问句")
+                continue
+            if (i // batch + 1) % 5 == 0:
+                _emit(on_event, "info", f"已改写 {done}/{target} 条")
+        _emit(on_event, "ok", f"问句改写完成：{done} 条")
+
+    # ---- 2. 样本不足时扩写补量 ----
+    if len(pairs) < min_samples:
+        _emit(on_event, "info", "样本数量不足，用模型扩写中…")
+        expanded: list[dict] = []
+        ebatch = 6
+        for i in range(0, min(len(pairs), 120), ebatch):
+            chunk = pairs[i : i + ebatch]
             payload = "\n".join(f"{j+1}. {p['output'][:200]}" for j, p in enumerate(chunk))
             try:
                 data = llm.chat_json(
@@ -129,7 +174,8 @@ def build_dataset(
                     q, a = (qa.get("q") or "").strip(), (qa.get("a") or "").strip()
                     if len(q) > 6 and len(a) > 12:
                         expanded.append({"instruction": q, "output": a, "source": "expanded"})
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                _emit(on_event, "warn", f"扩写批次失败：{str(e)[:40]}")
                 continue
             if len(expanded) + len(pairs) >= min_samples:
                 break
@@ -235,12 +281,24 @@ def train(
         _emit(on_event, "info", f"训练样本 {len(rows)} 条")
 
         max_len = 1024
-        enc = []
+        enc: list[tuple[list[int], int]] = []
         for r in rows:
             text = _format_example(tok, r)
             ids = tok(text, truncation=True, max_length=max_len, padding=False)["input_ids"]
-            if len(ids) >= 16:
-                enc.append(ids)
+            if len(ids) < 16:
+                continue
+            # 记录 prompt 长度：训练时把这段的 loss mask 掉，
+            # 只让模型学「怎么答」，而不是学「怎么复读问题」
+            try:
+                msgs = r.get("messages") or []
+                prompt_text = _format_example(tok, {"messages": msgs[:-1]}) if len(msgs) > 1 else ""
+                plen = len(tok(prompt_text, truncation=True, max_length=max_len,
+                               padding=False)["input_ids"]) if prompt_text else 0
+            except Exception:
+                plen = 0
+            # 至少留 4 个 token 参与 loss，避免整条被 mask 掉导致 loss=nan
+            plen = max(0, min(plen, len(ids) - 4))
+            enc.append((ids, plen))
         _emit(on_event, "info", f"有效样本 {len(enc)} 条，开始训练 {epochs} 轮")
 
         dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -261,15 +319,19 @@ def train(
             random.shuffle(enc)
             for i in range(0, len(enc) - bs + 1, bs):
                 batch = enc[i : i + bs]
-                ml = max(len(b) for b in batch)
+                ml = max(len(b[0]) for b in batch)
                 input_ids = torch.tensor(
-                    [b + [tok.pad_token_id] * (ml - len(b)) for b in batch], device=dev
+                    [b[0] + [tok.pad_token_id] * (ml - len(b[0])) for b in batch], device=dev
                 )
                 attn = torch.tensor(
-                    [[1] * len(b) + [0] * (ml - len(b)) for b in batch], device=dev
+                    [[1] * len(b[0]) + [0] * (ml - len(b[0])) for b in batch], device=dev
                 )
                 labels = input_ids.clone()
                 labels[attn == 0] = -100
+                # 只对 assistant 回答部分计算 loss，prompt 段全部屏蔽
+                for j, (_, plen) in enumerate(batch):
+                    if plen > 0:
+                        labels[j, :plen] = -100
                 out = model(input_ids=input_ids, attention_mask=attn, labels=labels)
                 loss = out.loss / grad_accum
                 loss.backward()

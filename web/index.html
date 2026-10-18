@@ -374,6 +374,14 @@
             </label>
             <label class="field"><span>HF 镜像（国内可填 https://hf-mirror.com）</span><input id="cfg-hf" /></label>
             <label class="field"><span>代理（可选，如 http://127.0.0.1:7890）</span><input id="cfg-proxy" /></label>
+            <label class="field">
+              <span>微调基座模型</span>
+              <input id="cfg-ft-base" placeholder="Qwen/Qwen2.5-0.5B-Instruct" />
+            </label>
+            <div class="hint" style="margin-top:-6px">
+              默认 0.5B，几分钟能跑完一轮，用来验证链路。<b>想要真正有用的模型改成
+              <code>Qwen/Qwen2.5-7B-Instruct</code></b>（需下载 14GB、约 17GB 显存）。
+            </div>
             <button class="btn primary" id="btn-save-cfg" style="margin-top:6px">保存设置</button>
           </div>
         </div>

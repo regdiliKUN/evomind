@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -394,6 +395,36 @@ def delete_point(pid: str) -> bool:
     return True
 
 
+def _make_instruction(claim: str) -> str:
+    """把一条陈述改写成能自然回答它的问句（规则版，作为 LLM 改写失败时的兜底）。
+
+    关键：不能用 topic 拼问句。topic 常常是「书库 · 某本书名」这类无意义值，
+    拼出来会变成「请说明「这本书」领域中的这个要点」，答案与问题完全对不上。
+    所以一律从 claim 自身取第一个完整分句来构造，避免截断在词中间。
+    """
+    c = claim.strip().rstrip("。．.!！;；")
+    parts = [x.strip() for x in re.split(r"[，,。；;：:！!？?]", c) if x.strip()]
+    core = parts[0] if parts else c
+    # 第一个分句常常是「在《X》设定中」这类介词短语，信息量不够，合并下一句
+    if len(core) < 14 and len(parts) > 1:
+        core = f"{parts[0]}，{parts[1]}"
+    if len(core) > 40:
+        core = core[:40].rstrip() + "…"
+    if len(core) < 8:
+        core = c[:40].rstrip()
+
+    # 按陈述语气选问法，比统一模板更像真实提问
+    if any(k in c for k in ("应该", "需要", "必须", "建议", "最好")):
+        return f"{core}，原因是什么？"
+    if any(k in c for k in ("指的是", "称为", "叫做", "属于", "是一种")):
+        return f"{core}，具体指什么？"
+    if any(k in c for k in ("可以", "能够", "用于", "适合", "用来")):
+        return f"{core}，具体怎么用？"
+    if any(k in c for k in ("因为", "导致", "造成", "源于")):
+        return f"{core}，是什么原因？"
+    return f"{core}，这是怎么回事？"
+
+
 def export_training_pairs(topic: str | None = None, limit: int = 5000) -> list[dict]:
     """把知识点导出为「指令-回答」训练样本。"""
     sql = (
@@ -415,10 +446,11 @@ def export_training_pairs(topic: str | None = None, limit: int = 5000) -> list[d
             answer = f"{answer}\n\n{detail}"
         pairs.append(
             {
-                "instruction": f"请说明「{r['topic']}」领域中的这个要点：{r['claim'][:40]}",
+                "instruction": _make_instruction(answer),
                 "input": "",
                 "output": answer,
                 "source": r["source_title"] or "",
+                "topic": r["topic"] or "",
             }
         )
     return pairs

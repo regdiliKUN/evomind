@@ -50,6 +50,8 @@ DEFAULTS: dict[str, Any] = {
     "max_model_gb": 40,              # 单个模型体积上限
     "download_workers": 2,
     # ---- 权重层 ----
+    # 微调基座。7B 在 4090(24GB) 上实测可跑：LoRA 可训练参数 0.53%，
+    # 197 条样本 1 轮 121 秒。想先快速验证链路可改成 Qwen/Qwen2.5-0.5B-Instruct
     "finetune_base": "Qwen/Qwen2.5-7B-Instruct",
     "finetune_min_samples": 300,     # 攒够多少条样本才值得微调
     "finetune_epochs": 2,
