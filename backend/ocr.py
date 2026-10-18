@@ -331,11 +331,13 @@ def ocr_book_async(
     dpi: int = DEFAULT_DPI,
     skip_done: bool = True,
     on_event: Event | None = None,
+    _internal: bool = False,
 ) -> dict:
-    """后台批量识别一本书。"""
-    with _task_lock:
-        if _task["running"]:
-            return {"ok": False, "msg": "已有 OCR 任务在跑，请先等待或停止"}
+    """后台批量识别一本书。_internal=True 时跳过互斥检查（供批量队列调用）。"""
+    if not _internal:
+        with _task_lock:
+            if _task["running"] or _task.get("batch"):
+                return {"ok": False, "msg": "已有 OCR 任务在跑，请先等待或停止"}
 
     # 书库导入和 OCR 都是重任务，同时跑会互相拖慢（都吃 CPU/GPU）
     try:
@@ -364,11 +366,15 @@ def ocr_book_async(
         row = c.execute("SELECT path, title FROM books WHERE id=?", (book_id,)).fetchone()
         if not row:
             _emit(on_event, "error", "书目不存在")
+            with _task_lock:
+                _task.update(running=False, stage="idle")
             return
         try:
             doc = pymupdf.open(row["path"])
         except Exception as e:  # noqa: BLE001
             _emit(on_event, "error", f"打不开文件：{str(e)[:80]}")
+            with _task_lock:
+                _task.update(running=False, stage="idle")
             return
 
         total_pages = doc.page_count
@@ -470,8 +476,86 @@ def ocr_book_async(
         with _task_lock:
             _task.update(running=False, stage="idle")
 
+    # 先占位再起线程：否则批量队列会在线程还没跑到 running=True 时就以为任务结束了，
+    # 结果所有书并发开跑，反而更慢
+    with _task_lock:
+        _task.update(running=True, stage="starting", book_id=book_id)
     threading.Thread(target=go, daemon=True).start()
     return {"ok": True}
+
+
+def ocr_batch_async(
+    book_ids: list[str],
+    *,
+    pages: str = "all",
+    engine: str = "rapid",
+    dpi: int = DEFAULT_DPI,
+    skip_done: bool = True,
+    on_event: Event | None = None,
+) -> dict:
+    """按顺序批量识别多本书。
+
+    一本跑完再开下一本 —— 同时跑会抢 CPU/显存，反而更慢。
+    批量期间 _task["batch"] 为真，单本接口会拒绝新任务。
+    """
+    ids = [x for x in (book_ids or []) if x]
+    if not ids:
+        return {"ok": False, "msg": "没有选中要识别的书"}
+
+    with _task_lock:
+        if _task["running"] or _task.get("batch"):
+            return {"ok": False, "msg": "已有 OCR 任务在跑，请先等待或停止"}
+
+    try:
+        from . import finetune as _ft, library as _lib
+
+        if _lib.state().get("running"):
+            return {"ok": False, "msg": "书库导入任务正在跑，等它结束再开始 OCR"}
+        if _ft.state().get("running"):
+            return {"ok": False, "msg": "微调训练正在跑，等它结束再开始 OCR"}
+    except Exception:
+        pass
+
+    try:
+        free = config.free_disk_gb()
+        if free < 2:
+            return {"ok": False, "msg": f"磁盘剩余 {free}GB，空间不足，先清理再 OCR"}
+    except Exception:  # noqa: BLE001
+        pass
+
+    with _task_lock:
+        _task.update(batch=True, batch_total=len(ids), batch_done=0,
+                     running=False, stage="batch", stop=False)
+
+    def go() -> None:
+        done = 0
+        for i, bid in enumerate(ids, 1):
+            if _task.get("stop"):
+                break
+            _emit(on_event, "stage", f"批量识别 [{i}/{len(ids)}] 本")
+            r = ocr_book_async(
+                bid, pages=pages, engine=engine, dpi=dpi,
+                skip_done=skip_done, on_event=on_event, _internal=True,
+            )
+            if not r.get("ok"):
+                _emit(on_event, "warn", f"第 {i} 本跳过：{str(r.get('msg',''))[:50]}")
+                continue
+            # 等这一本真正跑完再开下一本
+            while _task.get("running"):
+                time.sleep(0.8)
+                if _task.get("stop"):
+                    break
+            done = i
+            with _task_lock:
+                _task["batch_done"] = i
+            _emit(on_event, "info", f"批量进度 {i}/{len(ids)}")
+
+        with _task_lock:
+            _task.update(batch=False, running=False, stage="idle", stop=False)
+        _emit(on_event, "ok", f"批量识别结束：完成 {done}/{len(ids)} 本")
+
+    threading.Thread(target=go, daemon=True).start()
+    return {"ok": True, "msg": f"已开始批量识别 {len(ids)} 本"}
 
 
 def stop() -> dict:

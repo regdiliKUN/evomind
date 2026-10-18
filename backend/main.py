@@ -467,6 +467,19 @@ def api_book_ocr(bid: str, body: dict = Body(...)) -> dict:
     )
 
 
+@app.post("/api/ocr/batch")
+def api_ocr_batch(body: dict = Body(...)) -> dict:
+    """批量识别多本书：一本跑完再开下一本。"""
+    return ocr.ocr_batch_async(
+        body.get("book_ids") or [],
+        pages=str(body.get("pages") or "all"),
+        engine=body.get("engine") or "rapid",
+        dpi=int(body.get("dpi") or config.get("ocr_dpi", 200)),
+        skip_done=bool(body.get("skip_done", True)),
+        on_event=_lib_evt,
+    )
+
+
 @app.get("/api/library/books/{bid}/ocr")
 def api_book_ocr_pages(bid: str) -> dict:
     return {"pages": ocr.list_pages(bid), "stats": ocr.ocr_stats(bid)}

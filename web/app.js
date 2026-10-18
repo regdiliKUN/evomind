@@ -569,7 +569,8 @@ function renderLibBooks(items, total) {
   box.innerHTML = items
     .map((b) => {
       const [txt, color] = BOOK_STATUS[b.status] || [b.status, "var(--text-dim)"];
-      const canPick = ["pending", "ready"].includes(b.status);
+      // skipped（扫描版）也要能选：全选后可以批量 OCR
+      const canPick = ["pending", "ready", "skipped"].includes(b.status);
       const size = b.size_bytes
         ? (b.size_bytes / 1024 / 1024).toFixed(1) + "MB"
         : "";
@@ -624,8 +625,15 @@ function renderLibBooks(items, total) {
 function updateLibImportBtn() {
   const n = libSelected.size;
   const btn = $("#btn-lib-import");
-  btn.textContent = `导入选中（${n}）`;
-  btn.disabled = n === 0;
+  if (btn) {
+    btn.textContent = `导入选中（${n}）`;
+    btn.disabled = n === 0;
+  }
+  const ob = $("#btn-lib-ocr");
+  if (ob) {
+    ob.textContent = `OCR 选中（${n}）`;
+    ob.disabled = n === 0;
+  }
 }
 
 function paintLibTask(t) {
@@ -749,6 +757,39 @@ $("#btn-lib-selectall").addEventListener("click", () => {
     libSelected.add(ck.dataset.id);
   });
   updateLibImportBtn();
+});
+
+$("#btn-lib-unselect").addEventListener("click", () => {
+  libSelected.clear();
+  $$("#lib-book-list .lib-ck").forEach((ck) => {
+    ck.checked = false;
+  });
+  updateLibImportBtn();
+});
+
+$("#btn-lib-ocr").addEventListener("click", async () => {
+  const ids = Array.from(libSelected);
+  if (!ids.length) return toast("先勾选要识别的书", "err");
+  const ok = confirm(
+    `对选中的 ${ids.length} 本书开始 OCR？\n\n` +
+      "默认识别全部页面、快速引擎（约 5 秒/页）。\n" +
+      "大书会跑很久，可以随时点「停止」。\n\n" +
+      "建议先用 1 本试，确认识别质量再批量跑。"
+  );
+  if (!ok) return;
+  try {
+    const r = await api("/api/ocr/batch", {
+      method: "POST",
+      body: { book_ids: ids, pages: "all", engine: "rapid" },
+    });
+    if (!r.ok) return toast(r.msg || "启动失败", "err");
+    toast(r.msg || `已开始识别 ${ids.length} 本`, "ok");
+    libSelected.clear();
+    updateLibImportBtn();
+    setTimeout(() => loadLibBooks().catch(() => {}), 6000);
+  } catch (e) {
+    toast(e.message, "err");
+  }
 });
 
 /* ---------------- OCR 识别与校对 ---------------- */
