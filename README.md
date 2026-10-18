@@ -1,10 +1,16 @@
 # EvoMind · 自进化学习引擎
 
-> 一个会自己上网学习、并且越学越强的本地 AI。
-> 你定方向，它自己检索 → 阅读 → 提炼 → 入库 → 微调，全程不需要你盯着。
+<p align="center">
+  <img src="assets/icon.png" width="112" alt="EvoMind">
+</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.11+-blue" alt="python">
+  一个会自己上网学习、并且越学越强的本地 AI。<br>
+  你定方向，它自己检索 → 阅读 → 提炼 → 入库 → 微调，全程不需要你盯着。
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10+-blue" alt="python">
   <img src="https://img.shields.io/badge/platform-Windows-lightgrey" alt="platform">
   <img src="https://img.shields.io/badge/inference-Ollama-green" alt="ollama">
   <img src="https://img.shields.io/badge/license-MIT-brightgreen" alt="license">
@@ -68,17 +74,36 @@ ollama pull qwen3.8:27b     # 或任意你喜欢的模型
 ollama pull bge-m3          # 向量模型
 ```
 
-### 启动（Windows）
+### 安装与启动（Windows）
 
-双击 **`① 双击这里启动.cmd`**，浏览器会自动打开控制台。
+**第一次用**：双击 **`⓪ 首次安装.cmd`**
 
-依赖缺失时先跑一次 **`② 修复环境.cmd`**。
+它会依次完成：建虚拟环境 → 装依赖 → 检查 Ollama → **问你要不要在桌面放一个 EvoMind 图标**（可以选不要）。
+
+**以后每次**：双击 **`① 双击这里启动.cmd`**，或者直接双击桌面上的图标。
+
+浏览器会自动打开控制台，约 10 秒。依赖出问题时跑 **`② 修复环境.cmd`**。
+
+### 桌面图标
+
+安装时会问一次，**选「不要」也完全不影响使用**。
+
+之后想加或者想删，随时双击 **`③ 桌面图标.cmd`** —— 它会先告诉你现在有没有，再问你要创建还是删除。
+
+图标长这样（与网页控制台同一套视觉）：
+
+<p align="center">
+  <img src="assets/icon.png" width="72" alt="icon">
+</p>
+
+> 实现上走 `.lnk` + `WScript.Shell`，会正确解析被重定向过的桌面目录（比如桌面设在 D 盘），
+> 不会傻傻地往 `C:\Users\xxx\Desktop` 里塞文件。
 
 ### 手动启动（跨平台）
 
 ```bash
 python -m venv .venv
-.venv/Scripts/pip install fastapi "uvicorn[standard]" httpx beautifulsoup4 lxml trafilatura numpy huggingface_hub
+.venv/Scripts/pip install -r requirements.txt
 .venv/Scripts/python run.py
 ```
 
@@ -127,10 +152,21 @@ evomind/
 │   ├── scheduler.py    持续自学调度
 │   └── main.py         FastAPI + SSE 事件流
 ├── web/                控制台（原生 JS，无构建步骤）
+├── scripts/
+│   ├── install.py      首次安装：建环境 → 装依赖 → 问桌面图标
+│   ├── shortcut.py     桌面快捷方式创建/删除（.lnk + WScript.Shell）
+│   └── desktop_icon.py 图标管理交互
+├── assets/
+│   ├── icon.ico        应用图标（7 个尺寸：16~256）
+│   ├── icon.png        512px 预览图
+│   └── make_icon.py    图标生成脚本（Pillow + numpy）
 ├── data/               运行时数据（不入库）
 ├── run.py              启动器：拉起 Ollama → 起服务 → 开浏览器
+├── requirements.txt
+├── ⓪ 首次安装.cmd
 ├── ① 双击这里启动.cmd
 ├── ② 修复环境.cmd
+├── ③ 桌面图标.cmd
 └── 使用说明.html        面向非技术用户的完整说明
 ```
 

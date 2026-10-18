@@ -19,6 +19,9 @@ data/
 *.png
 *.jpg
 
+# 但图标资源要提交
+!assets/*.png
+
 # 系统
 .DS_Store
 Thumbs.db

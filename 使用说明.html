@@ -51,6 +51,14 @@
   .startbox .note{margin-top:20px;font-size:13.5px;color:var(--dim);line-height:1.9}
   .startbox .note b{color:var(--amber)}
 
+  .startbox.second{
+    max-width:480px;padding:26px 26px;
+    background:linear-gradient(160deg,rgba(33,212,160,.10),rgba(77,141,255,.06));
+    border-color:rgba(33,212,160,.28);
+    box-shadow:0 14px 40px rgba(33,212,160,.10);
+  }
+  .startbox.second .fakebtn{font-size:16px;padding:14px 30px;border-radius:11px}
+
   h2{
     font-size:22px;margin:64px 0 20px;padding-bottom:12px;
     border-bottom:1px solid var(--border);letter-spacing:-.2px;
@@ -107,11 +115,22 @@
   </div>
 
   <div class="startbox">
-    <div class="label">开 始 使 用</div>
+    <div class="label">第 一 次 用</div>
+    <div class="fakebtn">⓪ 首次安装.cmd</div>
+    <div class="note">
+      装运行环境，大概几分钟。<br>
+      装的过程中会问你 <b>要不要在桌面放一个 EvoMind 图标</b>——<br>
+      选「要」还是「不要」都行，不影响使用。
+    </div>
+  </div>
+
+  <div class="startbox second">
+    <div class="label">以 后 每 次</div>
     <div class="fakebtn">① 双击这里启动.cmd</div>
     <div class="note">
       双击后会出现一个黑色窗口，<b>不要关掉它</b>（关掉服务就停了）。<br>
-      浏览器会自动打开控制台，大概需要 10 秒。
+      浏览器会自动打开控制台，大概需要 10 秒。<br>
+      建了桌面图标的话，直接双击桌面上的 <b>EvoMind</b> 也一样。
     </div>
   </div>
 
@@ -137,6 +156,32 @@
     <div class="t">第三层：自己找资源下载</div>
     <p style="margin-top:8px">学习过程中如果发现网上有对口的模型或数据集，它会自己判断值不值得下，然后下载到本地。<br>
     有安全阀：先算体积，再查磁盘预算，超了自动跳过，绝不会把硬盘塞爆。</p>
+  </div>
+
+  <h2>桌面图标</h2>
+
+  <p>安装的时候会问你一次要不要在桌面放图标。<b>选「不要」完全不影响使用</b>，只是每次得进文件夹找启动文件。</p>
+
+  <div style="display:flex;gap:26px;align-items:center;margin:26px 0">
+    <img src="assets/icon.png" width="76" height="76"
+         style="border-radius:16px;box-shadow:0 8px 26px rgba(77,141,255,.32)" alt="EvoMind 图标">
+    <div>
+      <div style="font-weight:700;margin-bottom:6px">EvoMind</div>
+      <div class="muted" style="line-height:1.7">
+        双击就启动，不用进文件夹找。<br>
+        图标用的是项目自己的渐变 E，和网页控制台左上角那个是同一个。
+      </div>
+    </div>
+  </div>
+
+  <h3>想加或者想删？随时可以</h3>
+
+  <p>双击 <b><code>③ 桌面图标.cmd</code></b>，它会先告诉你现在桌面上有没有，再问你要创建还是删除。</p>
+
+  <div class="card info">
+    <div class="t">一个小细节</div>
+    <p style="margin-top:8px">如果你的桌面被改到别的盘（比如 D 盘），它也能找对地方——
+    不会傻傻地往 <code>C:\Users\你的用户名\Desktop</code> 里塞文件。</p>
   </div>
 
   <h2>怎么用它学习</h2>
@@ -322,14 +367,17 @@
 
   <table>
     <tr><th>文件/目录</th><th>说明</th></tr>
-    <tr><td><code>① 双击这里启动.cmd</code></td><td>启动器，平时只用这个</td></tr>
+    <tr><td><code>⓪ 首次安装.cmd</code></td><td>第一次用跑这个，装环境、可选建桌面图标</td></tr>
+    <tr><td><code>① 双击这里启动.cmd</code></td><td>日常启动，最常用</td></tr>
     <tr><td><code>② 修复环境.cmd</code></td><td>依赖坏了时用它重建</td></tr>
+    <tr><td><code>③ 桌面图标.cmd</code></td><td>随时增删桌面图标</td></tr>
     <tr><td><code>data/knowledge/</code></td><td>知识库数据库（你的学习成果都在这）</td></tr>
     <tr><td><code>data/models/</code></td><td>它自己下载的模型</td></tr>
     <tr><td><code>data/datasets/</code></td><td>它自己下载的数据集</td></tr>
     <tr><td><code>data/finetune/</code></td><td>微调产出的模型</td></tr>
     <tr><td><code>backend/</code></td><td>程序代码</td></tr>
     <tr><td><code>web/</code></td><td>控制台界面</td></tr>
+    <tr><td><code>assets/icon.ico</code></td><td>桌面图标文件</td></tr>
   </table>
 
   <div class="card">
