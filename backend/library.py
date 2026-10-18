@@ -659,10 +659,12 @@ def import_books_async(
 
     # OCR 与导入都是重任务，同时跑会互相拖慢
     try:
-        from . import ocr as _ocr
+        from . import finetune as _ft, ocr as _ocr
 
         if _ocr.state().get("running"):
             return {"ok": False, "msg": "OCR 任务正在跑，等它结束再导入"}
+        if _ft.state().get("running"):
+            return {"ok": False, "msg": "微调训练正在跑，等它结束再导入"}
     except Exception:
         pass
 

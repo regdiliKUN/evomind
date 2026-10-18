@@ -1,21 +1,31 @@
 # EvoMind 运行依赖
 # 安装：.venv\Scripts\pip install -r requirements.txt
+#
+# 上界是刻意加的：这些库大版本升级常带破坏性改动
+# （transformers 5.x 已改过 torch_dtype → dtype、apply_chat_template 返回类型），
+# 不锁上界的话，半年后重装可能拿到装不上的新版本。
 
-fastapi>=0.110
-uvicorn[standard]>=0.27
-httpx>=0.26
-beautifulsoup4>=4.12
-lxml>=5.0
-trafilatura>=1.8
-numpy>=1.26
-huggingface_hub>=0.23
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+httpx>=0.26,<1.0
+beautifulsoup4>=4.12,<5.0
+lxml>=5.0,<7.0
+trafilatura>=1.8,<3.0
+numpy>=1.26,<3.0
+huggingface_hub>=0.23,<2.0
 
 # 本地书库解析
-pypdf>=4.0
-EbookLib>=0.18
-python-docx>=1.1
+pypdf>=4.0,<7.0
+EbookLib>=0.18,<1.0
+python-docx>=1.1,<2.0
 
 # 扫描件 OCR
-PyMuPDF>=1.24
-rapidocr-onnxruntime>=1.3
-python-multipart>=0.0.9
+PyMuPDF>=1.24,<2.0
+rapidocr-onnxruntime>=1.3,<2.0
+python-multipart>=0.0.9,<1.0
+
+# 微调（可选，不装也能用知识层；装了才需要在设置里配基座）
+# torch>=2.4,<3.0
+# transformers>=4.40,<6.0
+# peft>=0.10,<1.0
+# accelerate>=0.30,<2.0

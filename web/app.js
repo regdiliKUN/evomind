@@ -530,6 +530,12 @@ function renderLibDirs(dirs) {
 async function loadLibBooks() {
   const status = $("#lib-filter").value;
   const q = $("#lib-search").value.trim();
+  // 列表内容变了，之前勾选的书可能已经不在列表里。
+  // 不清空的话，点「导入选中」会导入用户看不见的书。
+  if (libSelected.size) {
+    libSelected.clear();
+    updateLibImportBtn();
+  }
   const params = new URLSearchParams({ limit: "300" });
   if (status) params.set("status", status);
   if (q) params.set("q", q);

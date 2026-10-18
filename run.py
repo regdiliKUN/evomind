@@ -106,11 +106,37 @@ def pick_port(preferred: int = 8765) -> int:
     return preferred
 
 
+def is_evomind(port: int) -> bool:
+    """判断端口上跑的是不是 EvoMind 自己。"""
+    import json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return "stats" in data and "engine" in data
+    except Exception:
+        return False
+
+
 def main() -> None:
     os.system("")  # 开启 Windows 控制台 ANSI
     print("=" * 58)
     print("  EvoMind · 自进化学习引擎")
     print("=" * 58)
+
+    # 单实例保护：已经有实例在跑就不要再起一个。
+    # 两个实例会共用同一个 SQLite，但内存里的任务锁互相看不见，
+    # 结果就是 OCR 和导入能在两个进程里同时跑，互相抢 GPU、抢数据库。
+    if port_open(8765) and is_evomind(8765):
+        log("[i] EvoMind 已经在运行，直接打开现有窗口")
+        log("    地址：http://127.0.0.1:8765")
+        try:
+            if not os.environ.get("EVOMIND_NO_BROWSER"):
+                webbrowser.open("http://127.0.0.1:8765")
+        except Exception:
+            pass
+        return
 
     if not ensure_ollama():
         log("\n无法连接 Ollama，控制台仍会启动，但学习功能不可用。")

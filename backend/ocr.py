@@ -285,10 +285,12 @@ def ocr_book_async(
 
     # 书库导入和 OCR 都是重任务，同时跑会互相拖慢（都吃 CPU/GPU）
     try:
-        from . import library as _lib
+        from . import finetune as _ft, library as _lib
 
         if _lib.state().get("running"):
             return {"ok": False, "msg": "书库导入任务正在跑，等它结束再开始 OCR"}
+        if _ft.state().get("running"):
+            return {"ok": False, "msg": "微调训练正在跑，等它结束再开始 OCR"}
     except Exception:
         pass
 

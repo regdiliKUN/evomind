@@ -131,28 +131,66 @@ def build_dataset(
     if rewrite:
         target = int(rewrite_limit) if rewrite_limit else min(len(pairs), max(min_samples, 120))
         target = min(target, len(pairs))
+
+        # 断点续做：每条要 5-6 秒，200 条要 20 分钟，中途关窗口不该从头再来
+        OUTPUTS.mkdir(parents=True, exist_ok=True)
+        safe_tag = (topic or "all").replace("/", "_").replace("\\", "_")[:30]
+        partial = OUTPUTS / f"rewrite_{safe_tag}.partial.json"
+        saved: list[str] = [""] * len(pairs)
+        if partial.exists():
+            try:
+                prev = json.loads(partial.read_text(encoding="utf-8"))
+                if isinstance(prev, list) and len(prev) == len(pairs):
+                    saved = [str(x or "") for x in prev]
+                    restored = sum(1 for q in saved if q)
+                    if restored:
+                        for i, q in enumerate(saved):
+                            if q:
+                                pairs[i]["instruction"] = q
+                        _emit(on_event, "info", f"发现上次进度，已恢复 {restored} 条改写结果")
+            except Exception:  # noqa: BLE001
+                saved = [""] * len(pairs)
+
         _emit(on_event, "info", f"用模型改写 {target} 条问句，让问题和答案真正对得上…")
         batch = 8
         done = 0
         for i in range(0, target, batch):
             chunk = pairs[i : i + batch]
+            # 只改写这一批里还没改过的条目，已改的原样保留
+            todo = [(j, p) for j, p in enumerate(chunk) if not saved[i + j]]
+            if not todo:
+                done += len(chunk)
+                continue
             payload = "\n".join(
-                f"{j+1}. {p['output'][:180]}" for j, p in enumerate(chunk)
+                f"{k+1}. {p['output'][:180]}" for k, (_, p) in enumerate(todo)
             )
             try:
                 data = llm.chat_json(
                     REWRITE_SYSTEM, f"知识陈述：\n{payload}", temperature=0.6
                 )
                 qs = data.get("questions") or []
-                for j, q in enumerate(qs):
-                    if j < len(chunk) and isinstance(q, str) and len(q.strip()) > 8:
+                for k, q in enumerate(qs):
+                    if k < len(todo) and isinstance(q, str) and len(q.strip()) > 8:
+                        j = todo[k][0]
                         chunk[j]["instruction"] = q.strip()
+                        saved[i + j] = q.strip()
                 done += len(chunk)
             except Exception as e:  # noqa: BLE001
                 _emit(on_event, "warn", f"第 {i//batch+1} 批改写失败（{str(e)[:40]}），保留模板问句")
                 continue
+            # 每 5 批落盘一次，中断最多丢 5 批
             if (i // batch + 1) % 5 == 0:
+                try:
+                    partial.write_text(
+                        json.dumps(saved, ensure_ascii=False), encoding="utf-8"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 _emit(on_event, "info", f"已改写 {done}/{target} 条")
+        try:
+            partial.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
         _emit(on_event, "ok", f"问句改写完成：{done} 条")
 
     # ---- 2. 样本不足时扩写补量 ----
@@ -227,10 +265,34 @@ def train(
             return {"ok": False, "msg": "已有训练任务在跑"}
         _state = {"running": True, "stage": "loading", "progress": 0.0, "log": []}
 
+    # 训练会吃满显存，和 OCR / 书库导入同时跑会互相拖慢甚至 OOM
+    try:
+        from . import library as _lib, ocr as _ocr
+
+        if _ocr.state().get("running"):
+            _state["running"] = False
+            return {"ok": False, "msg": "OCR 任务正在跑，等它结束再训练"}
+        if _lib.state().get("running"):
+            _state["running"] = False
+            return {"ok": False, "msg": "书库导入任务正在跑，等它结束再训练"}
+    except Exception:  # noqa: BLE001
+        pass
+
     base = base or config.get("finetune_base")
     epochs = int(epochs or config.get("finetune_epochs", 2))
     lr = float(lr or config.get("finetune_lr", 1e-4))
     tag = Path(dataset_path).stem.replace("dataset_", "")[:40]
+
+    # 磁盘闸门：基座下载 + adapter + 合并产物加起来要 20GB 以上，
+    # 空间不够时会在写权重写到一半失败，留下损坏目录
+    try:
+        free = config.free_disk_gb()
+        if free < 20:
+            _state["running"] = False
+            return {"ok": False,
+                    "msg": f"磁盘剩余 {free}GB，微调至少需要 20GB（含 15GB 合并产物）"}
+    except Exception:  # noqa: BLE001
+        pass
 
     try:
         import torch
@@ -378,6 +440,24 @@ def train(
             _emit(on_event, "warn", f"合并失败（adapter 仍可用）：{e}")
 
         _state.update(running=False, stage="done", progress=1.0)
+
+        # 清理旧的 merged 模型：每个约 15GB，不清理几次就把磁盘撑爆。
+        # 保留最近 2 个，够对比用；adapter 只有 165MB，全部保留。
+        try:
+            olds = sorted(
+                [p for p in OUTPUTS.glob("merged_*") if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            removed = 0
+            for old in olds[2:]:
+                shutil.rmtree(old, ignore_errors=True)
+                removed += 1
+            if removed:
+                _emit(on_event, "info", f"已清理 {removed} 个旧 merged 模型（保留最近 2 个）")
+        except Exception:  # noqa: BLE001
+            pass
+
         return {
             "ok": True,
             "adapter": str(adapter_dir),
