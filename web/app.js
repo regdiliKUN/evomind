@@ -547,7 +547,8 @@ async function loadLibBooks() {
     libSelected.clear();
     updateLibImportBtn();
   }
-  const params = new URLSearchParams({ limit: "300" });
+  // 后端 list_books 的上限是 1000，这里取满，否则「全选」永远选不全
+  const params = new URLSearchParams({ limit: "1000" });
   if (status) params.set("status", status);
   if (q) params.set("q", q);
   try {
@@ -629,6 +630,11 @@ function updateLibImportBtn() {
     btn.textContent = `导入选中（${n}）`;
     btn.disabled = n === 0;
   }
+  const pb = $("#btn-lib-parse");
+  if (pb) {
+    pb.textContent = `解析选中（${n}）`;
+    pb.disabled = n === 0;
+  }
   const ob = $("#btn-lib-ocr");
   if (ob) {
     ob.textContent = `OCR 选中（${n}）`;
@@ -704,6 +710,31 @@ $("#btn-lib-add").addEventListener("click", async () => {
 });
 
 $("#btn-lib-scan").addEventListener("click", () => doScan(null));
+
+$("#btn-lib-parse").addEventListener("click", async () => {
+  const ids = Array.from(libSelected);
+  if (!ids.length) return toast("先勾选要解析的书", "err");
+  const ok = confirm(
+    `对选中的 ${ids.length} 本书做解析？\n\n` +
+      "解析只提取正文、判断有没有文字层，不调用大模型，每本几秒钟。\n" +
+      "结果：有文字层的变成「可导入」，扫描版会被单独标出来。\n\n" +
+      "（要真正进知识库还得再点「导入选中」，那个慢得多，每本十几分钟）"
+  );
+  if (!ok) return;
+  try {
+    const r = await api("/api/library/parse", {
+      method: "POST",
+      body: { book_ids: ids },
+    });
+    if (!r.ok) return toast(r.msg || "启动失败", "err");
+    toast(r.msg || "已开始解析", "ok");
+    libSelected.clear();
+    updateLibImportBtn();
+    pollLibTask();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+});
 
 $("#btn-lib-import").addEventListener("click", async () => {
   const ids = Array.from(libSelected);

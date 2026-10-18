@@ -413,6 +413,15 @@ def api_lib_import(body: dict = Body(...)) -> dict:
     )
 
 
+@app.post("/api/library/parse")
+def api_lib_parse(body: dict = Body(...)) -> dict:
+    """批量解析：只提取正文、标出扫描版，不做 LLM 提炼。"""
+    ids = body.get("book_ids") or []
+    if not ids:
+        raise HTTPException(400, "请选择要解析的书")
+    return library.parse_books_async(ids, on_event=_lib_evt)
+
+
 @app.post("/api/library/import-url")
 def api_lib_import_url(body: dict = Body(...)) -> dict:
     url = (body.get("url") or "").strip()

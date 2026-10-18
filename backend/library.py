@@ -14,6 +14,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -655,30 +656,54 @@ def import_book(
 
     chapters = _split_chapters(raw_text, book["title"])
     total_points = 0
-    used = 0
-    for ci, ch in enumerate(chapters):
-        if used >= max_chunks:
+    # 先把要处理的块收集起来，才能并发提炼
+    blocks: list[dict] = []
+    for ch in chapters:
+        if len(blocks) >= max_chunks:
             _emit(on_event, "info", f"已达单本上限 {max_chunks} 块，剩余章节跳过")
             break
         for chunk in _chunk(ch["text"]):
-            if used >= max_chunks:
+            if len(blocks) >= max_chunks:
                 break
-            used += 1
-            _emit(on_event, "stage", f"《{book['title']}》{ch['title'][:30]} · 第 {used} 块")
-            try:
-                data = llm.chat_json(
-                    EXTRACT_SYSTEM,
-                    EXTRACT_USER.format(
-                        topic=topic,
-                        title=book["title"],
-                        chapter=ch["title"][:60],
-                        text=chunk[:9000],
-                    ),
-                    temperature=0.2,
-                )
-            except Exception as e:  # noqa: BLE001
-                _emit(on_event, "warn", f"提炼失败（内部已重试）：{str(e)[:60]}")
+            blocks.append({"chapter": ch["title"], "text": chunk})
+
+    used = len(blocks)
+    if not used:
+        c.execute("UPDATE books SET status='ready', error='正文为空' WHERE id=?", (book_id,))
+        c.commit()
+        return {"ok": False, "msg": "正文为空，无法提炼"}
+
+    _emit(on_event, "stage", f"《{book['title']}》共 {used} 块，开始提炼")
+
+    def _extract(b: dict) -> tuple[dict | None, dict]:
+        try:
+            data = llm.chat_json(
+                EXTRACT_SYSTEM,
+                EXTRACT_USER.format(
+                    topic=topic,
+                    title=book["title"],
+                    chapter=b["chapter"][:60],
+                    text=b["text"][:9000],
+                ),
+                temperature=0.2,
+            )
+            return data, b
+        except Exception as e:  # noqa: BLE001
+            _emit(on_event, "warn", f"提炼失败（内部已重试）：{str(e)[:60]}")
+            return None, b
+
+    done_blocks = 0
+    # LLM 调用并发：实测提炼时 GPU 利用率只有 11%，串行等于让显卡空转。
+    # 入库仍留在主线程串行，避免并发写库与去重锁互等。
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        for data, b in ex.map(_extract, blocks):
+            done_blocks += 1
+            if data is None:
                 continue
+            _emit(
+                on_event, "stage",
+                f"《{book['title']}》{b['chapter'][:30]} · {done_blocks}/{used} 块",
+            )
             for pt in (data.get("points") or [])[:6]:
                 claim = (pt.get("claim") or "").strip()
                 if len(claim) < 12:
@@ -696,7 +721,7 @@ def import_book(
                         claim=claim,
                         detail=(pt.get("detail") or "").strip()[:1200],
                         source_url=f"file:///{str(p).replace(chr(92), '/')}",
-                        source_title=f"《{book['title']}》 {ch['title'][:60]}",
+                        source_title=f"《{book['title']}》 {b['chapter'][:60]}",
                         source_kind="book",
                         tags=pt.get("tags") or [],
                         confidence=max(0.1, min(1.0, conf)),
@@ -723,6 +748,63 @@ def import_book(
     c.commit()
     _emit(on_event, "ok", f"《{book['title']}》导入完成，新增 {total_points} 条知识点")
     return {"ok": True, "points": total_points, "chunks": used}
+
+
+def parse_books_async(book_ids: list[str], *, on_event: Event | None = None) -> dict:
+    """后台批量解析：只提取正文、更新状态，不做 LLM 提炼。
+
+    比「批量导入」快两个数量级——导入每本要十几分钟（40 块 × 20 秒），
+    解析每本只要几秒。三千多本书过一遍用这个，几小时能跑完；
+    用导入则要一个月。跑完能清楚看出哪些书有文字层、哪些是扫描版。
+    """
+    ids = [x for x in (book_ids or []) if x]
+    if not ids:
+        return {"ok": False, "msg": "没有选中要解析的书"}
+
+    with _lock:
+        if _task["running"]:
+            return {"ok": False, "msg": "已有书库任务在跑"}
+
+    try:
+        from . import ocr as _ocr
+
+        if _ocr.state().get("running"):
+            return {"ok": False, "msg": "OCR 任务正在跑，等它结束再解析"}
+    except Exception:
+        pass
+
+    def go() -> None:
+        _task.update(running=True, kind="parse", total=len(ids), done=0,
+                     stage="parsing", points=0, stop=False, current="")
+        ok = scan = bad = 0
+        for i, bid in enumerate(ids):
+            if _task["stop"]:
+                _emit(on_event, "warn", "收到停止指令，中断解析")
+                break
+            _task["done"] = i
+            row = memory.conn().execute("SELECT title FROM books WHERE id=?", (bid,)).fetchone()
+            _task["current"] = row["title"] if row else bid
+            try:
+                r = parse_book(bid)
+            except Exception:  # noqa: BLE001
+                bad += 1
+                continue
+            if r.get("ok"):
+                ok += 1
+            elif "扫描版" in str(r.get("msg", "")):
+                scan += 1
+            else:
+                bad += 1
+            # 每本都发日志会刷屏，20 本汇总一次
+            if (i + 1) % 20 == 0:
+                _emit(on_event, "info",
+                      f"解析进度 {i+1}/{len(ids)}：可读 {ok}，扫描版 {scan}，失败 {bad}")
+        _task.update(running=False, stage="idle", done=len(ids))
+        _emit(on_event, "ok",
+              f"批量解析完成：可读 {ok} 本，扫描版 {scan} 本，失败 {bad} 本")
+
+    threading.Thread(target=go, daemon=True).start()
+    return {"ok": True, "msg": f"已开始解析 {len(ids)} 本（只提取正文，不做提炼）"}
 
 
 def import_books_async(
