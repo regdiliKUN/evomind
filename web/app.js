@@ -1166,20 +1166,49 @@ $("#btn-ft-install").addEventListener("click", async () => {
   await api("/api/finetune/install", { method: "POST" });
 });
 
+let ftPollTimer = null;
+
+// 生成训练集要改写几百条问句，十几分钟起步，必须轮询看进度
+function pollFinetune() {
+  if (ftPollTimer) return;
+  ftPollTimer = setInterval(async () => {
+    try {
+      const st = await api("/api/finetune/state");
+      const pct = Math.round((st.progress || 0) * 100);
+      const bar = $("#ft-bar");
+      if (bar) bar.style.width = pct + "%";
+      if (st.running && st.stage) $("#ft-ds").textContent = st.stage;
+      if (!st.running) {
+        clearInterval(ftPollTimer);
+        ftPollTimer = null;
+        $("#btn-ft-dataset").disabled = false;
+        const res = st.result || {};
+        if (res.ok) {
+          state.datasetPath = res.path;
+          $("#ft-ds").textContent = `${res.count} 条`;
+          $("#btn-ft-train").disabled = false;
+          toast(`训练集已生成：${res.count} 条`, "ok");
+        } else if (res.msg) {
+          $("#ft-ds").textContent = "生成失败";
+          toast(res.msg, "err");
+        }
+      }
+    } catch (e) {
+      // 单次轮询失败不打断，等下一轮
+    }
+  }, 2000);
+}
+
 $("#btn-ft-dataset").addEventListener("click", async () => {
-  toast("正在生成训练集…");
   try {
     const r = await api("/api/finetune/dataset", { method: "POST", body: {} });
-    if (r.ok) {
-      state.datasetPath = r.path;
-      $("#ft-ds").textContent = `${r.count} 条`;
-      $("#btn-ft-train").disabled = false;
-      toast(`训练集已生成：${r.count} 条`, "ok");
-    } else {
-      toast(r.msg || "生成失败", "err");
-    }
+    if (!r.ok) return toast(r.msg || "启动失败", "err");
+    $("#btn-ft-dataset").disabled = true;
+    $("#ft-ds").textContent = "准备中…";
+    toast("已开始生成训练集，进度见上方进度条");
+    pollFinetune();
   } catch (e) {
-    toast("生成失败：" + e.message, "err");
+    toast("启动失败：" + e.message, "err");
   }
 });
 

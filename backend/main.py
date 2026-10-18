@@ -275,9 +275,13 @@ def api_ft_install() -> dict:
 
 @app.post("/api/finetune/dataset")
 def api_ft_dataset(body: dict = Body(default={})) -> dict:
-    topic = (body or {}).get("topic") or None
-    return finetune.build_dataset(
-        topic, on_event=lambda lv, m, p: evolve.bus.publish({"level": lv, "msg": m, **p})
+    b = body or {}
+    topic = (b.get("topic") or "").strip() or None
+    return finetune.build_dataset_async(
+        topic,
+        min_samples=b.get("min_samples"),
+        rewrite=bool(b.get("rewrite", True)),
+        on_event=lambda lv, m, p: evolve.bus.publish({"level": lv, "msg": m, **p}),
     )
 
 

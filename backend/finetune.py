@@ -122,9 +122,11 @@ def build_dataset(
     改写很慢（27B 模型每批 8 条约 30-60 秒），rewrite_limit 可用于快速验证。
     """
     min_samples = int(min_samples or config.get("finetune_min_samples", 300))
+    _state.update(stage="导出知识库", progress=0.02)
     pairs = memory.export_training_pairs(topic, limit=8000)
     _emit(on_event, "info", f"知识库导出 {len(pairs)} 条原始样本")
     if not pairs:
+        _state.update(stage="知识库为空", progress=0.0)
         return {"ok": False, "msg": "知识库为空，先去学习一轮"}
 
     # ---- 1. 改写问句（质量优先）----
@@ -186,6 +188,11 @@ def build_dataset(
                     )
                 except Exception:  # noqa: BLE001
                     pass
+                # 改写占整体进度的大头：0.05 → 0.90
+                _state.update(
+                    progress=round(0.05 + 0.85 * min(1.0, done / max(target, 1)), 3),
+                    stage=f"改写问句 {done}/{target}",
+                )
                 _emit(on_event, "info", f"已改写 {done}/{target} 条")
         try:
             partial.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
@@ -235,8 +242,43 @@ def build_dataset(
                 },
                 ensure_ascii=False,
             ) + "\n")
+    _state.update(stage=f"完成：{len(pairs)} 条", progress=1.0)
     _emit(on_event, "ok", f"数据集已生成：{path.name}（{len(pairs)} 条）")
     return {"ok": True, "path": str(path), "count": len(pairs)}
+
+
+def build_dataset_async(
+    topic: str | None = None,
+    *,
+    min_samples: int | None = None,
+    rewrite: bool = True,
+    on_event: Event | None = None,
+) -> dict:
+    """后台生成训练集。
+
+    改写几百条要十几分钟，同步接口会让请求一直挂着、前端只能干等，
+    所以改成后台跑 + 前端轮询 /api/finetune/state 看进度。
+    """
+    with _lock:
+        if _state["running"]:
+            return {"ok": False, "msg": "已有任务在跑"}
+        _state.update(running=True, stage="准备", progress=0.0, log=[], result=None)
+
+    def go() -> None:
+        try:
+            r = build_dataset(
+                topic, min_samples=min_samples, rewrite=rewrite, on_event=on_event
+            )
+            _state["result"] = r
+        except Exception as e:  # noqa: BLE001
+            _emit(on_event, "error", f"生成训练集失败：{str(e)[:120]}")
+            _state["result"] = {"ok": False, "msg": str(e)}
+        finally:
+            with _lock:
+                _state["running"] = False
+
+    threading.Thread(target=go, daemon=True).start()
+    return {"ok": True, "msg": "已开始生成训练集"}
 
 
 # --------------------------------------------------------------------------
