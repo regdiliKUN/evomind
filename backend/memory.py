@@ -18,7 +18,7 @@ from . import config, llm
 
 _lock = threading.RLock()
 _local = threading.local()
-_vec_cache: tuple[list[int], np.ndarray] | None = None
+_vec_cache: dict[int, tuple[list[int], np.ndarray]] | None = None
 _cache_lock = threading.RLock()
 
 SCHEMA = """
@@ -170,27 +170,31 @@ def _invalidate() -> None:
         _vec_cache = None
 
 
-def _all_vectors() -> tuple[list[int], np.ndarray]:
+def _all_vectors(dimension: int) -> tuple[list[int], np.ndarray]:
+    """按维度缓存单位向量，避免模型切换后混合维度导致 vstack 崩溃。"""
     global _vec_cache
     with _cache_lock:
         if _vec_cache is not None:
-            return _vec_cache
+            return _vec_cache.get(dimension, ([], np.empty((0, dimension), dtype=np.float32)))
         rows = conn().execute(
             "SELECT rowid, embedding FROM knowledge WHERE embedding IS NOT NULL"
         ).fetchall()
-        ids: list[int] = []
-        vecs: list[np.ndarray] = []
+        groups: dict[int, tuple[list[int], list[np.ndarray]]] = {}
         for r in rows:
             try:
                 v = _from_blob(r["embedding"])
-                if v.size:
-                    ids.append(r["rowid"])
-                    vecs.append(v)
-            except Exception:
+                if not v.size or not np.isfinite(v).all():
+                    continue
+                norm = float(np.linalg.norm(v))
+                if not np.isfinite(norm) or norm == 0:
+                    continue
+                ids, vecs = groups.setdefault(v.size, ([], []))
+                ids.append(r["rowid"])
+                vecs.append(v / norm)
+            except (TypeError, ValueError):
                 continue
-        mat = np.vstack(vecs) if vecs else np.zeros((0, 1), dtype=np.float32)
-        _vec_cache = (ids, mat)
-        return _vec_cache
+        _vec_cache = {size: (ids, np.vstack(vecs)) for size, (ids, vecs) in groups.items()}
+        return _vec_cache.get(dimension, ([], np.empty((0, dimension), dtype=np.float32)))
 
 
 def _normalize(m: np.ndarray) -> np.ndarray:
@@ -201,12 +205,20 @@ def _normalize(m: np.ndarray) -> np.ndarray:
     return m / n
 
 
-def similarity(vec: list[float], rowids: list[int], mat: np.ndarray) -> list[tuple[int, float]]:
-    if not rowids:
+def similarity(
+    vec: list[float], rowids: list[int], mat: np.ndarray, *,
+    k: int = 20, normalized: bool = False,
+) -> list[tuple[int, float]]:
+    if not rowids or k <= 0:
         return []
     q = _normalize(np.asarray([vec], dtype=np.float32))
-    sims = (_normalize(mat) @ q.T).ravel()
-    order = np.argsort(-sims)[:20]
+    if q.shape[1] != mat.shape[1] or not np.isfinite(q).all() or not np.any(q):
+        return []
+    sims = ((mat if normalized else _normalize(mat)) @ q.T).ravel()
+    count = min(k, len(rowids))
+    # 只对命中的 k 条排序，避免每次给整个知识库排序。
+    candidates = np.argpartition(-sims, count - 1)[:count]
+    order = candidates[np.argsort(-sims[candidates], kind="stable")]
     return [(rowids[i], float(sims[i])) for i in order]
 
 
@@ -245,35 +257,33 @@ def add_point(
     if vec is None:
         vec = llm.embed([claim + " " + detail[:400]])[0]
 
-    if dedup:
-        rowids, mat = _all_vectors()
-        for rid, score in similarity(vec, rowids, mat)[:3]:
-            if score >= config.get("dedup_threshold", 0.93):
-                return None
+    vector = np.asarray(vec, dtype=np.float32)
+    if vector.ndim != 1 or not vector.size or not np.isfinite(vector).all():
+        raise ValueError("知识点向量必须是非空的有限数值数组")
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm == 0:
+        raise ValueError("知识点向量的长度必须是有限正数")
 
-    pid = uuid.uuid4().hex[:16]
-    c = conn()
-    c.execute(
-        "INSERT INTO knowledge(id,topic,claim,detail,source_url,source_title,source_kind,"
-        "tags,confidence,embedding,session_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            pid,
-            topic,
-            claim,
-            detail,
-            source_url,
-            source_title,
-            source_kind,
-            json.dumps(list(tags), ensure_ascii=False),
-            confidence,
-            _to_blob(vec),
-            session_id,
-            time.time(),
-        ),
-    )
-    c.commit()
-    _invalidate()
-    return pid
+    # 推理在锁外；检查、插入与缓存失效必须串行，防止并发重复入库。
+    with _lock:
+        if dedup:
+            rowids, mat = _all_vectors(len(vec))
+            for rid, score in similarity(vec, rowids, mat, k=1, normalized=True):
+                if score >= config.get("dedup_threshold", 0.93):
+                    return None
+
+        pid = uuid.uuid4().hex[:16]
+        c = conn()
+        with c:
+            c.execute(
+                "INSERT INTO knowledge(id,topic,claim,detail,source_url,source_title,source_kind,"
+                "tags,confidence,embedding,session_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (pid, topic, claim, detail, source_url, source_title, source_kind,
+                 json.dumps(list(tags), ensure_ascii=False), confidence,
+                 _to_blob(vec), session_id, time.time()),
+            )
+        _invalidate()
+        return pid
 
 
 # --------------------------------------------------------------------------
@@ -286,15 +296,23 @@ def search(
     topic: str | None = None,
     vec: list[float] | None = None,
 ) -> list[dict]:
+    k = max(0, min(int(k), 1000))
+    if not query.strip() or k == 0:
+        return []
     if vec is None:
         vec = llm.embed([query])[0]
-    rowids, mat = _all_vectors()
+    rowids, mat = _all_vectors(len(vec))
     if not rowids:
         return []
-    hits = similarity(vec, rowids, mat)
+    if topic:
+        allowed = {r[0] for r in conn().execute("SELECT rowid FROM knowledge WHERE topic=?", (topic,))}
+        indices = [i for i, rid in enumerate(rowids) if rid in allowed]
+        rowids = [rowids[i] for i in indices]
+        mat = mat[indices]
+    hits = similarity(vec, rowids, mat, k=k, normalized=True)
     if not hits:
         return []
-    top_ids = [rid for rid, _ in hits[: max(k * 4, 20)]]
+    top_ids = [rid for rid, _ in hits]
     score_map = dict(hits)
     placeholders = ",".join("?" * len(top_ids))
     # 必须显式选出 rowid，SELECT * 不包含它
@@ -321,6 +339,9 @@ def search(
 
 
 def keyword_search(query: str, k: int = 10) -> list[dict]:
+    k = max(0, min(int(k), 1000))
+    if not query.strip() or k == 0:
+        return []
     like = f"%{query}%"
     rows = conn().execute(
         "SELECT * FROM knowledge WHERE claim LIKE ? OR detail LIKE ? ORDER BY created_at DESC LIMIT ?",
@@ -342,6 +363,15 @@ def keyword_search(query: str, k: int = 10) -> list[dict]:
 # --------------------------------------------------------------------------
 # 统计与列表
 # --------------------------------------------------------------------------
+def count_points(topic: str | None = None) -> int:
+    sql = "SELECT COUNT(*) FROM knowledge"
+    params = ()
+    if topic:
+        sql += " WHERE topic=?"
+        params = (topic,)
+    return conn().execute(sql, params).fetchone()[0]
+
+
 def stats() -> dict:
     c = conn()
     total = c.execute("SELECT COUNT(*) n FROM knowledge").fetchone()["n"]
@@ -410,10 +440,11 @@ def list_points(topic: str | None = None, limit: int = 50, offset: int = 0) -> l
 
 
 def delete_point(pid: str) -> bool:
-    c = conn()
-    c.execute("DELETE FROM knowledge WHERE id=?", (pid,))
-    c.commit()
-    _invalidate()
+    with _lock:
+        c = conn()
+        with c:
+            c.execute("DELETE FROM knowledge WHERE id=?", (pid,))
+        _invalidate()
     return True
 
 

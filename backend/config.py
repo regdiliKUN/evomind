@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -71,48 +73,100 @@ _lock = threading.RLock()
 _cache: dict[str, Any] | None = None
 
 
+def _validated(patch: dict[str, Any]) -> dict[str, Any]:
+    """忽略未知键，拒绝会破坏后台任务的类型或数值。"""
+    ranges = {
+        "temperature": (0, 2), "context_num": (256, 131072),
+        "ocr_dpi": (72, 600), "max_rounds": (1, 100),
+        "queries_per_round": (1, 20), "fetch_per_round": (1, 50),
+        "min_relevance": (0, 1), "dedup_threshold": (0, 1),
+        "idle_minutes": (0, 10080), "auto_rounds": (1, 100),
+        "disk_budget_gb": (1, 1000000), "max_model_gb": (1, 1000000),
+        "download_workers": (1, 16), "finetune_min_samples": (1, 1000000),
+        "finetune_epochs": (1, 100), "finetune_lr": (1e-10, 1),
+        "finetune_lora_r": (1, 1024), "request_timeout": (1, 600),
+    }
+    clean = {}
+    for key, value in patch.items():
+        if key not in DEFAULTS:
+            continue
+        expected = type(DEFAULTS[key])
+        valid_type = type(value) is expected
+        if expected is float:
+            valid_type = type(value) in (int, float) and math.isfinite(value)
+        if not valid_type:
+            raise ValueError(f"{key} 的值类型不正确")
+        if key in ranges:
+            low, high = ranges[key]
+            if not low <= value <= high:
+                raise ValueError(f"{key} 必须在 {low} 到 {high} 之间")
+        if key in ("model", "embed_model", "ollama_url") and not value.strip():
+            raise ValueError(f"{key} 不能为空")
+        clean[key] = value
+    return clean
+
+
 def load() -> dict[str, Any]:
     """读取配置，缺失项用默认值补齐并写回。"""
     global _cache
     with _lock:
         if _cache is not None:
-            return _cache
+            return dict(_cache)
         cfg = dict(DEFAULTS)
         if CONFIG_FILE.exists():
             try:
-                raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                # 只认 DEFAULTS 里有的键。历史版本或外部脚本写进来的未知键
-                # （比如测试留下的 __bogus__）会一直留在配置文件里，
-                # 每次 load 都原样写回，越积越脏 —— 这里直接丢弃。
-                cfg.update({k: v for k, v in raw.items() if k in DEFAULTS})
-            except Exception:
+                stored = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if isinstance(stored, dict):
+                    for key, value in stored.items():
+                        try:
+                            cfg.update(_validated({key: value}))
+                        except ValueError:
+                            pass  # 无效旧值只回退对应的默认项
+            except (OSError, ValueError):
                 pass
         # 环境变量覆盖（便于命令行调试）
         if os.environ.get("EVOMIND_MODEL"):
             cfg["model"] = os.environ["EVOMIND_MODEL"]
-        _cache = cfg
         save(cfg)
-        return cfg
+        return dict(_cache)
 
 
 def save(cfg: dict[str, Any]) -> None:
     global _cache
     with _lock:
-        _cache = cfg
-        CONFIG_FILE.write_text(
-            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        clean = {**DEFAULTS, **_validated(cfg)}
+        # 同目录原子替换；失败时旧文件与内存缓存都保持不变。
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=CONFIG_FILE.parent,
+                prefix=CONFIG_FILE.name + ".", suffix=".tmp", delete=False,
+            ) as f:
+                temporary = Path(f.name)
+                json.dump(clean, f, ensure_ascii=False, indent=2, allow_nan=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, CONFIG_FILE)
+            _cache = dict(clean)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def get(key: str, default: Any = None) -> Any:
-    return load().get(key, default)
+    with _lock:
+        if _cache is None:
+            load()
+        return _cache.get(key, default)
 
 
 def update(patch: dict[str, Any]) -> dict[str, Any]:
-    cfg = dict(load())
-    cfg.update(patch)
-    save(cfg)
-    return cfg
+    with _lock:
+        clean = _validated(patch)
+        cfg = load()
+        cfg.update(clean)
+        save(cfg)
+        return dict(_cache)
 
 
 def disk_usage_gb() -> float:

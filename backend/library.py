@@ -179,6 +179,7 @@ def state() -> dict:
 # 目录配置
 # --------------------------------------------------------------------------
 def add_dir(path: str, label: str = "", excludes: list[str] | None = None) -> dict:
+    init_db()
     p = Path(path)
     if not p.exists() or not p.is_dir():
         return {"ok": False, "msg": f"目录不存在：{path}"}
@@ -977,16 +978,16 @@ def library_stats() -> dict:
 
 
 def delete_book(book_id: str, purge_points: bool = False) -> dict:
-    c = memory.conn()
-    row = c.execute("SELECT path, source_type FROM books WHERE id=?", (book_id,)).fetchone()
-    if purge_points:
-        try:
-            c.execute("DELETE FROM knowledge WHERE book_id=?", (book_id,))
-        except Exception:
-            pass
-    c.execute("DELETE FROM book_chapters WHERE book_id=?", (book_id,))
-    c.execute("DELETE FROM books WHERE id=?", (book_id,))
-    c.commit()
+    with memory._lock:
+        c = memory.conn()
+        row = c.execute("SELECT path, source_type FROM books WHERE id=?", (book_id,)).fetchone()
+        with c:
+            if purge_points:
+                c.execute("DELETE FROM knowledge WHERE book_id=?", (book_id,))
+            c.execute("DELETE FROM book_chapters WHERE book_id=?", (book_id,))
+            c.execute("DELETE FROM books WHERE id=?", (book_id,))
+        if purge_points:
+            memory._invalidate()
 
     # 链接导入的文件是我们自己下载到 data/library 的，删书目时一并清掉，
     # 否则这个目录只增不减。用户自己书库里的文件绝不碰。

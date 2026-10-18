@@ -9,6 +9,8 @@ const state = {
   cfg: null,
   datasetPath: "",
   chatBusy: false,
+  knowledgeQuery: "",
+  knowledgeRequest: 0,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -394,13 +396,17 @@ $("#btn-auto").addEventListener("click", async () => {
 });
 
 /* ---------------- 知识库 ---------------- */
-async function loadKnowledge(q) {
+async function loadKnowledge(q = state.knowledgeQuery) {
+  state.knowledgeQuery = q || "";
+  const request = ++state.knowledgeRequest;
   const topic = $("#kb-topic").value;
-  const url = q
-    ? `/api/knowledge?q=${encodeURIComponent(q)}&limit=60`
-    : `/api/knowledge?limit=60${topic ? "&topic=" + encodeURIComponent(topic) : ""}`;
+  const params = new URLSearchParams({ limit: "60" });
+  if (q) params.set("q", q);
+  if (topic) params.set("topic", topic);
+  const url = `/api/knowledge?${params}`;
   try {
     const r = await api(url);
+    if (request !== state.knowledgeRequest) return;
     renderKnowledge(r.items);
     if (!q) fillTopicSelect(r.items);
   } catch (e) {
@@ -451,7 +457,7 @@ function renderKnowledge(items) {
 
 $("#btn-kb-search").addEventListener("click", () => {
   const q = $("#kb-search").value.trim();
-  loadKnowledge(q || undefined);
+  loadKnowledge(q);
 });
 $("#kb-search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("#btn-kb-search").click();
@@ -1170,14 +1176,18 @@ $("#btn-save-cfg").addEventListener("click", async () => {
 });
 
 /* ---------------- 轮询 ---------------- */
+let refreshBusy = false;
 async function refreshAll() {
+  if (refreshBusy || document.hidden) return;
+  refreshBusy = true;
   try {
     const st = await api("/api/status");
     state.status = st;
     paintTopbar(st);
-    if (state.view === "dashboard") loadDashboard(st);
-    if (state.view === "knowledge") loadKnowledge();
+    if (state.view === "dashboard") await loadDashboard(st);
+    if (state.view === "knowledge") await loadKnowledge();
   } catch (_) {}
+  finally { refreshBusy = false; }
 }
 
 connectSSE();

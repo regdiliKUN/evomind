@@ -70,7 +70,10 @@ def api_config_get() -> dict:
 def api_config_set(patch: dict = Body(...)) -> dict:
     allowed = set(config.DEFAULTS.keys())
     clean = {k: v for k, v in patch.items() if k in allowed}
-    return config.update(clean)
+    try:
+        return config.update(clean)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
 
 
 # --------------------------------------------------------------------------
@@ -165,7 +168,7 @@ def api_events() -> StreamingResponse:
 
 @app.get("/api/events/recent")
 def api_events_recent(limit: int = 80) -> list[dict]:
-    return list(reversed(memory.recent_events(limit)))
+    return list(reversed(memory.recent_events(max(0, min(limit, 1000)))))
 
 
 # --------------------------------------------------------------------------
@@ -176,10 +179,10 @@ def api_knowledge(
     topic: str | None = None, limit: int = 60, offset: int = 0, q: str | None = None
 ) -> dict:
     if q:
-        items = memory.search(q, k=limit)
+        items = memory.search(q, k=limit, topic=topic)
     else:
         items = memory.list_points(topic, limit, offset)
-    return {"items": items, "total": memory.stats()["points"]}
+    return {"items": items, "total": memory.count_points(topic)}
 
 
 @app.delete("/api/knowledge/{pid}")

@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import io
+import gc
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -21,20 +23,10 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-
-# ---------------------------------------------------------------------------
-# 测试一律跑在临时数据库上。
-# 以前这里直接连 data/knowledge/knowledge.db，每跑一次就往用户知识库里
-# 塞一批 __test_* / __perf 知识点（实测累积了 84 条，总览页的主题列表
-# 前几名全是测试残留）。必须在导入 backend 之后、任何 conn() 之前改掉。
-# ---------------------------------------------------------------------------
-_TMP_DB_DIR = Path(tempfile.mkdtemp(prefix="evo_db_"))
-import backend.config as _config  # noqa: E402
-
-_config.DB_FILE = _TMP_DB_DIR / "knowledge.db"
 
 FAST = "--fast" in sys.argv
 
@@ -540,8 +532,12 @@ def test_downloader():
         assert "ok" in r
         return f"返回 {list(r.keys())}"
 
-    case("下载", "体积探测正常仓库", size_probe)
-    case("下载", "体积探测不存在仓库", size_probe_bogus)
+    if FAST:
+        _results.append({"group": "下载", "name": "体积探测（--fast 跳过网络）",
+                         "status": WARN, "elapsed": 0, "note": "未执行外部请求"})
+    else:
+        case("下载", "体积探测正常仓库", size_probe)
+        case("下载", "体积探测不存在仓库", size_probe_bogus)
     case("下载", "下载闸门返回结构", budget_gate)
 
 
@@ -638,7 +634,7 @@ def test_perf():
 # ==========================================================================
 # 主流程
 # ==========================================================================
-def main() -> int:
+def _run_suite() -> int:
     print("=" * 74)
     print("  EvoMind 测试套件" + ("（快速模式：跳过网络与 LLM）" if FAST else ""))
     print("=" * 74)
@@ -680,10 +676,38 @@ def main() -> int:
     w = sum(1 for r in _results if r["status"] == WARN)
     print("\n" + "=" * 74)
     print(f"  通过 {p} · 失败 {f} · 警告 {w} · 共 {len(_results)}")
-    print(f"  临时库：{_TMP_DB_DIR}")
     print("=" * 74)
-    shutil.rmtree(_TMP_DB_DIR, ignore_errors=True)
     return 1 if f else 0
+
+
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    from backend import config, llm, memory
+
+    def fake_embed(texts, **kwargs):
+        # 固定哈希仅用于离线测试，保留相同输入应去重的性质。
+        return [[(b - 127.5) / 127.5 for b in hashlib.sha256(t.encode()).digest()]
+                for t in texts]
+
+    with tempfile.TemporaryDirectory(prefix="evomind_suite_") as tmp:
+        root = Path(tmp)
+        with patch.multiple(config, DATA=root, LOGS=root, MODELS=root / "models",
+                            DATASETS=root / "datasets", KNOWLEDGE=root,
+                            CONFIG_FILE=root / "config.json", DB_FILE=root / "knowledge.db",
+                            _cache=None):
+            try:
+                if FAST:
+                    with patch.object(llm, "embed", side_effect=fake_embed):
+                        return _run_suite()
+                return _run_suite()
+            finally:
+                c = getattr(memory._local, "c", None)
+                if c is not None:
+                    c.close()
+                    memory._local.c = None
+                memory._invalidate()
+                gc.collect()
 
 
 if __name__ == "__main__":

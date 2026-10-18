@@ -145,6 +145,7 @@ quality 是本轮知识质量自评（0-1）。"""
 class Engine:
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
+        self._start_lock = threading.Lock()
         self._stop = threading.Event()
         self.state: dict[str, Any] = {
             "running": False,
@@ -165,6 +166,10 @@ class Engine:
 
     # ---------------- 对外接口 ----------------
     def start(self, direction: str, rounds: int | None = None) -> dict:
+        with self._start_lock:
+            return self._start_locked(direction, rounds)
+
+    def _start_locked(self, direction: str, rounds: int | None) -> dict:
         if self.state["running"]:
             return {"ok": False, "msg": "已有学习任务在跑，请先停止"}
         # 方向会被当作主题分组用，多行粘贴进来的换行和缩进要压平，
@@ -172,7 +177,10 @@ class Engine:
         direction = " ".join(direction.split())
         if not direction:
             return {"ok": False, "msg": "请填写学习方向"}
-        rounds = int(rounds or config.get("max_rounds", 8))
+        if rounds is None:
+            rounds = config.get("max_rounds", 8)
+        if type(rounds) is not int or not 1 <= rounds <= 100:
+            return {"ok": False, "msg": "学习轮数必须是 1 到 100 的整数"}
         self._stop.clear()
         self._used_queries = []
         self._visited = set()
@@ -192,7 +200,12 @@ class Engine:
         self._thread = threading.Thread(
             target=self._run, args=(direction, rounds, sid), daemon=True
         )
-        self._thread.start()
+        try:
+            self._thread.start()
+        except Exception:
+            self.state.update(running=False, stage="idle")
+            memory.update_session(sid, status="error", ended_at=time.time())
+            raise
         return {"ok": True, "session_id": sid}
 
     def stop(self) -> dict:
@@ -220,9 +233,7 @@ class Engine:
         try:
             self._emit("info", f"开始学习「{direction}」，计划 {rounds} 轮", stage="init")
             if not llm.healthy():
-                self._emit("error", "Ollama 未运行，无法开始学习")
-                self.state.update(running=False, stage="error")
-                return
+                raise llm.LLMError("Ollama 未运行，无法开始学习")
             llm.ensure_models(lambda m: self._emit("info", m))
 
             for r in range(1, rounds + 1):
