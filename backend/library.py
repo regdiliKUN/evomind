@@ -407,8 +407,37 @@ def parse_html(p: Path) -> dict:
             "text_ratio": 1.0, "scanned": False}
 
 
+def _extract_text(p: Path) -> dict:
+    """按扩展名提取正文。统一入口，避免多处重复的 if/elif 分支。
+
+    返回 {text, pages, chars, text_ratio, scanned, [unsupported], [title]}
+    """
+    ext = p.suffix.lower()
+    if ext == ".pdf":
+        return parse_pdf(p)
+    if ext == ".epub":
+        return parse_epub(p)
+    if ext == ".docx":
+        return parse_docx(p)
+    if ext in (".htm", ".html"):
+        return parse_html(p)
+    if ext == ".doc":
+        return {"text": "", "pages": 0, "chars": 0, "text_ratio": 0,
+                "scanned": False, "unsupported": ".doc 需要先转成 .docx"}
+    if ext == ".rtf":
+        raw = _read_text_file(p)
+        t = re.sub(r"\\[a-z]+\d*\s?|[{}]", "", raw)
+        return {"text": t, "pages": 0, "chars": len(t), "text_ratio": 1.0, "scanned": False}
+    t = _read_text_file(p)
+    return {"text": t, "pages": 0, "chars": len(t), "text_ratio": 1.0, "scanned": False}
+
+
 def parse_book(book_id: str, on_event: Event | None = None) -> dict:
-    """解析一本书，把章节写进 book_chapters，更新状态。"""
+    """解析一本书，把章节写进 book_chapters，更新状态。
+
+    返回值带 text，调用方（import_book）可以直接复用，
+    不必再解析一遍 —— 大 PDF 解析一次就是几秒到几十秒。
+    """
     init_db()
     c = memory.conn()
     row = c.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
@@ -424,28 +453,8 @@ def parse_book(book_id: str, on_event: Event | None = None) -> dict:
     c.execute("UPDATE books SET status='parsing' WHERE id=?", (book_id,))
     c.commit()
 
-    ext = p.suffix.lower()
     try:
-        if ext == ".pdf":
-            res = parse_pdf(p)
-        elif ext == ".epub":
-            res = parse_epub(p)
-        elif ext == ".docx":
-            res = parse_docx(p)
-        elif ext in (".htm", ".html"):
-            res = parse_html(p)
-        elif ext == ".doc":
-            res = {"text": "", "pages": 0, "chars": 0, "text_ratio": 0,
-                   "scanned": False, "unsupported": ".doc 需要先转成 .docx"}
-        elif ext == ".rtf":
-            raw = _read_text_file(p)
-            t = re.sub(r"\\[a-z]+\d*\s?|[{}]", "", raw)
-            res = {"text": t, "pages": 0, "chars": len(t),
-                   "text_ratio": 1.0, "scanned": False}
-        else:
-            t = _read_text_file(p)
-            res = {"text": t, "pages": 0, "chars": len(t),
-                   "text_ratio": 1.0, "scanned": False}
+        res = _extract_text(p)
     except Exception as e:  # noqa: BLE001
         c.execute("UPDATE books SET status='failed', error=? WHERE id=?",
                   (str(e)[:300], book_id))
@@ -488,7 +497,7 @@ def parse_book(book_id: str, on_event: Event | None = None) -> dict:
     )
     c.commit()
     _emit(on_event, "info", f"解析完成：{title}（{len(text)} 字 / {len(chapters)} 章）")
-    return {"ok": True, "chars": len(text), "chapters": len(chapters)}
+    return {"ok": True, "chars": len(text), "chapters": len(chapters), "text": text}
 
 
 # --------------------------------------------------------------------------
@@ -536,39 +545,37 @@ def import_book(
         return {"ok": False, "msg": "书目不存在"}
     book = dict(row)
 
+    p = Path(book["path"])
+    ext = p.suffix.lower()
+
+    # 正文只解析一次：状态还没就绪时 parse_book 会顺带解析并把 text 带回来，
+    # 直接就绪的直接读一次。之前两种情况都会再解析一遍，大 PDF 白白多花几十秒。
     if book["status"] not in ("ready", "done"):
         r = parse_book(book_id, on_event)
         if not r.get("ok"):
             return r
+        raw_text = r.get("text") or ""
         row = c.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
         book = dict(row)
+    else:
+        try:
+            raw_text = _extract_text(p).get("text", "")
+        except Exception as e:  # noqa: BLE001
+            c.execute("UPDATE books SET status='failed', error=? WHERE id=?",
+                      (str(e)[:300], book_id))
+            c.commit()
+            return {"ok": False, "msg": str(e)}
 
     topic = topic or book["topic"] or f"书库 · {book['title']}"
     c.execute("UPDATE books SET status='importing', topic=? WHERE id=?", (topic, book_id))
     c.commit()
 
-    p = Path(book["path"])
-    ext = p.suffix.lower()
-    try:
-        if ext == ".pdf":
-            res = parse_pdf(p)
-        elif ext == ".epub":
-            res = parse_epub(p)
-        elif ext == ".docx":
-            res = parse_docx(p)
-        elif ext in (".htm", ".html"):
-            res = parse_html(p)
-        elif ext == ".rtf":
-            raw = _read_text_file(p)
-            res = {"text": re.sub(r"\\[a-z]+\d*\s?|[{}]", "", raw)}
-        else:
-            res = {"text": _read_text_file(p)}
-    except Exception as e:  # noqa: BLE001
-        c.execute("UPDATE books SET status='failed', error=? WHERE id=?", (str(e)[:300], book_id))
+    if not raw_text:
+        c.execute("UPDATE books SET status='ready', error='正文为空' WHERE id=?", (book_id,))
         c.commit()
-        return {"ok": False, "msg": str(e)}
+        return {"ok": False, "msg": "正文为空，无法提炼"}
 
-    chapters = _split_chapters(res["text"], book["title"])
+    chapters = _split_chapters(raw_text, book["title"])
     total_points = 0
     used = 0
     for ci, ch in enumerate(chapters):
@@ -592,7 +599,7 @@ def import_book(
                     temperature=0.2,
                 )
             except Exception as e:  # noqa: BLE001
-                _emit(on_event, "warn", f"提炼失败：{str(e)[:60]}")
+                _emit(on_event, "warn", f"提炼失败（内部已重试）：{str(e)[:60]}")
                 continue
             for pt in (data.get("points") or [])[:6]:
                 claim = (pt.get("claim") or "").strip()
@@ -649,6 +656,15 @@ def import_books_async(
     with _lock:
         if _task["running"]:
             return {"ok": False, "msg": "已有书库任务在跑"}
+
+    # OCR 与导入都是重任务，同时跑会互相拖慢
+    try:
+        from . import ocr as _ocr
+
+        if _ocr.state().get("running"):
+            return {"ok": False, "msg": "OCR 任务正在跑，等它结束再导入"}
+    except Exception:
+        pass
 
     def go() -> None:
         _task.update(running=True, kind="import", total=len(book_ids), done=0,
@@ -755,7 +771,8 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
                                         chapter=ch["title"][:60], text=chunk[:9000]),
                     temperature=0.2,
                 )
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                _emit(on_event, "warn", f"提炼失败（内部已重试）：{str(e)[:60]}")
                 continue
             for pt in (data.get("points") or [])[:6]:
                 claim = (pt.get("claim") or "").strip()

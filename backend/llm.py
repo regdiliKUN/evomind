@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Iterable, Iterator
 
 import httpx
@@ -220,7 +221,11 @@ def chat_json(
     retries: int = 2,
     **kw,
 ) -> Any:
-    """要求模型输出 JSON，失败自动重试（重试时追加更严格的提示）。"""
+    """要求模型输出 JSON，失败自动重试（重试时追加更严格的提示）。
+
+    重试之间做指数退避 —— 网络抖动时立刻重试几乎必然再失败，
+    等一下反而更容易成功；纯 JSON 格式问题则会因为追加了严格提示而改善。
+    """
     last: Exception | None = None
     for attempt in range(retries + 1):
         extra = "" if attempt == 0 else "\n\n【重要】上次输出不是合法 JSON。只输出 JSON 本体，不要任何解释、不要 Markdown 代码围栏。"
@@ -234,6 +239,8 @@ def chat_json(
             return extract_json(raw)
         except Exception as e:  # noqa: BLE001
             last = e
+            if attempt < retries:
+                time.sleep(0.8 * (attempt + 1))
     raise LLMError(f"结构化输出失败：{last}")
 
 

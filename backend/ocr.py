@@ -283,6 +283,15 @@ def ocr_book_async(
         if _task["running"]:
             return {"ok": False, "msg": "已有 OCR 任务在跑，请先等待或停止"}
 
+    # 书库导入和 OCR 都是重任务，同时跑会互相拖慢（都吃 CPU/GPU）
+    try:
+        from . import library as _lib
+
+        if _lib.state().get("running"):
+            return {"ok": False, "msg": "书库导入任务正在跑，等它结束再开始 OCR"}
+    except Exception:
+        pass
+
     def go() -> None:
         from . import library
 
@@ -453,11 +462,12 @@ def render_png(book_id: str, page_no: int, dpi: int = 110) -> bytes | None:
     if not row:
         return None
     try:
-        doc = pymupdf.open(row["path"])
-        if page_no >= doc.page_count:
-            return None
-        img, _ = render_page(doc, page_no, dpi)
-        return img
+        # 显式关闭：前端每翻一页都会调这里，不依赖 GC 回收文件句柄
+        with pymupdf.open(row["path"]) as doc:
+            if page_no >= doc.page_count:
+                return None
+            img, _ = render_page(doc, page_no, dpi)
+            return img
     except Exception:
         return None
 
