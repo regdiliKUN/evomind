@@ -211,9 +211,52 @@ def vision_available() -> tuple[bool, str]:
 # --------------------------------------------------------------------------
 # 页范围解析
 # --------------------------------------------------------------------------
+_CN_DIGIT = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+             "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn2int(s: str) -> int:
+    """把「十二」「二十」「二十三」这类中文数字转成整数。"""
+    if s.isdigit():
+        return int(s)
+    if "十" in s:
+        a, _, b = s.partition("十")
+        tens = _CN_DIGIT.get(a, 1) if a else 1
+        ones = _CN_DIGIT.get(b, 0) if b else 0
+        return tens * 10 + ones
+    return _CN_DIGIT.get(s, 0)
+
+
+def _normalize_spec(spec: str) -> str:
+    """把各种写法统一成「数字-数字,数字」的形式。
+
+    支持：1-50 / 1到50 / 第1页至第50页 / 一-五十 / 1~50 / 1，3，5
+    """
+    s = (spec or "").strip().lower()
+    for a, b in (("到", "-"), ("至", "-"), ("~", "-"), ("～", "-"),
+                 ("－", "-"), ("—", "-"), ("–", "-"), ("，", ","), ("、", ","),
+                 (" ", ""), ("第", ""), ("页", ""), ("全部", "all"), ("所有", "all")):
+        s = s.replace(a, b)
+    # 中文数字转阿拉伯数字（逐段替换，只处理 1-99）
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch in _CN_DIGIT or ch == "十":
+            j = i
+            while j < len(s) and (s[j] in _CN_DIGIT or s[j] == "十"):
+                j += 1
+            out.append(str(_cn2int(s[i:j])))
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def parse_pages(spec: str, total: int) -> list[int]:
-    """支持 "1-50"、"1,3,5"、"1-20,30-40"、"all"。页码从 1 开始。"""
-    spec = (spec or "all").strip().lower()
+    """支持 "1-50"、"1,3,5"、"1-20,30-40"、"all"，以及中文写法 "第一到五十页"。页码从 1 开始。"""
+    spec = _normalize_spec(spec)
     if spec in ("all", "", "*"):
         return list(range(total))
     pages: set[int] = set()
@@ -231,6 +274,17 @@ def parse_pages(spec: str, total: int) -> list[int]:
             if 0 <= n < total:
                 pages.add(n)
     return sorted(pages)
+
+
+def parse_pages_checked(spec: str, total: int) -> tuple[list[int], str]:
+    """解析页码并返回错误说明，供 API 层给出明确提示，而不是静默返回空。"""
+    normalized = _normalize_spec(spec)
+    pages = parse_pages(spec, total)
+    if pages:
+        return pages, ""
+    if normalized in ("all", "", "*"):
+        return [], "这本书没有可识别的页面"
+    return [], f"看不懂「{spec}」这个页码范围，请用 1-50 或 all 这样的写法"
 
 
 # --------------------------------------------------------------------------
@@ -294,6 +348,14 @@ def ocr_book_async(
     except Exception:
         pass
 
+    # 磁盘闸门：识别结果要写数据库，空间耗尽会写失败
+    try:
+        free = config.free_disk_gb()
+        if free < 2:
+            return {"ok": False, "msg": f"磁盘剩余 {free}GB，空间不足，先清理再 OCR"}
+    except Exception:  # noqa: BLE001
+        pass
+
     def go() -> None:
         from . import library
 
@@ -310,7 +372,12 @@ def ocr_book_async(
             return
 
         total_pages = doc.page_count
-        targets = parse_pages(pages, total_pages)
+        targets, page_err = parse_pages_checked(pages, total_pages)
+        if page_err:
+            _emit(on_event, "error", page_err)
+            with _task_lock:
+                _task.update(running=False, stage="idle")
+            return
         if skip_done:
             done_rows = c.execute(
                 "SELECT page_no FROM ocr_pages WHERE book_id=? AND chars>0", (book_id,)

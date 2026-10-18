@@ -344,12 +344,23 @@ def stats() -> dict:
     ).fetchone()["n"]
     sessions = c.execute("SELECT COUNT(*) n FROM sessions").fetchone()["n"]
     res = c.execute("SELECT COUNT(*) n FROM resources WHERE status='done'").fetchone()["n"]
+    # 语义检索是全量向量比对，规模上去会线性变慢（1000 条约 25ms，1 万条约 250ms）。
+    # 到阈值就明确提示，别等用户自己发现「怎么越来越卡」。
+    scale_warn = ""
+    if total >= 20000:
+        scale_warn = (
+            f"知识点已达 {total} 条，语义检索明显变慢（每次全量比对）。"
+            "建议按方向拆分知识库，或引入近似索引（HNSW/FAISS）。"
+        )
+    elif total >= 5000:
+        scale_warn = f"知识点已达 {total} 条，检索开始变慢，注意观察响应时间。"
     return {
         "points": total,
         "documents": docs,
         "new_24h": new24,
         "sessions": sessions,
         "resources": res,
+        "scale_warn": scale_warn,
         "topics": [{"topic": r["topic"], "count": r["n"]} for r in topics],
         "disk_gb": config.disk_usage_gb(),
         "budget_gb": config.get("disk_budget_gb"),

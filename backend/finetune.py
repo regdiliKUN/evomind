@@ -377,7 +377,33 @@ def train(
 
         import random
 
-        for ep in range(epochs):
+        # 断点续训：每轮结束存一次 adapter，中断后可从下一轮接着跑。
+        # 只按「轮」存而不是按「步」，是为了避免恢复优化器状态带来的复杂度 ——
+        # 一轮训练通常几分钟，重跑一轮的代价可以接受。
+        ckpt_root = OUTPUTS / f"ckpt_{tag}"
+        start_ep = 0
+        if ckpt_root.exists():
+            done_eps = sorted(
+                int(p.name[2:]) for p in ckpt_root.glob("ep*")
+                if p.is_dir() and p.name[2:].isdigit()
+            )
+            if done_eps and done_eps[-1] < epochs:
+                last = done_eps[-1]
+                try:
+                    from peft import PeftModel
+
+                    model = PeftModel.from_pretrained(
+                        model, str(ckpt_root / f"ep{last}"), is_trainable=True
+                    )
+                    model.to(dev)
+                    start_ep = last
+                    _emit(on_event, "info",
+                          f"发现第 {last} 轮 checkpoint，从第 {last+1} 轮继续训练")
+                except Exception as e:  # noqa: BLE001
+                    _emit(on_event, "warn", f"checkpoint 加载失败（{str(e)[:50]}），从头开始")
+                    start_ep = 0
+
+        for ep in range(start_ep, epochs):
             random.shuffle(enc)
             for i in range(0, len(enc) - bs + 1, bs):
                 batch = enc[i : i + bs]
@@ -412,6 +438,13 @@ def train(
                             f"loss {out.loss.item():.4f} · {int(time.time()-t0)}s",
                             progress=_state["progress"],
                         )
+            # 本轮结束，落盘 checkpoint
+            try:
+                ckpt_root.mkdir(parents=True, exist_ok=True)
+                model.save_pretrained(str(ckpt_root / f"ep{ep+1}"))
+                _emit(on_event, "info", f"第 {ep+1} 轮 checkpoint 已保存")
+            except Exception as e:  # noqa: BLE001
+                _emit(on_event, "warn", f"checkpoint 保存失败：{str(e)[:50]}")
 
         # 保存 adapter
         adapter_dir = OUTPUTS / f"adapter_{tag}_{int(time.time())}"
@@ -435,9 +468,16 @@ def train(
             merged = pm.merge_and_unload()
             merged.save_pretrained(str(merged_dir), safe_serialization=True)
             tok.save_pretrained(str(merged_dir))
+            # 打完成标记：没这个标记的 merged 目录视为半成品，列表里不显示
+            (merged_dir / ".ok").write_text("1", encoding="utf-8")
             _emit(on_event, "ok", f"合并完成：{merged_dir}")
         except Exception as e:  # noqa: BLE001
             _emit(on_event, "warn", f"合并失败（adapter 仍可用）：{e}")
+            # 清掉半成品，避免占 15GB 又不可用
+            try:
+                shutil.rmtree(merged_dir, ignore_errors=True)
+            except Exception:  # noqa: BLE001
+                pass
 
         _state.update(running=False, stage="done", progress=1.0)
 
@@ -490,11 +530,19 @@ def list_outputs() -> list[dict]:
     for p in sorted(OUTPUTS.iterdir(), key=lambda x: -x.stat().st_mtime):
         if not p.is_dir():
             continue
+        kind = "adapter" if p.name.startswith("adapter") else "merged"
+        # 合并中途失败会留下空壳目录；有 .ok 标记或完整权重文件才算可用
+        if kind == "merged" and not (
+            (p / ".ok").exists() or (p / "model.safetensors").exists()
+        ):
+            continue
+        if p.name.startswith("ckpt_"):
+            continue
         size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / (1024 ** 3)
         out.append(
             {
                 "name": p.name,
-                "kind": "adapter" if p.name.startswith("adapter") else "merged",
+                "kind": kind,
                 "size_gb": round(size, 2),
                 "mtime": p.stat().st_mtime,
             }

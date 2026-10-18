@@ -221,6 +221,8 @@ def scan(dirs: list[str] | None = None, on_event: Event | None = None) -> dict:
     found = 0
     added = 0
     skipped = 0
+    excluded_by_dir: dict[str, int] = {}   # 每个排除规则命中了多少文件
+    unsupported_ext: dict[str, int] = {}   # 因格式不支持跳过了多少
     _task.update(running=True, kind="scan", total=0, done=0, stage="scanning",
                  current="", stop=False, points=0)
     _emit(on_event, "stage", "开始扫描书库目录")
@@ -241,11 +243,15 @@ def scan(dirs: list[str] | None = None, on_event: Event | None = None) -> dict:
             try:
                 if not p.is_file():
                     continue
-                if _excluded(p, excludes):
+                hit = next((x for x in excludes if x and x in str(p)), None)
+                if hit:
+                    excluded_by_dir[hit] = excluded_by_dir.get(hit, 0) + 1
                     skipped += 1
                     continue
                 ext = p.suffix.lower()
                 if ext in SKIP_FORMATS or ext not in SUPPORTED:
+                    key = ext or "(无扩展名)"
+                    unsupported_ext[key] = unsupported_ext.get(key, 0) + 1
                     skipped += 1
                     continue
                 found += 1
@@ -282,9 +288,21 @@ def scan(dirs: list[str] | None = None, on_event: Event | None = None) -> dict:
         c.commit()
 
     _task.update(running=False, stage="idle", total=found, done=found)
-    msg = f"扫描完成：发现 {found} 个可导入文件，新增 {added} 个，跳过 {skipped} 个（图片/压缩包/排除目录）"
+    msg = f"扫描完成：发现 {found} 个可导入文件，新增 {added} 个，跳过 {skipped} 个"
     _emit(on_event, "ok", msg)
-    return {"ok": True, "found": found, "added": added, "skipped": skipped}
+    # 把跳过明细讲清楚，否则用户不知道排除规则到底排掉了什么
+    if excluded_by_dir:
+        detail = "、".join(f"{k}（{v} 个）" for k, v in excluded_by_dir.items())
+        _emit(on_event, "info", f"按排除规则跳过：{detail}")
+    if unsupported_ext:
+        top = sorted(unsupported_ext.items(), key=lambda x: -x[1])[:6]
+        detail = "、".join(f"{k} {v}" for k, v in top)
+        _emit(on_event, "info", f"按格式跳过：{detail}")
+    return {
+        "ok": True, "found": found, "added": added, "skipped": skipped,
+        "excluded_by_rule": excluded_by_dir,
+        "unsupported_ext": dict(sorted(unsupported_ext.items(), key=lambda x: -x[1])[:12]),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -312,7 +330,20 @@ def _split_chapters(text: str, fallback_title: str) -> list[dict]:
     return chapters or [{"title": fallback_title, "text": text}]
 
 
+MAX_TEXT_BYTES = 200 * 1024 * 1024   # 单个文本文件读取上限
+
+
 def _read_text_file(p: Path) -> str:
+    # Python 的 str 内部是宽字符，实测 36MB 文件读取峰值到 144MB（约 4 倍膨胀）。
+    # 不设上限的话，一个几百 MB 的 txt 就能把内存吃光。
+    try:
+        size = p.stat().st_size
+        if size > MAX_TEXT_BYTES:
+            raise ValueError(
+                f"文件 {size/1024/1024:.0f}MB 超过 {MAX_TEXT_BYTES//1024//1024}MB 上限，请先拆分"
+            )
+    except OSError:
+        pass
     for enc in ("utf-8", "utf-8-sig", "gbk", "gb18030", "big5", "shift_jis", "latin-1"):
         try:
             return p.read_text(encoding=enc)
@@ -668,6 +699,14 @@ def import_books_async(
     except Exception:
         pass
 
+    # 磁盘闸门：知识点要写数据库，空间耗尽会写失败
+    try:
+        free = config.free_disk_gb()
+        if free < 1:
+            return {"ok": False, "msg": f"磁盘剩余 {free}GB，空间不足，先清理再导入"}
+    except Exception:  # noqa: BLE001
+        pass
+
     def go() -> None:
         _task.update(running=True, kind="import", total=len(book_ids), done=0,
                      stage="importing", points=0, stop=False, current="")
@@ -893,6 +932,7 @@ def library_stats() -> dict:
 
 def delete_book(book_id: str, purge_points: bool = False) -> dict:
     c = memory.conn()
+    row = c.execute("SELECT path, source_type FROM books WHERE id=?", (book_id,)).fetchone()
     if purge_points:
         try:
             c.execute("DELETE FROM knowledge WHERE book_id=?", (book_id,))
@@ -901,4 +941,17 @@ def delete_book(book_id: str, purge_points: bool = False) -> dict:
     c.execute("DELETE FROM book_chapters WHERE book_id=?", (book_id,))
     c.execute("DELETE FROM books WHERE id=?", (book_id,))
     c.commit()
-    return {"ok": True}
+
+    # 链接导入的文件是我们自己下载到 data/library 的，删书目时一并清掉，
+    # 否则这个目录只增不减。用户自己书库里的文件绝不碰。
+    removed_file = False
+    if row and row["source_type"] == "url":
+        try:
+            p = Path(row["path"])
+            lib_dir = (config.DATA / "library").resolve()
+            if p.exists() and lib_dir in p.resolve().parents:
+                p.unlink()
+                removed_file = True
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ok": True, "removed_file": removed_file}

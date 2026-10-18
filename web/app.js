@@ -250,6 +250,11 @@ function renderNextSteps(st) {
   const add = (icon, title, desc, view, btn) =>
     items.push({ icon, title, desc, view, btn });
 
+  // 规模提醒放最前面：这是性能问题，比「继续学」更该先处理
+  if (s.scale_warn) {
+    add("!", "知识库规模提醒", s.scale_warn, "knowledge", "去整理");
+  }
+
   if (s.points === 0) {
     add("◐", "先让它学一个方向", "去「自主进化」填一个具体方向，点开始。3 轮约 10 分钟就有第一批知识。", "learn", "去学习");
   } else if (s.points < 30) {
