@@ -1,0 +1,339 @@
+"""EvoMind HTTP 服务：REST API + SSE 实时事件流 + 静态控制台。"""
+from __future__ import annotations
+
+import json
+import queue
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from . import config, downloader, evolve, finetune, llm, memory, scheduler
+
+app = FastAPI(title="EvoMind", version="1.0.0")
+
+WEB = config.WEB
+app.mount("/static", StaticFiles(directory=str(WEB)), name="static")
+
+
+@app.exception_handler(Exception)
+def _unhandled(request, exc: Exception) -> JSONResponse:
+    """把后端异常转成前端能读的 JSON，而不是一片空白。"""
+    import traceback
+
+    memory.log_event("error", f"接口异常 {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc)[:400],
+            "path": str(request.url.path),
+            "trace": traceback.format_exc()[-1200:],
+        },
+    )
+
+
+# --------------------------------------------------------------------------
+# 页面
+# --------------------------------------------------------------------------
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(WEB / "index.html")
+
+
+# --------------------------------------------------------------------------
+# 状态
+# --------------------------------------------------------------------------
+@app.get("/api/status")
+def api_status() -> dict:
+    env = finetune.check_env()
+    return {
+        "engine": evolve.engine.snapshot(),
+        "stats": memory.stats(),
+        "llm": {"healthy": llm.healthy(), "models": llm.list_models()},
+        "config": config.load(),
+        "disk": downloader.disk_report(),
+        "finetune": {"ready": env["ready"], "gpu": env.get("gpu"), "cuda": env.get("cuda")},
+        "finetune_state": finetune.state(),
+    }
+
+
+@app.get("/api/config")
+def api_config_get() -> dict:
+    return config.load()
+
+
+@app.post("/api/config")
+def api_config_set(patch: dict = Body(...)) -> dict:
+    allowed = set(config.DEFAULTS.keys())
+    clean = {k: v for k, v in patch.items() if k in allowed}
+    return config.update(clean)
+
+
+# --------------------------------------------------------------------------
+# 学习
+# --------------------------------------------------------------------------
+@app.post("/api/learn/start")
+def api_learn_start(body: dict = Body(...)) -> dict:
+    direction = (body.get("direction") or "").strip()
+    rounds = body.get("rounds")
+    if not direction:
+        raise HTTPException(400, "请填写学习方向")
+    config.update({"last_direction": direction})
+    res = evolve.engine.start(direction, rounds)
+    if res.get("ok"):
+        memory.log_event("start", f"启动学习：{direction}", {"rounds": rounds})
+    return res
+
+
+@app.post("/api/learn/stop")
+def api_learn_stop() -> dict:
+    return evolve.engine.stop()
+
+
+# --------------------------------------------------------------------------
+# 持续自学
+# --------------------------------------------------------------------------
+@app.get("/api/auto")
+def api_auto_get() -> dict:
+    return scheduler.state()
+
+
+@app.post("/api/auto")
+def api_auto_set(body: dict = Body(...)) -> dict:
+    on = bool(body.get("enabled"))
+    direction = (body.get("direction") or "").strip() or None
+    if body.get("idle_minutes") is not None:
+        config.update({"idle_minutes": max(0, int(body["idle_minutes"]))})
+    if body.get("auto_rounds") is not None:
+        config.update({"auto_rounds": max(1, int(body["auto_rounds"]))})
+    if on:
+        if not (direction or config.get("last_direction")):
+            raise HTTPException(400, "开启持续自学前，请先设定一个学习方向")
+        config.update({"continuous_learning": True})
+        return scheduler.enable(direction)
+    config.update({"continuous_learning": False})
+    return scheduler.disable()
+
+
+@app.get("/api/sessions")
+def api_sessions() -> list[dict]:
+    return memory.list_sessions()
+
+
+# --------------------------------------------------------------------------
+# 事件流
+# --------------------------------------------------------------------------
+@app.get("/api/events")
+def api_events() -> StreamingResponse:
+    q: queue.Queue = queue.Queue(maxsize=500)
+
+    def listener(evt: dict) -> None:
+        try:
+            q.put_nowait(evt)
+        except queue.Full:
+            pass
+
+    evolve.bus.subscribe(listener)
+
+    def gen():
+        try:
+            yield "retry: 3000\n\n"
+            for evt in evolve.bus.history[-40:]:
+                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+            while True:
+                try:
+                    evt = q.get(timeout=15)
+                    yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+                except queue.Empty:
+                    yield ": ping\n\n"
+        finally:
+            evolve.bus.unsubscribe(listener)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/events/recent")
+def api_events_recent(limit: int = 80) -> list[dict]:
+    return list(reversed(memory.recent_events(limit)))
+
+
+# --------------------------------------------------------------------------
+# 知识库
+# --------------------------------------------------------------------------
+@app.get("/api/knowledge")
+def api_knowledge(
+    topic: str | None = None, limit: int = 60, offset: int = 0, q: str | None = None
+) -> dict:
+    if q:
+        items = memory.search(q, k=limit)
+    else:
+        items = memory.list_points(topic, limit, offset)
+    return {"items": items, "total": memory.stats()["points"]}
+
+
+@app.delete("/api/knowledge/{pid}")
+def api_knowledge_delete(pid: str) -> dict:
+    memory.delete_point(pid)
+    return {"ok": True}
+
+
+@app.get("/api/knowledge/search")
+def api_knowledge_search(q: str = Query(...), k: int = 8) -> list[dict]:
+    return memory.search(q, k=k)
+
+
+# --------------------------------------------------------------------------
+# 资源
+# --------------------------------------------------------------------------
+@app.get("/api/resources")
+def api_resources() -> dict:
+    return {"items": memory.list_resources(), "disk": downloader.disk_report()}
+
+
+@app.post("/api/resources/download")
+def api_resource_download(body: dict = Body(...)) -> dict:
+    repo = (body.get("repo") or "").strip()
+    kind = body.get("kind") or "hf_model"
+    if not repo:
+        raise HTTPException(400, "缺少 repo")
+    if kind == "ollama":
+        return downloader.pull_ollama(repo, reason="手动添加")
+    return downloader.download_hf(repo, kind=kind, reason="手动添加")
+
+
+@app.post("/api/resources/discover")
+def api_resource_discover(body: dict = Body(...)) -> dict:
+    direction = (body.get("direction") or "").strip()
+    if not direction:
+        raise HTTPException(400, "缺少方向")
+    got = downloader.discover_for_direction(direction)
+    return {"ok": True, "found": got}
+
+
+# --------------------------------------------------------------------------
+# 对话（基于知识库）
+# --------------------------------------------------------------------------
+@app.post("/api/chat")
+def api_chat(body: dict = Body(...)) -> dict:
+    question = (body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(400, "缺少问题")
+    return evolve.answer_with_knowledge(question, body.get("topic") or None)
+
+
+@app.post("/api/chat/stream")
+def api_chat_stream(body: dict = Body(...)) -> StreamingResponse:
+    question = (body.get("question") or "").strip()
+    topic = body.get("topic") or None
+    if not question:
+        raise HTTPException(400, "缺少问题")
+
+    def gen():
+        try:
+            res = evolve.answer_with_knowledge(question, topic)
+            for i in range(0, len(res["answer"]), 24):
+                yield f"data: {json.dumps({'delta': res['answer'][i:i+24]}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True, 'sources': res['sources'], 'hits': res['hits']}, ensure_ascii=False)}\n\n"
+        except Exception as e:  # noqa: BLE001
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# --------------------------------------------------------------------------
+# 权重层
+# --------------------------------------------------------------------------
+@app.get("/api/finetune/env")
+def api_ft_env() -> dict:
+    return finetune.check_env()
+
+
+@app.post("/api/finetune/install")
+def api_ft_install() -> dict:
+    def go() -> None:
+        finetune.install_env(
+            lambda lv, m, p: evolve.bus.publish({"level": lv, "msg": m, **p})
+        )
+
+    threading.Thread(target=go, daemon=True).start()
+    return {"ok": True, "msg": "安装已在后台开始，约 3GB 下载"}
+
+
+@app.post("/api/finetune/dataset")
+def api_ft_dataset(body: dict = Body(default={})) -> dict:
+    topic = (body or {}).get("topic") or None
+    return finetune.build_dataset(
+        topic, on_event=lambda lv, m, p: evolve.bus.publish({"level": lv, "msg": m, **p})
+    )
+
+
+@app.post("/api/finetune/train")
+def api_ft_train(body: dict = Body(...)) -> dict:
+    path = body.get("dataset_path")
+    if not path:
+        raise HTTPException(400, "缺少 dataset_path")
+    return finetune.train_async(
+        path,
+        on_event=lambda lv, m, p: evolve.bus.publish({"level": lv, "msg": m, **p}),
+        base=body.get("base"),
+        epochs=body.get("epochs"),
+    )
+
+
+@app.get("/api/finetune/state")
+def api_ft_state() -> dict:
+    return finetune.state()
+
+
+@app.get("/api/finetune/outputs")
+def api_ft_outputs() -> list[dict]:
+    return finetune.list_outputs()
+
+
+@app.post("/api/finetune/export")
+def api_ft_export(body: dict = Body(...)) -> dict:
+    return finetune.export_gguf(
+        body.get("merged_dir", ""),
+        on_event=lambda lv, m, p: evolve.bus.publish({"level": lv, "msg": m, **p}),
+    )
+
+
+# --------------------------------------------------------------------------
+# 模型
+# --------------------------------------------------------------------------
+@app.get("/api/models")
+def api_models() -> list[dict]:
+    return llm.list_models()
+
+
+@app.post("/api/models/use")
+def api_models_use(body: dict = Body(...)) -> dict:
+    name = body.get("name")
+    if not name:
+        raise HTTPException(400, "缺少模型名")
+    return config.update({"model": name})
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    memory.log_event("boot", "EvoMind 启动")
+    if not llm.healthy():
+        memory.log_event("warn", "Ollama 未运行")
+    try:
+        scheduler.start_auto_if_needed()
+    except Exception:
+        pass
+
+
+def run(host: str = "127.0.0.1", port: int = 8765) -> None:
+    import uvicorn
+
+    uvicorn.run(app, host=host, port=port, log_level="warning")

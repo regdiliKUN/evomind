@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>EvoMind · 自进化学习引擎</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="app">
+  <!-- ============ 侧栏 ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">E</div>
+      <div class="brand-text">
+        <b>EvoMind</b>
+        <span>自进化学习引擎</span>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <div class="nav-item active" data-view="dashboard"><span class="ico">◈</span>总览</div>
+      <div class="nav-item" data-view="learn"><span class="ico">◐</span>自主进化</div>
+      <div class="nav-item" data-view="knowledge"><span class="ico">▤</span>知识库</div>
+      <div class="nav-item" data-view="resources"><span class="ico">⤓</span>资源获取</div>
+      <div class="nav-item" data-view="finetune"><span class="ico">⚙</span>权重进化</div>
+      <div class="nav-item" data-view="chat"><span class="ico">✎</span>检验所学</div>
+      <div class="nav-item" data-view="settings"><span class="ico">⋯</span>设置</div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="pill"><span class="dot" id="dot-llm"></span><span id="txt-llm">检测中</span></div>
+      <div class="pill"><span class="dot" id="dot-gpu"></span><span id="txt-gpu">—</span></div>
+    </div>
+  </aside>
+
+  <!-- ============ 主区 ============ -->
+  <main class="main">
+    <header class="topbar">
+      <h1 id="page-title">总览</h1>
+      <div class="spacer"></div>
+      <div class="metric"><b id="m-points">0</b><span>知识点</span></div>
+      <div class="metric"><b id="m-docs">0</b><span>已读资料</span></div>
+      <div class="metric"><b id="m-disk">0 GB</b><span>资源占用</span></div>
+      <div class="metric"><b id="m-state">空闲</b><span>引擎状态</span></div>
+    </header>
+
+    <div class="content">
+      <!-- ---------- 总览 ---------- -->
+      <section class="view active" id="view-dashboard">
+        <div class="grid g4" style="margin-bottom:16px">
+          <div class="stat">
+            <div class="k">知识点总数</div>
+            <div class="v" id="s-points">0</div>
+            <div class="s" id="s-new">24 小时新增 0</div>
+          </div>
+          <div class="stat">
+            <div class="k">已消化资料</div>
+            <div class="v" id="s-docs">0</div>
+            <div class="s">网页 / 论文 / 仓库</div>
+          </div>
+          <div class="stat">
+            <div class="k">自主获取资源</div>
+            <div class="v" id="s-res">0</div>
+            <div class="s" id="s-res-disk">占用 0 GB</div>
+          </div>
+          <div class="stat">
+            <div class="k">学习任务</div>
+            <div class="v" id="s-sessions">0</div>
+            <div class="s">累计启动次数</div>
+          </div>
+        </div>
+
+        <div class="grid g2">
+          <div class="card">
+            <div class="card-title">能力分布<span class="tag">按学习方向</span></div>
+            <div id="topic-list"><div class="empty">还没有任何学习记录</div></div>
+          </div>
+          <div class="card">
+            <div class="card-title">最近活动<span class="tag">实时</span></div>
+            <div class="stream" id="dash-stream" style="height:300px;min-height:300px"></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">下一步建议<span class="tag">自动判断</span></div>
+          <div id="next-steps"></div>
+        </div>
+      </section>
+
+      <!-- ---------- 自主进化 ---------- -->
+      <section class="view" id="view-learn">
+        <div class="learn-grid">
+          <div class="card">
+            <div class="card-title">设定进化方向</div>
+            <label class="field">
+              <span>学习方向（越具体，学得越深）</span>
+              <textarea id="direction" placeholder="例如：量子计算中的表面码纠错 / 大模型 Agent 的规划与反思机制 / 光固化 3D 打印的收缩补偿模型"></textarea>
+            </label>
+            <div class="dir-presets" id="presets">
+              <span class="chip">大模型 Agent 架构</span>
+              <span class="chip">RAG 检索增强前沿</span>
+              <span class="chip">强化学习对齐方法</span>
+              <span class="chip">光固化打印工艺</span>
+              <span class="chip">量化投资因子模型</span>
+            </div>
+
+            <div class="sep"></div>
+
+            <label class="field">
+              <span>迭代轮数（每轮约 2-4 分钟）</span>
+              <select id="rounds">
+                <option value="3">3 轮 · 快速摸底</option>
+                <option value="6" selected>6 轮 · 常规学习</option>
+                <option value="10">10 轮 · 深度钻研</option>
+                <option value="16">16 轮 · 长时间自学</option>
+              </select>
+            </label>
+
+            <div class="rowflex">
+              <button class="btn primary" id="btn-start" style="flex:1">开始进化学习</button>
+              <button class="btn danger" id="btn-stop" disabled>停止</button>
+            </div>
+
+            <div class="sep"></div>
+
+            <div class="rowflex" style="justify-content:space-between;align-items:flex-start">
+              <div style="flex:1">
+                <div style="font-size:13px;font-weight:600">持续自学</div>
+                <div class="hint" style="margin:3px 0 0" id="auto-desc">
+                  开启后，学完一段空闲一会儿就自动接着学，不用一直盯着
+                </div>
+              </div>
+              <button class="btn sm" id="btn-auto">开启</button>
+            </div>
+
+            <div class="hint">
+              引擎会自己判断「还缺什么」，每轮检索式都不重复。遇到合适的模型或数据集，会在预算内自主下载。
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              实时进化流
+              <span class="tag" id="stage-tag">空闲</span>
+            </div>
+            <div class="progress-ring" style="margin-bottom:14px">
+              <svg class="ring" viewBox="0 0 62 62">
+                <defs>
+                  <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0%" stop-color="#4d8dff" />
+                    <stop offset="100%" stop-color="#21d4a0" />
+                  </linearGradient>
+                </defs>
+                <circle class="bg" cx="31" cy="31" r="26"></circle>
+                <circle class="fg" id="ring-fg" cx="31" cy="31" r="26"
+                        stroke-dasharray="163.4" stroke-dashoffset="163.4"
+                        transform="rotate(-90 31 31)"></circle>
+              </svg>
+              <div>
+                <div style="font-size:13px;font-weight:600" id="round-label">等待启动</div>
+                <div class="dim" style="font-size:12px" id="focus-label">—</div>
+              </div>
+            </div>
+            <div class="stream" id="learn-stream">
+              <div class="empty"><div class="big">◐</div>设定方向后点击「开始进化学习」</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------- 知识库 ---------- -->
+      <section class="view" id="view-knowledge">
+        <div class="card" style="margin-bottom:14px">
+          <div class="rowflex">
+            <input id="kb-search" placeholder="语义搜索知识库（问一句话，找出最相关的知识点）" />
+            <select id="kb-topic" style="max-width:260px"><option value="">全部方向</option></select>
+            <button class="btn" id="btn-kb-search">搜索</button>
+          </div>
+        </div>
+        <div class="list" id="kb-list"><div class="empty">暂无知识点</div></div>
+      </section>
+
+      <!-- ---------- 资源 ---------- -->
+      <section class="view" id="view-resources">
+        <div class="grid g3" style="margin-bottom:16px">
+          <div class="stat">
+            <div class="k">资源占用 / 预算</div>
+            <div class="v" id="r-used">0 GB</div>
+            <div class="bar"><i id="r-bar" style="width:0%"></i></div>
+          </div>
+          <div class="stat">
+            <div class="k">磁盘剩余</div>
+            <div class="v" id="r-free">0 GB</div>
+            <div class="s">下载前会自动校验</div>
+          </div>
+          <div class="stat">
+            <div class="k">自主下载</div>
+            <div class="v" id="r-auto">开启</div>
+            <div class="s">超预算自动跳过</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">手动指定资源</div>
+          <div class="rowflex">
+            <input id="res-repo" placeholder="HuggingFace 仓库，如 Qwen/Qwen2.5-7B-Instruct 或 数据集 org/name" />
+            <select id="res-kind" style="max-width:170px">
+              <option value="hf_model">模型</option>
+              <option value="hf_dataset">数据集</option>
+              <option value="ollama">Ollama 模型</option>
+            </select>
+            <button class="btn primary" id="btn-res-add">获取</button>
+          </div>
+          <div class="hint">下载前会先算体积、再查预算。GGUF 模型下载完会自动注册进 Ollama。</div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">资源清单</div>
+          <div class="list" id="res-list"><div class="empty">还没有下载任何资源</div></div>
+        </div>
+      </section>
+
+      <!-- ---------- 权重进化 ---------- -->
+      <section class="view" id="view-finetune">
+        <div class="grid g2" style="align-items:start">
+          <div class="card">
+            <div class="card-title">微调环境</div>
+            <div id="ft-env"><div class="empty">检测中…</div></div>
+            <div class="rowflex" style="margin-top:14px">
+              <button class="btn primary" id="btn-ft-install">安装微调环境</button>
+            </div>
+            <div class="hint">
+              需要 PyTorch + Transformers + PEFT，约 3GB。装一次即可。你的 4090 跑 7B LoRA 微调约 17GB 显存，够用。
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">知识固化流程</div>
+            <div class="kv"><span class="k">① 导出数据集</span><span class="v" id="ft-ds">未生成</span></div>
+            <div class="kv"><span class="k">② LoRA 训练</span><span class="v" id="ft-train">未开始</span></div>
+            <div class="kv"><span class="k">③ 合并权重</span><span class="v" id="ft-merge">—</span></div>
+            <div class="bar"><i id="ft-bar" style="width:0%"></i></div>
+            <div class="rowflex" style="margin-top:14px;flex-wrap:wrap">
+              <button class="btn" id="btn-ft-dataset">生成训练集</button>
+              <button class="btn" id="btn-ft-train" disabled>开始微调</button>
+            </div>
+            <div class="hint">
+              把知识库里学到的内容，用 LoRA 压进模型参数。微调后的模型不再依赖检索，是「真的学会了」。
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">训练产出</div>
+          <div class="list" id="ft-outputs"><div class="empty">还没有产出</div></div>
+        </div>
+      </section>
+
+      <!-- ---------- 检验所学 ---------- -->
+      <section class="view" id="view-chat">
+        <div class="card chat-box">
+          <div class="chat-log" id="chat-log">
+            <div class="msg bot">问我任何关于已学方向的问题。我会用学到的知识回答，并标注出处。知识库里没有的，我会直接说不知道——不编。</div>
+          </div>
+          <div class="chat-input">
+            <input id="chat-q" placeholder="输入问题，回车发送" />
+            <button class="btn primary" id="btn-chat">发送</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------- 设置 ---------- -->
+      <section class="view" id="view-settings">
+        <div class="grid g2" style="align-items:start">
+          <div class="card">
+            <div class="card-title">学习与推理</div>
+            <label class="field"><span>主推理模型</span><select id="cfg-model"></select></label>
+            <label class="field"><span>向量模型</span><input id="cfg-embed" /></label>
+            <label class="field"><span>每轮检索式数量</span><input id="cfg-qpr" type="number" min="1" max="8" /></label>
+            <label class="field"><span>每轮抓取网页数</span><input id="cfg-fpr" type="number" min="1" max="20" /></label>
+            <label class="field"><span>知识点入库最低相关度</span><input id="cfg-rel" type="number" step="0.05" min="0" max="1" /></label>
+          </div>
+          <div class="card">
+            <div class="card-title">资源下载</div>
+            <label class="field"><span>总磁盘预算（GB）</span><input id="cfg-budget" type="number" min="10" /></label>
+            <label class="field"><span>单个模型体积上限（GB）</span><input id="cfg-maxone" type="number" min="1" /></label>
+            <label class="field"><span>自动下载</span>
+              <select id="cfg-auto"><option value="1">开启（预算内自主下载）</option><option value="0">关闭（只记录不下载）</option></select>
+            </label>
+            <label class="field"><span>HF 镜像（国内可填 https://hf-mirror.com）</span><input id="cfg-hf" /></label>
+            <label class="field"><span>代理（可选，如 http://127.0.0.1:7890）</span><input id="cfg-proxy" /></label>
+            <button class="btn primary" id="btn-save-cfg" style="margin-top:6px">保存设置</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
