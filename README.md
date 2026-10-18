@@ -1,5 +1,7 @@
 # EvoMind · 自进化学习引擎
 
+> 开发验证：`python -m unittest discover -s tests -p "test_*.py"`、`python tests/run_tests.py --fast`、`node --test tests/frontend_tests.cjs`。快速验证使用临时数据；详见[本轮优化与测量说明](tests/OPTIMIZATION.md)。
+
 <p align="center">
   <img src="assets/icon.png" width="112" alt="EvoMind">
 </p>

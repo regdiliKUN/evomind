@@ -249,6 +249,32 @@ class LibraryTests(IsolatedTest):
     def test_add_directory_to_fresh_database(self):
         self.assertTrue(library.add_dir(self.tmp.name)["ok"])
 
+    def test_book_source_link_committed_before_progress_callback(self):
+        path = Path(self.tmp.name) / "book.txt"
+        path.write_text("Useful source material for the test. " * 40, encoding="utf-8")
+        library.init_db()
+        c = memory.conn()
+        c.execute("INSERT INTO books(id,path,title,format) VALUES ('book',?,'Test','txt')",
+                  (str(path),))
+        c.commit()
+        links = []
+
+        def progress(level, message, payload):
+            if level == "learn":
+                other = memory.sqlite3.connect(config.DB_FILE)
+                try:
+                    links.append(other.execute("SELECT book_id FROM knowledge").fetchone()[0])
+                finally:
+                    other.close()
+
+        points = {"points": [{"claim": "A useful verified claim from the source",
+                               "relevance": 1., "confidence": 0.9}]}
+        with patch.object(llm, "chat_json", return_value=points):
+            with patch.object(llm, "embed", return_value=[[1., 0.]]):
+                result = library.import_book("book", max_chunks=1, on_event=progress)
+        self.assertTrue(result["ok"])
+        self.assertEqual(links, ["book"])
+
 
 class ApiTests(IsolatedTest):
     def setUp(self):

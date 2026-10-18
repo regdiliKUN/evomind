@@ -708,6 +708,8 @@ def import_book(
                         total_points += 1
                         try:
                             c.execute("UPDATE knowledge SET book_id=? WHERE id=?", (book_id, pid))
+                            # 不把写事务带进下一次 add_point（会与并发去重锁互等）。
+                            c.commit()
                         except Exception:
                             pass
                         _emit(on_event, "learn", f"＋ {claim[:70]}")
