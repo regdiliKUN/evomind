@@ -118,6 +118,50 @@ def init_db() -> None:
     c.commit()
 
 
+def recover_stale_states() -> dict:
+    """修复上次异常退出留下的中间态。
+
+    导入时先把状态写成 importing 再逐块提炼，进程如果在中途被杀掉（关窗口、
+    断电、Ctrl+C），这本书会永远停在 importing。前端只给 pending / ready
+    提供勾选框，于是它既不能继续也不能重来，用户只能去手改数据库。
+
+    启动时没有任务在跑，此时仍处于 importing / parsing 的一定是孤儿：
+      - 已经解析出正文的 → ready（可重新导入，语义去重会挡住重复条目）
+      - 从没解析过的     → pending
+    """
+    if _task["running"]:
+        return {"importing": 0, "parsing": 0}
+
+    c = memory.conn()
+    stale = [
+        r["id"]
+        for r in c.execute("SELECT id FROM books WHERE status='importing'").fetchall()
+    ]
+    if stale:
+        c.execute(
+            "UPDATE books SET status=CASE WHEN COALESCE(chars,0)>0 THEN 'ready'"
+            " ELSE 'pending' END WHERE status='importing'"
+        )
+        # 中断前已入库的条目按 book_id 回填，否则界面显示「0 条知识」
+        for bid in stale:
+            n = c.execute(
+                "SELECT COUNT(*) n FROM knowledge WHERE book_id=?", (bid,)
+            ).fetchone()["n"]
+            c.execute("UPDATE books SET points_count=? WHERE id=?", (n, bid))
+
+    n_par = c.execute(
+        "UPDATE books SET status='pending' WHERE status='parsing'"
+    ).rowcount
+    c.commit()
+
+    if stale:
+        memory.log_event(
+            "warn",
+            f"上次退出时有 {len(stale)} 本书停在导入中，已恢复为可重新导入",
+        )
+    return {"importing": len(stale), "parsing": n_par}
+
+
 def _emit(on_event: Event | None, level: str, msg: str, **payload) -> None:
     _task["log"].append({"ts": time.time(), "level": level, "msg": msg})
     _task["log"] = _task["log"][-300:]
@@ -597,7 +641,9 @@ def import_book(
             c.commit()
             return {"ok": False, "msg": str(e)}
 
-    topic = topic or book["topic"] or f"书库 · {book['title']}"
+    # 主题要和 memory.add_point 里写入的一致（那边会压平空白），
+    # 否则 books.topic 与 knowledge.topic 对不上，按主题筛书会漏。
+    topic = " ".join((topic or book["topic"] or f"书库 · {book['title']}").split())
     c.execute("UPDATE books SET status='importing', topic=? WHERE id=?", (topic, book_id))
     c.commit()
 

@@ -213,6 +213,16 @@ def similarity(vec: list[float], rowids: list[int], mat: np.ndarray) -> list[tup
 # --------------------------------------------------------------------------
 # 写入
 # --------------------------------------------------------------------------
+def _norm_topic(topic: str) -> str:
+    """主题归一化：把换行、制表符和连续空格压成单个空格。
+
+    学习方向常是多行粘贴进来的（配置里的 last_direction 就带着换行和缩进），
+    同一个方向因此会存成两个不同的主题：界面上出现两条几乎一样的分组，
+    检索也各算各的。主题只用于分组，压平不影响语义。
+    """
+    return " ".join(str(topic or "").split())
+
+
 def add_point(
     *,
     topic: str,
@@ -229,6 +239,7 @@ def add_point(
 ) -> str | None:
     """写入一个知识点。重复则返回 None。"""
     claim = claim.strip()
+    topic = _norm_topic(topic)
     if len(claim) < 8:
         return None
     if vec is None:

@@ -80,7 +80,11 @@ def load() -> dict[str, Any]:
         cfg = dict(DEFAULTS)
         if CONFIG_FILE.exists():
             try:
-                cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+                raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                # 只认 DEFAULTS 里有的键。历史版本或外部脚本写进来的未知键
+                # （比如测试留下的 __bogus__）会一直留在配置文件里，
+                # 每次 load 都原样写回，越积越脏 —— 这里直接丢弃。
+                cfg.update({k: v for k, v in raw.items() if k in DEFAULTS})
             except Exception:
                 pass
         # 环境变量覆盖（便于命令行调试）

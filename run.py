@@ -119,6 +119,16 @@ def is_evomind(port: int) -> bool:
         return False
 
 
+def has_model(models: list[str], name: str) -> bool:
+    """判断模型是否已安装，忽略 tag。
+
+    ollama 列出来的是 `bge-m3:latest`，配置里写的是 `bge-m3`，
+    直接字符串比较会误报「缺少模型」。
+    """
+    base = name.split(":")[0]
+    return any(m == name or m.split(":")[0] == base for m in models)
+
+
 def main() -> None:
     os.system("")  # 开启 Windows 控制台 ANSI
     print("=" * 58)
@@ -149,11 +159,9 @@ def main() -> None:
 
     if llm.healthy():
         models = [m["name"] for m in llm.list_models()]
-        if cfg["model"] not in models and not any(
-            m.split(":")[0] == cfg["model"].split(":")[0] for m in models
-        ):
+        if not has_model(models, cfg["model"]):
             log(f"[..] 缺少 {cfg['model']}，首次学习时会自动下载")
-        if cfg["embed_model"] not in models:
+        if not has_model(models, cfg["embed_model"]):
             log(f"[..] 缺少向量模型 {cfg['embed_model']}，首次学习时会自动下载")
 
     port = pick_port()

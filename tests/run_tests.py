@@ -25,6 +25,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# ---------------------------------------------------------------------------
+# 测试一律跑在临时数据库上。
+# 以前这里直接连 data/knowledge/knowledge.db，每跑一次就往用户知识库里
+# 塞一批 __test_* / __perf 知识点（实测累积了 84 条，总览页的主题列表
+# 前几名全是测试残留）。必须在导入 backend 之后、任何 conn() 之前改掉。
+# ---------------------------------------------------------------------------
+_TMP_DB_DIR = Path(tempfile.mkdtemp(prefix="evo_db_"))
+import backend.config as _config  # noqa: E402
+
+_config.DB_FILE = _TMP_DB_DIR / "knowledge.db"
+
 FAST = "--fast" in sys.argv
 
 PASS, FAIL, WARN = "PASS", "FAIL", "WARN"
@@ -321,6 +332,9 @@ def test_search_pure():
 def test_library():
     from backend import library, memory
 
+    # 临时库是空的，书库相关的表要自己建
+    library.init_db()
+
     tmp = Path(tempfile.mkdtemp(prefix="evo_lib_"))
     try:
         # 造样本：正常 txt、空文件、损坏 PDF、子目录、被排除目录
@@ -455,6 +469,20 @@ def test_library():
             assert library.book_detail(b["id"]) == {}
             return "删除成功"
 
+        def recover_interrupted_import():
+            # 模拟进程在导入中途被杀：状态卡在 importing
+            b = [x for x in library.list_books(dir_id=did, limit=50)["items"]
+                 if x["title"] == "正常书"][0]
+            c = memory.conn()
+            c.execute("UPDATE books SET status='importing' WHERE id=?", (b["id"],))
+            c.commit()
+            r = library.recover_stale_states()
+            assert r["importing"] >= 1, f"没识别出僵尸状态：{r}"
+            d = library.book_detail(b["id"])
+            # 已经解析出正文的应回到 ready（可重新导入），而不是永远卡住
+            assert d["status"] == "ready", f"恢复后状态应为 ready，实际 {d['status']}"
+            return f"恢复 {r['importing']} 本 → {d['status']}"
+
         case("书库", "添加目录", add_dir)
         did = holder.get("id", "")
         case("书库", "重复添加目录被拒", add_duplicate_dir)
@@ -474,6 +502,7 @@ def test_library():
         case("书库", "章节切分多章", split_chapters_many)
         case("书库", "GBK 编码回退", encoding_fallback)
         case("书库", "删除书目", delete_book)
+        case("书库", "导入中断状态恢复", recover_interrupted_import)
     finally:
         # 清掉测试产生的书目记录与目录配置
         try:
@@ -651,7 +680,9 @@ def main() -> int:
     w = sum(1 for r in _results if r["status"] == WARN)
     print("\n" + "=" * 74)
     print(f"  通过 {p} · 失败 {f} · 警告 {w} · 共 {len(_results)}")
+    print(f"  临时库：{_TMP_DB_DIR}")
     print("=" * 74)
+    shutil.rmtree(_TMP_DB_DIR, ignore_errors=True)
     return 1 if f else 0
 
 

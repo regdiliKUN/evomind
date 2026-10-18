@@ -513,6 +513,8 @@ def _startup() -> None:
     memory.log_event("boot", "EvoMind 启动")
     try:
         library.init_db()
+        # 上次退出时被中断的导入会留下僵尸状态，启动时还原
+        library.recover_stale_states()
     except Exception:
         pass
     if not llm.healthy():

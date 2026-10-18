@@ -167,7 +167,9 @@ class Engine:
     def start(self, direction: str, rounds: int | None = None) -> dict:
         if self.state["running"]:
             return {"ok": False, "msg": "已有学习任务在跑，请先停止"}
-        direction = direction.strip()
+        # 方向会被当作主题分组用，多行粘贴进来的换行和缩进要压平，
+        # 否则同一个方向会分裂成两个主题。
+        direction = " ".join(direction.split())
         if not direction:
             return {"ok": False, "msg": "请填写学习方向"}
         rounds = int(rounds or config.get("max_rounds", 8))
