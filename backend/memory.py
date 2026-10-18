@@ -357,6 +357,16 @@ def stats() -> dict:
 
 
 def list_points(topic: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    # 夹紧分页参数：SQLite 的 LIMIT -1 会返回全表
+    try:
+        limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+
     sql = "SELECT id,topic,claim,detail,source_url,source_title,source_kind,tags,confidence,created_at FROM knowledge"
     params: list[Any] = []
     if topic:

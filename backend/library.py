@@ -790,6 +790,17 @@ def list_books(
     fmt: str | None = None, q: str | None = None, limit: int = 200, offset: int = 0,
 ) -> dict:
     init_db()
+    # SQLite 的 LIMIT -1 表示「不限制」，负数/超大值必须夹紧，
+    # 否则前端传错参数会一次性拉回整张表
+    try:
+        limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        limit = 200
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+
     sql = "SELECT * FROM books WHERE 1=1"
     params: list[Any] = []
     if status:

@@ -174,7 +174,7 @@
       <section class="view" id="view-knowledge">
         <div class="card" style="margin-bottom:14px">
           <div class="rowflex">
-            <input id="kb-search" placeholder="语义搜索知识库（问一句话，找出最相关的知识点）" />
+            <input id="kb-search" placeholder="语义搜索知识库（问一句话，找出最相关的知识点）" maxlength="200" />
             <select id="kb-topic" style="max-width:260px"><option value="">全部方向</option></select>
             <button class="btn" id="btn-kb-search">搜索</button>
           </div>
@@ -248,7 +248,7 @@
                 <option value="skipped">已跳过</option>
                 <option value="failed">失败</option>
               </select>
-              <input id="lib-search" placeholder="搜索书名" style="width:180px;padding:5px 9px;font-size:12px" />
+              <input id="lib-search" placeholder="搜索书名" maxlength="60" style="width:180px;padding:5px 9px;font-size:12px" />
               <button class="btn sm" id="btn-lib-selectall">全选可导入</button>
             </div>
           </div>
@@ -339,7 +339,7 @@
             <div class="msg bot">问我任何关于已学方向的问题。我会用学到的知识回答，并标注出处。知识库里没有的，我会直接说不知道——不编。</div>
           </div>
           <div class="chat-input">
-            <input id="chat-q" placeholder="输入问题，回车发送" />
+            <input id="chat-q" placeholder="输入问题，回车发送" maxlength="500" />
             <button class="btn primary" id="btn-chat">发送</button>
           </div>
         </div>

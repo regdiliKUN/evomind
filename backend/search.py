@@ -545,6 +545,12 @@ def search(
     if "arxiv" in names and not should_use_arxiv(query):
         names.remove("arxiv")
 
+    # 空查询、纯标点查询直接返回：否则会并发去打 6 个源，
+    # 实测空查询要耗 20 秒，而且拿回的全是无关内容
+    q = (query or "").strip()
+    if len(q) < 2 or not re.search(r"[0-9A-Za-z\u4e00-\u9fa5]", q):
+        return []
+
     tasks = [(n, SOURCES[n]) for n in names if n in SOURCES]
     results: list[Result] = []
     with ThreadPoolExecutor(max_workers=len(tasks) + 2) as ex:
