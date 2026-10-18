@@ -209,7 +209,9 @@ class Engine:
     def _emit(self, level: str, msg: str, **payload) -> None:
         evt = {"level": level, "msg": msg, **payload}
         bus.publish(evt)
-        if level in ("ok", "warn", "error"):
+        # stage 也要落库：只落 ok/warn/error 的话，刷新页面就只剩「开始/完成」两条，
+        # 中间「检索到什么、读了哪几篇、提炼出几条」全部丢失，用户没法排查为什么 0 条。
+        if level in ("ok", "warn", "error", "stage"):
             memory.log_event(level, msg, payload)
 
     # ---------------- 主循环 ----------------
@@ -283,8 +285,22 @@ class Engine:
         # ③ 抓取
         todo = self._pick_targets(results)
         if not todo:
-            self._emit("warn", "候选来源都读过了，本轮改为深挖已有知识")
-            return
+            # 候选都读过了，直接 return 等于这一轮白跑。换一组更具体的检索词再试一次。
+            direction = self.state.get("direction", "")
+            extra = [
+                f"{direction} 常见问题",
+                f"{direction} 具体参数 经验",
+            ]
+            self._emit("info", "候选来源都读过了，换一组更具体的检索词再试")
+            results2 = self._search_all(extra)
+            todo = self._pick_targets(results2)
+            if not todo:
+                self._emit(
+                    "warn",
+                    "换检索词后仍没有可读的新资料。这个方向可能已经学透，"
+                    "建议换一个更具体的方向，或去书库导入相关书籍",
+                )
+                return
         self.state["stage"] = "reading"
         self._emit("stage", f"第 {r}/{total} 轮 · 阅读 {len(todo)} 篇资料")
         docs = self._fetch_all(todo)
@@ -433,11 +449,14 @@ class Engine:
                 "优先保留：讲原理、给具体参数/数值、有判据或对比的内容。\n"
                 "坚决排除：产品介绍页、购买/下载页、安装教程、新闻通稿、"
                 "纯目录页、与方向只是关键词巧合命中的内容。\n"
+                "如果候选中没有完美的，也要挑出相对最接近的 2-3 条 —— "
+                "返回空列表意味着这一轮完全白跑，比读到一般的内容更糟。\n"
                 '输出 JSON: {"pick": [编号, ...], "why": "一句话"}',
                 f"## 学习方向\n{self.state.get('direction','')}\n\n"
                 f"## 本轮重点\n{self.state.get('focus','')}\n\n"
                 f"## 候选资料\n" + "\n".join(listing) +
-                f"\n\n挑出最多 {limit} 条最值得读的，按有用程度排序。宁缺毋滥。",
+                f"\n\n挑出最多 {limit} 条最值得读的，按有用程度排序。"
+                "只要与方向沾边就给个机会，完全不沾边的才排除。",
                 temperature=0.1,
             )
             idxs = verdict.get("pick") or []
@@ -460,8 +479,14 @@ class Engine:
                     picked=[p.get("title", "")[:60] for p in picked[:4]],
                 )
                 return picked
-            self._emit("warn", f"预筛判定 {len(candidates)} 条候选都不够相关，本轮跳过抓取")
-            return []
+            # 模型全拒：保底读 2 条。0 篇必然 0 条，2 篇至少还有机会提炼出东西，
+            # 成本也就多 30 秒左右。
+            fallback = candidates[:2]
+            self._emit(
+                "warn",
+                f"预筛认为 {len(candidates)} 条都不够相关，保底读前 {len(fallback)} 条试试",
+            )
+            return fallback
         except Exception as e:  # noqa: BLE001
             self._emit("warn", f"预筛失败（{str(e)[:60]}），按原顺序取前 {limit} 条")
 
@@ -534,9 +559,12 @@ class Engine:
             return out
 
         # 提炼并发度控制在 2，避免压垮本地大模型
+        dup = 0          # 被语义去重拦下的
+        candidate = 0    # 模型给出的候选总数
         with ThreadPoolExecutor(max_workers=2) as ex:
             for pts in ex.map(one, docs):
                 for p in pts:
+                    candidate += 1
                     try:
                         pid = memory.add_point(
                             topic=direction,
@@ -555,8 +583,21 @@ class Engine:
                                 "learn", f"＋ {p['claim'][:70]}",
                                 source=p["source_url"], topic=direction,
                             )
+                        else:
+                            dup += 1
                     except Exception as e:  # noqa: BLE001
                         self._emit("warn", f"入库失败：{str(e)[:80]}")
+
+        # 0 条新知识时最容易被误认为「坏了」，把原因讲清楚
+        if candidate and not new_points:
+            self._emit(
+                "info",
+                f"本轮提炼出 {candidate} 条候选，全部与已有知识重复（去重阈值 "
+                f"{config.get('dedup_threshold')}），没有新增。"
+                "这个方向已经学得比较透了，换个角度或更具体的问题会更有收获",
+            )
+        elif dup:
+            self._emit("info", f"候选 {candidate} 条，新增 {len(new_points)} 条，重复跳过 {dup} 条")
         return new_points
 
     def _reflect(self, direction: str, new_points: list[dict]) -> dict:
