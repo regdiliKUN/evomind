@@ -8,11 +8,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, downloader, evolve, finetune, library, llm, memory, scheduler
+from . import config, downloader, evolve, finetune, library, llm, memory, ocr, scheduler
 
 app = FastAPI(title="EvoMind", version="1.0.0")
 
@@ -431,6 +431,81 @@ def api_lib_stop() -> dict:
 @app.delete("/api/library/books/{bid}")
 def api_lib_del_book(bid: str, purge_points: bool = False) -> dict:
     return library.delete_book(bid, purge_points)
+
+
+# --------------------------------------------------------------------------
+# 扫描件 OCR
+# --------------------------------------------------------------------------
+@app.get("/api/ocr/state")
+def api_ocr_state() -> dict:
+    return ocr.state()
+
+
+@app.post("/api/ocr/stop")
+def api_ocr_stop() -> dict:
+    return ocr.stop()
+
+
+@app.get("/api/ocr/vision")
+def api_ocr_vision() -> dict:
+    ok, info = ocr.vision_available()
+    return {"available": ok, "model": info}
+
+
+@app.post("/api/library/books/{bid}/ocr")
+def api_book_ocr(bid: str, body: dict = Body(...)) -> dict:
+    return ocr.ocr_book_async(
+        bid,
+        pages=str(body.get("pages") or "all"),
+        engine=body.get("engine") or "rapid",
+        dpi=int(body.get("dpi") or config.get("ocr_dpi", 200)),
+        skip_done=bool(body.get("skip_done", True)),
+        on_event=_lib_evt,
+    )
+
+
+@app.get("/api/library/books/{bid}/ocr")
+def api_book_ocr_pages(bid: str) -> dict:
+    return {"pages": ocr.list_pages(bid), "stats": ocr.ocr_stats(bid)}
+
+
+@app.get("/api/library/books/{bid}/ocr/{page_no}")
+def api_book_ocr_page(bid: str, page_no: int) -> dict:
+    d = ocr.get_page(bid, page_no)
+    if not d:
+        raise HTTPException(404, "这一页还没有识别结果")
+    return d
+
+
+@app.put("/api/library/books/{bid}/ocr/{page_no}")
+def api_book_ocr_save(bid: str, page_no: int, body: dict = Body(...)) -> dict:
+    return ocr.save_page(bid, page_no, body.get("text") or "")
+
+
+@app.post("/api/library/books/{bid}/ocr/{page_no}/redo")
+def api_book_ocr_redo(bid: str, page_no: int, body: dict = Body(default={})) -> dict:
+    return ocr.ocr_page(
+        bid, page_no,
+        engine=(body or {}).get("engine") or "rapid",
+        dpi=int((body or {}).get("dpi") or config.get("ocr_dpi", 200)),
+    )
+
+
+@app.get("/api/library/books/{bid}/page/{page_no}.png")
+def api_book_page_png(bid: str, page_no: int, dpi: int = 110) -> Response:
+    data = ocr.render_png(bid, page_no, dpi)
+    if not data:
+        raise HTTPException(404, "页面渲染失败")
+    return Response(content=data, media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.post("/api/ocr/image")
+async def api_ocr_image(file: UploadFile = File(...), engine: str = "rapid") -> dict:
+    data = await file.read()
+    if len(data) > 30 * 1024 * 1024:
+        raise HTTPException(400, "图片超过 30MB")
+    return ocr.ocr_image_bytes(data, engine)
 
 
 @app.on_event("startup")

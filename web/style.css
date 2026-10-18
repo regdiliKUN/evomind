@@ -320,3 +320,54 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 .mono { font-family: var(--mono); }
 .dim { color: var(--text-dim); }
 .scroll-y { max-height: 420px; overflow-y: auto; }
+
+/* ---------- OCR 识别与校对 ---------- */
+.drawer {
+  position: fixed; inset: 0; z-index: 120;
+  background: var(--bg);
+  display: none; flex-direction: column;
+}
+.drawer.open { display: flex; }
+.drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 13px 20px; border-bottom: 1px solid var(--line);
+  background: var(--panel); flex-shrink: 0;
+}
+.drawer-head .t { font-size: 14.5px; font-weight: 600; }
+.drawer-tools {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  padding: 11px 20px; border-bottom: 1px solid var(--line);
+  background: var(--panel); flex-shrink: 0;
+}
+.drawer-tools input, .drawer-tools select { padding: 6px 10px; font-size: 12.5px; width: auto; }
+.ocr-bar { height: 3px; background: var(--line); flex-shrink: 0; }
+.ocr-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+.ocr-body { flex: 1; display: flex; min-height: 0; }
+.ocr-pages {
+  width: 158px; flex-shrink: 0; overflow-y: auto;
+  border-right: 1px solid var(--line); background: var(--panel);
+}
+.ocr-pages .pg {
+  padding: 6px 12px; font-size: 12px; cursor: pointer;
+  border-left: 2px solid transparent; color: var(--text-dim);
+  display: flex; justify-content: space-between; gap: 6px;
+}
+.ocr-pages .pg:hover { background: rgba(255,255,255,.03); }
+.ocr-pages .pg.active {
+  background: rgba(77,141,255,.12); border-left-color: var(--accent);
+  color: var(--text);
+}
+.ocr-pages .pg .n { color: var(--text-faint); font-family: var(--mono); font-size: 11px; }
+.ocr-view { flex: 1; display: flex; min-width: 0; }
+.ocr-img {
+  width: 48%; overflow: auto; padding: 12px;
+  background: #080b10; border-right: 1px solid var(--line);
+}
+.ocr-img img { width: 100%; border-radius: 6px; display: block; }
+.ocr-text { flex: 1; display: flex; flex-direction: column; gap: 9px; padding: 12px; min-width: 0; }
+.ocr-text textarea {
+  flex: 1; resize: none; font-family: var(--mono); font-size: 12.5px;
+  line-height: 1.85; padding: 11px; border-radius: 8px;
+  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+}
+.ocr-text textarea:focus { outline: none; border-color: var(--accent); }

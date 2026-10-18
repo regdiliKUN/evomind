@@ -544,6 +544,7 @@ async function loadLibBooks() {
 function renderLibBooks(items, total) {
   const box = $("#lib-book-list");
   $("#lib-total").textContent = total;
+  window.__libBooks = items;
   if (!items.length) {
     box.innerHTML = '<div class="empty">没有匹配的书目</div>';
     return;
@@ -555,6 +556,10 @@ function renderLibBooks(items, total) {
       const size = b.size_bytes
         ? (b.size_bytes / 1024 / 1024).toFixed(1) + "MB"
         : "";
+      // 扫描版（被跳过且原因是扫描）或已有 OCR 结果的，给个 OCR 入口
+      const needOcr =
+        b.format === "pdf" &&
+        (b.status === "skipped" || b.status === "ready" || b.status === "done");
       return `<div class="row" style="display:flex;gap:11px;align-items:flex-start">
         <input type="checkbox" class="lib-ck" data-id="${b.id}"
                ${canPick ? "" : "disabled"}
@@ -563,11 +568,15 @@ function renderLibBooks(items, total) {
         <div style="flex:1;min-width:0">
           <div class="rowflex" style="justify-content:space-between;gap:10px">
             <span style="font-size:13.3px">${esc(b.title || b.path)}</span>
-            <span style="color:${color};font-size:11.5px;white-space:nowrap">${txt}</span>
+            <span class="rowflex" style="gap:7px;white-space:nowrap">
+              <span style="color:${color};font-size:11.5px">${txt}</span>
+              ${needOcr ? `<button class="btn sm" data-ocr="${b.id}">OCR</button>` : ""}
+            </span>
           </div>
           <div class="meta">
             <span class="tagmini">${esc(b.format)}</span>
             ${size ? `<span>${size}</span>` : ""}
+            ${b.pages ? `<span>${b.pages} 页</span>` : ""}
             ${b.chars ? `<span>${b.chars} 字</span>` : ""}
             ${b.points_count ? `<span style="color:var(--green)">${b.points_count} 条知识</span>` : ""}
             ${b.topic ? `<span class="tagmini">${esc(b.topic).slice(0, 24)}</span>` : ""}
@@ -584,6 +593,12 @@ function renderLibBooks(items, total) {
       if (ck.checked) libSelected.add(ck.dataset.id);
       else libSelected.delete(ck.dataset.id);
       updateLibImportBtn();
+    })
+  );
+  $$("#lib-book-list [data-ocr]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const book = (window.__libBooks || []).find((x) => x.id === btn.dataset.ocr);
+      if (book) openOcr(book);
     })
   );
   updateLibImportBtn();
@@ -717,6 +732,185 @@ $("#btn-lib-selectall").addEventListener("click", () => {
     libSelected.add(ck.dataset.id);
   });
   updateLibImportBtn();
+});
+
+/* ---------------- OCR 识别与校对 ---------------- */
+let ocrBook = null;
+let ocrPageNo = 0;
+let ocrPoll = null;
+
+function openOcr(book) {
+  ocrBook = book;
+  ocrPageNo = 0;
+  $("#ocr-title").textContent = book.title || book.path;
+  $("#ocr-sub").textContent = `${(book.format || "").toUpperCase()} · ${book.pages || "?"} 页`;
+  $("#ocr-text").value = "";
+  $("#ocr-page-info").textContent = "";
+  $("#ocr-img").removeAttribute("src");
+  $("#ocr-drawer").classList.add("open");
+  loadOcrPages();
+  pollOcr();
+}
+
+function closeOcr() {
+  $("#ocr-drawer").classList.remove("open");
+  ocrBook = null;
+  if (ocrPoll) {
+    clearInterval(ocrPoll);
+    ocrPoll = null;
+  }
+}
+
+async function loadOcrPages() {
+  if (!ocrBook) return;
+  try {
+    const r = await api(`/api/library/books/${ocrBook.id}/ocr`);
+    const st = r.stats || { pages: 0, chars: 0 };
+    $("#ocr-sub").textContent =
+      `${(ocrBook.format || "").toUpperCase()} · ${ocrBook.pages || "?"} 页 · 已识别 ${st.pages} 页 / ${st.chars} 字`;
+    const box = $("#ocr-page-list");
+    if (!r.pages.length) {
+      box.innerHTML = '<div class="empty" style="padding:14px">还没有识别任何页</div>';
+      return;
+    }
+    box.innerHTML = r.pages
+      .map(
+        (p) => `<div class="pg ${p.page_no === ocrPageNo ? "active" : ""}" data-pg="${p.page_no}">
+          <span>第 ${p.page_no + 1} 页${p.edited ? " ✓" : ""}</span>
+          <span class="n">${p.chars}</span>
+        </div>`
+      )
+      .join("");
+    $$("#ocr-page-list .pg").forEach((el) =>
+      el.addEventListener("click", () => selectOcrPage(+el.dataset.pg))
+    );
+  } catch (e) {
+    toast("加载识别记录失败：" + e.message, "err");
+  }
+}
+
+async function selectOcrPage(pno) {
+  if (!ocrBook) return;
+  ocrPageNo = pno;
+  $$("#ocr-page-list .pg").forEach((el) =>
+    el.classList.toggle("active", +el.dataset.pg === pno)
+  );
+  $("#ocr-img").src = `/api/library/books/${ocrBook.id}/page/${pno}.png?dpi=120`;
+  $("#ocr-page-info").textContent = "加载中…";
+  try {
+    const d = await api(`/api/library/books/${ocrBook.id}/ocr/${pno}`);
+    $("#ocr-text").value = d.text || "";
+    $("#ocr-page-info").textContent =
+      `${d.chars} 字 · ${d.engine}${d.elapsed ? " · " + d.elapsed + "s" : ""}${d.edited ? " · 已校对" : ""}`;
+  } catch (_) {
+    $("#ocr-text").value = "";
+    $("#ocr-page-info").textContent = "这一页还没识别";
+  }
+}
+
+async function startOcr() {
+  if (!ocrBook) return;
+  const pages = $("#ocr-pages").value.trim() || "all";
+  const engine = $("#ocr-engine").value;
+  try {
+    const r = await api(`/api/library/books/${ocrBook.id}/ocr`, {
+      method: "POST",
+      body: { pages, engine },
+    });
+    if (!r.ok) return toast(r.msg || "启动失败", "err");
+    toast(
+      engine === "vision" ? "精细识别已开始，每页约 40 秒" : "识别已开始，每页约 5 秒",
+      "ok"
+    );
+    pollOcr();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+async function pollOcr() {
+  try {
+    const s = await api("/api/ocr/state");
+    paintOcrTask(s);
+    if (s.running) {
+      if (!ocrPoll) ocrPoll = setInterval(pollOcr, 2000);
+    } else if (ocrPoll) {
+      clearInterval(ocrPoll);
+      ocrPoll = null;
+      loadOcrPages();
+      loadLibrary();
+    }
+  } catch (_) {}
+}
+
+function paintOcrTask(s) {
+  const mine = s.running && ocrBook && s.book_id === ocrBook.id;
+  $("#ocr-start").disabled = !!s.running;
+  $("#ocr-stop").disabled = !s.running;
+  if (s.running) {
+    const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
+    $("#ocr-bar").style.width = pct + "%";
+    $("#ocr-status").textContent = `${s.done}/${s.total} 页 · 第 ${s.page} 页 · ${s.chars} 字 · ${s.elapsed}s`;
+  } else {
+    $("#ocr-bar").style.width = "0%";
+    $("#ocr-status").textContent = "";
+  }
+}
+
+$("#ocr-close").addEventListener("click", closeOcr);
+$("#ocr-start").addEventListener("click", startOcr);
+
+$("#ocr-stop").addEventListener("click", async () => {
+  await api("/api/ocr/stop", { method: "POST" });
+  toast("已发送停止指令");
+});
+
+$("#ocr-save").addEventListener("click", async () => {
+  if (!ocrBook || ocrPageNo === null) return toast("先选一页", "err");
+  try {
+    await api(`/api/library/books/${ocrBook.id}/ocr/${ocrPageNo}`, {
+      method: "PUT",
+      body: { text: $("#ocr-text").value },
+    });
+    toast("已保存", "ok");
+    loadOcrPages();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+});
+
+$("#ocr-redo").addEventListener("click", async () => {
+  if (!ocrBook) return toast("先选一页", "err");
+  const engine = $("#ocr-engine").value;
+  toast(engine === "vision" ? "精细重识别中，约 40 秒…" : "重识别中…");
+  try {
+    const r = await api(`/api/library/books/${ocrBook.id}/ocr/${ocrPageNo}/redo`, {
+      method: "POST",
+      body: { engine },
+    });
+    if (!r.ok) return toast(r.msg || "失败", "err");
+    $("#ocr-text").value = r.text || "";
+    $("#ocr-page-info").textContent = `${r.chars} 字 · ${engine} · ${r.elapsed}s`;
+    toast(`重识别完成：${r.chars} 字`, "ok");
+    loadOcrPages();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+});
+
+$("#ocr-import").addEventListener("click", async () => {
+  if (!ocrBook) return;
+  try {
+    const r = await api("/api/library/import", {
+      method: "POST",
+      body: { book_ids: [ocrBook.id], topic: $("#lib-topic").value.trim() },
+    });
+    if (!r.ok) return toast(r.msg || "启动失败", "err");
+    toast("已开始提炼入库，进度看「导入操作」那一栏", "ok");
+    closeOcr();
+  } catch (e) {
+    toast(e.message, "err");
+  }
 });
 
 /* ---------------- 资源 ---------------- */

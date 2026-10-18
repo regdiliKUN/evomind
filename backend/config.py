@@ -26,6 +26,9 @@ for _p in (DATA, LOGS, MODELS, DATASETS, KNOWLEDGE):
 DEFAULTS: dict[str, Any] = {
     # ---- 推理后端 ----
     "ollama_url": "http://127.0.0.1:11434",
+    # 视觉模型：扫描件 OCR 精修用，留空则用默认值 qwen3.8:27b
+    "vision_model": "qwen3.8:27b",
+    "ocr_dpi": 200,                  # PDF 渲染 DPI，200 够识别正文
     "model": "qwen3.8:27b",          # 主推理模型（大脑）
     "embed_model": "bge-m3",         # 向量化模型（记忆）
     "temperature": 0.3,

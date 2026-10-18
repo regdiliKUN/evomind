@@ -296,11 +296,58 @@
   <p><code>txt</code> <code>md</code> <code>epub</code> <code>pdf</code> <code>docx</code> <code>html</code>，
   或者直接粘贴一个链接。</p>
 
-  <div class="card warn">
-    <div class="t">扫描版 PDF 读不了</div>
+  <div class="card info">
+    <div class="t">扫描版 PDF 要先 OCR</div>
     <p style="margin-top:8px">PDF 有两种：一种是电子排版的（能提取文字），一种是扫描的（本质是图片）。<br>
-    扫描版提取不出文字，系统会自动跳过并标注「扫描版 PDF，需 OCR」。<br><br>
-    <b>所以优先导 txt / epub / docx</b>，这些一定能读。</p>
+    扫描版提取不出文字，系统会标注「扫描版 PDF，需 OCR」。<br><br>
+    <b>这种可以点书目旁边的「OCR」按钮识别</b>，识别完就能正常导入了。<br>
+    当然，<code>txt</code> / <code>epub</code> / <code>docx</code> 最省事，能直接读。</p>
+  </div>
+
+  <h2>把扫描件变成能读的文字（OCR）</h2>
+
+  <p>扫描版的书，书目右边会有一个 <b>OCR</b> 按钮。点它。</p>
+
+  <div class="card">
+    <div class="t">两个引擎，怎么选</div>
+    <table style="margin-top:12px">
+      <tr><th>引擎</th><th>速度</th><th>什么时候用</th></tr>
+      <tr><td><b>快速</b></td><td>约 5 秒一页</td><td>中文、英文的书，字迹清楚</td></tr>
+      <tr><td><b>精细</b></td><td>约 40 秒一页</td><td>日文、有表格、排版复杂</td></tr>
+    </table>
+    <p style="margin-top:12px">同一页日文书实测：快速引擎认出来 483 字，一堆乱码；
+    精细引擎认出 897 字，句子完整能读。<b>日文一定要用精细。</b></p>
+  </div>
+
+  <div class="card ok">
+    <div class="t">操作就四步</div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">1</div>
+      <div class="body"><b>填页数范围</b>
+        <span>填 <code>1-50</code> 就是前 50 页。建议先跑 5-10 页看看效果，别一上来跑整本。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">2</div>
+      <div class="body"><b>选引擎，点开始识别</b>
+        <span>会一页一页跑，上面有进度条和字数。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">3</div>
+      <div class="body"><b>校对</b>
+        <span>左边点页码，右边上面是原图、下面是识别出的文字，可以直接改。改完点「保存校对」。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">4</div>
+      <div class="body"><b>点「导入知识库」</b>
+        <span>就和普通书一样，开始提炼知识点了。</span></div>
+    </div>
+  </div>
+
+  <div class="card warn">
+    <div class="t">两个省时间的技巧</div>
+    <p style="margin-top:8px"><b>① 断了可以接着跑。</b>已经识别过的页会自动跳过，不用从头再来。<br><br>
+    <b>② 只跑需要的章节。</b>一本 150 页的书，快速引擎要 15 分钟，精细引擎要 2-3 小时。
+    先挑你最需要的部分跑，比如前 40 页。</p>
   </div>
 
   <h3>排除不想导入的目录</h3>
