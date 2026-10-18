@@ -782,19 +782,67 @@ $("#lib-search").addEventListener("input", () => {
   window.__libT = setTimeout(loadLibBooks, 400);
 });
 
-$("#btn-lib-selectall").addEventListener("click", () => {
-  $$("#lib-book-list .lib-ck:not(:disabled)").forEach((ck) => {
-    ck.checked = true;
-    libSelected.add(ck.dataset.id);
+// 按当前筛选条件分页拉取全部 id —— 「全选」要选真的全部，
+// 而不是当前这一页（后端单次上限 1000）
+async function fetchAllIds(maxCount = 0) {
+  const status = $("#lib-filter").value;
+  const q = $("#lib-search").value.trim();
+  const ids = [];
+  let offset = 0;
+  for (let guard = 0; guard < 50; guard++) {
+    // 只要前 N 个时按需取，别把三千多个 id 全拉一遍
+    const remain = maxCount ? maxCount - ids.length : 1000;
+    const pageSize = Math.max(1, Math.min(1000, remain));
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) });
+    if (status) params.set("status", status);
+    if (q) params.set("q", q);
+    const r = await api(`/api/library/books?${params}`);
+    const items = r.items || [];
+    for (const b of items) ids.push(b.id);
+    if (items.length < pageSize) break;
+    if (maxCount && ids.length >= maxCount) break;
+    offset += pageSize;
+  }
+  return ids;
+}
+
+function syncLibCheckboxes() {
+  $$("#lib-book-list .lib-ck").forEach((ck) => {
+    ck.checked = libSelected.has(ck.dataset.id);
   });
-  updateLibImportBtn();
+}
+
+async function selectAllMatching(limitN) {
+  const btn = $("#btn-lib-selectall");
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "拉取中…";
+  try {
+    let ids = await fetchAllIds(limitN || 0);
+    if (limitN) ids = ids.slice(0, limitN);
+    libSelected = new Set(ids);
+    syncLibCheckboxes();
+    updateLibImportBtn();
+    toast(`已选中 ${ids.length} 本`);
+  } catch (e) {
+    toast("拉取失败：" + e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+$("#btn-lib-selectall").addEventListener("click", () => selectAllMatching(0));
+
+$("#btn-lib-selectn").addEventListener("click", () => {
+  const n = parseInt($("#lib-select-n").value, 10);
+  if (!n || n < 1) return toast("先填一个正整数", "err");
+  selectAllMatching(n);
 });
 
 $("#btn-lib-unselect").addEventListener("click", () => {
   libSelected.clear();
-  $$("#lib-book-list .lib-ck").forEach((ck) => {
-    ck.checked = false;
-  });
+  syncLibCheckboxes();
   updateLibImportBtn();
 });
 
