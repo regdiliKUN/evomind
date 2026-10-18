@@ -711,7 +711,10 @@ $("#btn-lib-add").addEventListener("click", async () => {
 
 $("#btn-lib-scan").addEventListener("click", () => doScan(null));
 
-$("#btn-lib-parse").addEventListener("click", async () => {
+// 新增元素一律做存在性检查：浏览器缓存了旧 HTML 时，找不到元素直接跳过，
+// 不要让一个 null.addEventListener 把整个初始化中断掉
+const _btnParse = $("#btn-lib-parse");
+if (_btnParse) _btnParse.addEventListener("click", async () => {
   const ids = Array.from(libSelected);
   if (!ids.length) return toast("先勾选要解析的书", "err");
   const ok = confirm(
@@ -832,21 +835,25 @@ async function selectAllMatching(limitN) {
   }
 }
 
-$("#btn-lib-selectall").addEventListener("click", () => selectAllMatching(0));
+const _btnSelAll = $("#btn-lib-selectall");
+if (_btnSelAll) _btnSelAll.addEventListener("click", () => selectAllMatching(0));
 
-$("#btn-lib-selectn").addEventListener("click", () => {
+const _btnSelN = $("#btn-lib-selectn");
+if (_btnSelN) _btnSelN.addEventListener("click", () => {
   const n = parseInt($("#lib-select-n").value, 10);
   if (!n || n < 1) return toast("先填一个正整数", "err");
   selectAllMatching(n);
 });
 
-$("#btn-lib-unselect").addEventListener("click", () => {
+const _btnUnsel = $("#btn-lib-unselect");
+if (_btnUnsel) _btnUnsel.addEventListener("click", () => {
   libSelected.clear();
   syncLibCheckboxes();
   updateLibImportBtn();
 });
 
-$("#btn-lib-ocr").addEventListener("click", async () => {
+const _btnOcr = $("#btn-lib-ocr");
+if (_btnOcr) _btnOcr.addEventListener("click", async () => {
   const ids = Array.from(libSelected);
   if (!ids.length) return toast("先勾选要识别的书", "err");
   const ok = confirm(
