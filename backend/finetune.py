@@ -474,6 +474,9 @@ def train(
                     step += 1
                     _state["progress"] = round(min(0.99, step / total_steps), 3)
                     if step % 5 == 0:
+                        _state["stage"] = (
+                            f"训练中 epoch {ep+1}/{epochs} · step {step}/{total_steps}"
+                        )
                         _emit(
                             on_event, "train",
                             f"epoch {ep+1}/{epochs} · step {step}/{total_steps} · "
@@ -555,7 +558,13 @@ def train(
 
 def train_async(dataset_path: str, on_event: Event | None = None, **kw) -> dict:
     def _go() -> None:
-        train(dataset_path, on_event=on_event, **kw)
+        try:
+            r = train(dataset_path, on_event=on_event, **kw)
+            # 存结果供前端轮询取：训练结束但页面不知道跑成没跑成
+            _state["result"] = r
+        except Exception as e:  # noqa: BLE001
+            _state["result"] = {"ok": False, "msg": str(e)}
+            _emit(on_event, "error", f"训练失败：{str(e)[:120]}")
 
     threading.Thread(target=_go, daemon=True).start()
     return {"ok": True, "msg": "训练已在后台启动"}

@@ -1182,14 +1182,20 @@ function pollFinetune() {
         clearInterval(ftPollTimer);
         ftPollTimer = null;
         $("#btn-ft-dataset").disabled = false;
+        $("#btn-ft-train").disabled = false;
         const res = st.result || {};
-        if (res.ok) {
+        if (res.ok && res.count !== undefined) {
+          // 数据集生成完成
           state.datasetPath = res.path;
           $("#ft-ds").textContent = `${res.count} 条`;
           $("#btn-ft-train").disabled = false;
           toast(`训练集已生成：${res.count} 条`, "ok");
+        } else if (res.ok) {
+          // 微调完成
+          $("#ft-train").textContent = "已完成";
+          $("#ft-merge").textContent = res.merged ? "已合并" : "仅 adapter";
+          toast("微调完成", "ok");
         } else if (res.msg) {
-          $("#ft-ds").textContent = "生成失败";
           toast(res.msg, "err");
         }
       }
@@ -1219,8 +1225,11 @@ $("#btn-ft-train").addEventListener("click", async () => {
       method: "POST",
       body: { dataset_path: state.datasetPath },
     });
+    if (!r.ok) return toast(r.msg || "启动失败", "err");
     toast(r.msg || "已启动", "ok");
+    $("#btn-ft-train").disabled = true;
     $("#ft-train").textContent = "训练中…";
+    pollFinetune();
   } catch (e) {
     toast("启动失败：" + e.message, "err");
   }
