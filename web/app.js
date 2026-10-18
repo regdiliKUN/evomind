@@ -71,7 +71,7 @@ function switchView(v, fromHash) {
   if (v === "library") loadLibrary();
   if (v === "resources") loadResources();
   if (v === "finetune") loadFinetune();
-  if (v === "dashboard") loadDashboard();
+  if (v === "dashboard") loadDashboard(null, true);
   if (v === "settings") fillSettings();
   if (v === "learn") loadAuto();
 }
@@ -87,20 +87,21 @@ const STAGE_TEXT = {
   stopping: "停止中",
 };
 
-function pushEvent(evt, streamEl) {
+function pushEvent(evt, streamEl, animate = true) {
   const box = streamEl || $("#learn-stream");
   const empty = box.querySelector(".empty");
   if (empty) empty.remove();
 
   const div = document.createElement("div");
-  div.className = "evt " + (evt.level || "info");
+  div.className = "evt " + (evt.level || "info") + (animate ? " enter" : "");
   const src = evt.source
     ? `<div class="src">↳ ${esc(String(evt.source).slice(0, 90))}</div>`
     : "";
   div.innerHTML = `<span class="t">${fmtTime(evt.ts || Date.now() / 1000)}</span>
     <span class="m">${esc(evt.msg)}${src}</span>`;
   box.appendChild(div);
-  box.scrollTop = box.scrollHeight;
+  // 只有新事件才自动滚到底；重渲染历史时不动滚动位置，避免打断用户浏览
+  if (animate) box.scrollTop = box.scrollHeight;
 
   while (box.children.length > 400) box.removeChild(box.firstChild);
 
@@ -126,11 +127,23 @@ function updateRing(round) {
 
 function connectSSE() {
   const es = new EventSource("/api/events");
+  // 服务端回放历史后会发 history-end，之前收到的都算历史，不播入场动画
+  let sseReady = false;
+  let firstMsg = true;
+  es.addEventListener("history-end", () => {
+    sseReady = true;
+  });
   es.onmessage = (e) => {
     try {
       const evt = JSON.parse(e.data);
+      // 重连时先清掉旧的历史回放，避免重复堆叠
+      if (firstMsg) {
+        firstMsg = false;
+        const box = $("#learn-stream");
+        if (box) box.innerHTML = "";
+      }
       state.events.push(evt);
-      pushEvent(evt);
+      pushEvent(evt, null, sseReady);
       if (evt.level === "download" || evt.level === "error") {
         if (evt.msg.includes("下载完成")) toast(evt.msg, "ok");
       }
@@ -138,29 +151,49 @@ function connectSSE() {
   };
   es.onerror = () => {
     es.close();
+    sseReady = false;
     setTimeout(connectSSE, 4000);
   };
 }
 
 /* ---------------- 总览 ---------------- */
-async function loadDashboard() {
-  try {
-    const st = await api("/api/status");
-    state.status = st;
-    const s = st.stats;
-    $("#s-points").textContent = s.points;
-    $("#s-new").textContent = `24 小时新增 ${s.new_24h}`;
-    $("#s-docs").textContent = s.documents;
-    $("#s-res").textContent = s.resources;
-    $("#s-res-disk").textContent = `占用 ${s.disk_gb} GB`;
-    $("#s-sessions").textContent = s.sessions;
+/* 内容没变就不动 DOM —— 轮询刷新时避免整块重绘导致文字闪动 */
+function setHTML(el, html) {
+  if (!el) return false;
+  if (el.__lastHTML === html) return false;
+  el.__lastHTML = html;
+  el.innerHTML = html;
+  return true;
+}
 
-    const tl = $("#topic-list");
-    if (!s.topics.length) {
-      tl.innerHTML = '<div class="empty">还没有任何学习记录</div>';
-    } else {
-      const max = Math.max(...s.topics.map((t) => t.count));
-      tl.innerHTML = s.topics
+let dashEvtId = 0;
+
+async function loadDashboard(st, forceEvents = false) {
+  if (!st) {
+    try {
+      st = await api("/api/status");
+    } catch (e) {
+      toast("状态获取失败：" + e.message, "err");
+      return;
+    }
+  }
+  state.status = st;
+  const s = st.stats;
+  $("#s-points").textContent = s.points;
+  $("#s-new").textContent = `24 小时新增 ${s.new_24h}`;
+  $("#s-docs").textContent = s.documents;
+  $("#s-res").textContent = s.resources;
+  $("#s-res-disk").textContent = `占用 ${s.disk_gb} GB`;
+  $("#s-sessions").textContent = s.sessions;
+
+  const tl = $("#topic-list");
+  if (!s.topics.length) {
+    setHTML(tl, '<div class="empty">还没有任何学习记录</div>');
+  } else {
+    const max = Math.max(...s.topics.map((t) => t.count));
+    setHTML(
+      tl,
+      s.topics
         .slice(0, 8)
         .map(
           (t) => `<div style="margin-bottom:11px">
@@ -171,24 +204,44 @@ async function loadDashboard() {
             <div class="bar"><i style="width:${(t.count / max) * 100}%"></i></div>
           </div>`
         )
-        .join("");
-    }
-    paintTopbar(st);
-    renderNextSteps(st);
-  } catch (e) {
-    toast("状态获取失败：" + e.message, "err");
+        .join("")
+    );
   }
+  paintTopbar(st);
+  renderNextSteps(st);
+  await syncDashEvents(forceEvents);
+}
 
+/* 增量同步「最近活动」：只追加新事件，绝不重建已有行。
+   之前每 6 秒清空重渲染，导致每行重播入场动画，视觉上一直在抖。 */
+async function syncDashEvents(force) {
+  let evts;
   try {
-    const evts = await api("/api/events/recent?limit=30");
-    const box = $("#dash-stream");
+    evts = await api("/api/events/recent?limit=30");
+  } catch (_) {
+    return;
+  }
+  const box = $("#dash-stream");
+  if (!box) return;
+
+  if (force || dashEvtId === 0) {
     box.innerHTML = "";
     if (!evts.length) {
       box.innerHTML = '<div class="empty">暂无活动</div>';
-    } else {
-      evts.forEach((e) => pushEvent(e, box));
+      return;
     }
-  } catch (_) {}
+    evts.forEach((e) => pushEvent(e, box, false));
+    box.scrollTop = box.scrollHeight;
+    dashEvtId = evts[evts.length - 1].id || 0;
+    return;
+  }
+
+  const fresh = evts.filter((e) => (e.id || 0) > dashEvtId);
+  if (!fresh.length) return;
+  const empty = box.querySelector(".empty");
+  if (empty) empty.remove();
+  fresh.forEach((e) => pushEvent(e, box, true));
+  dashEvtId = fresh[fresh.length - 1].id || dashEvtId;
 }
 
 function renderNextSteps(st) {
@@ -215,7 +268,7 @@ function renderNextSteps(st) {
   }
   add("✎", "随时可以问它", "它只用学过的知识回答并标出处，不会拿模型记忆糊弄你。", "chat", "去问");
 
-  $("#next-steps").innerHTML = items
+  const html = items
     .slice(0, 3)
     .map(
       (i) => `<div class="row" style="display:flex;gap:14px;align-items:flex-start">
@@ -229,12 +282,16 @@ function renderNextSteps(st) {
     )
     .join("");
 
+  // 内容没变就不重建，避免按钮每 6 秒闪一下
+  if (!setHTML($("#next-steps"), html)) return;
+
   $$("#next-steps [data-goto]").forEach((b) =>
     b.addEventListener("click", () => switchView(b.dataset.goto))
   );
 }
 
-function paintTopbar(st) {  $("#m-points").textContent = st.stats.points;
+function paintTopbar(st) {
+  $("#m-points").textContent = st.stats.points;
   $("#m-docs").textContent = st.stats.documents;
   $("#m-disk").textContent = st.stats.disk_gb + " GB";
   const running = st.engine.running;
@@ -911,7 +968,7 @@ async function refreshAll() {
     const st = await api("/api/status");
     state.status = st;
     paintTopbar(st);
-    if (state.view === "dashboard") loadDashboard();
+    if (state.view === "dashboard") loadDashboard(st);
     if (state.view === "knowledge") loadKnowledge();
   } catch (_) {}
 }

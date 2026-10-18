@@ -222,8 +222,10 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 .evt {
   display: flex; gap: 10px; padding: 7px 10px;
   border-radius: 7px; border-left: 2px solid transparent;
-  animation: slideIn .25s ease;
 }
+/* 入场动画只给「新到达」的事件，历史事件重渲染时不播，
+   否则每次轮询刷新都会让整列文字重新滑入，看起来像在抖 */
+.evt.enter { animation: slideIn .25s ease; }
 @keyframes slideIn { from { transform: translateX(-6px); } to { transform: none; } }
 .evt:hover { background: #0d131c; }
 .evt .t { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); flex-shrink: 0; padding-top: 2px; }

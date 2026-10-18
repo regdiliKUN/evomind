@@ -144,6 +144,9 @@ def api_events() -> StreamingResponse:
             yield "retry: 3000\n\n"
             for evt in evolve.bus.history[-40:]:
                 yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+            # 标记历史回放结束，前端据此区分「历史」和「实时」，
+            # 避免重连时把历史事件重播一遍入场动画
+            yield "event: history-end\ndata: {}\n\n"
             while True:
                 try:
                     evt = q.get(timeout=15)
