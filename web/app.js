@@ -494,6 +494,11 @@ async function loadLibrary() {
     renderLibDirs(dirs);
     await loadLibBooks();
     paintLibTask(st.task);
+    // 刷新页面 / 切回书库时，正在跑的 OCR 进度要能接回来，否则看起来像「没反应」
+    if (!st.task || !st.task.running) {
+      const o = await api("/api/ocr/state").catch(() => null);
+      if (o && (o.batch || o.running)) paintOcrLive(o);
+    }
   } catch (e) {
     toast("书库加载失败：" + e.message, "err");
   }
@@ -666,12 +671,59 @@ function paintLibTask(t) {
 
 async function pollLibTask() {
   try {
-    const t = await api("/api/library/state");
-    paintLibTask(t);
-    if (!t.running) {
+    // OCR 任务和书库任务是两套状态，批量 OCR 时 library/state 是空的，
+    // 只查它的话书库页会完全没反应
+    const [t, o] = await Promise.all([
+      api("/api/library/state").catch(() => ({})),
+      api("/api/ocr/state").catch(() => null),
+    ]);
+    if (o && (o.batch || o.running)) {
+      paintOcrLive(o);
+    } else {
+      paintLibTask(t);
+    }
+    if (!t.running && !(o && (o.batch || o.running))) {
       loadLibrary();
     }
   } catch (_) {}
+}
+
+// 批量 OCR 的进度：外层是第几本，内层是当前书第几页
+function paintOcrLive(o) {
+  $("#btn-lib-scan").disabled = true;
+  $("#btn-lib-stop").disabled = false;
+  $("#btn-lib-url").disabled = true;
+  const wrap = $("#lib-bar-wrap");
+  if (!wrap) return;
+  wrap.style.display = "block";
+  const total = o.batch_total || 0;
+  const doneBooks = o.batch_done || 0;
+  const cur = o.total ? o.done / o.total : 0;
+  // 批量：总体进度 = 已完成的书 + 当前这本的页进度；单本：就是页进度
+  const overall = o.batch
+    ? (total ? Math.round(((doneBooks + (o.running ? cur : 0)) / total) * 100) : 0)
+    : Math.round(cur * 100);
+  const bar = $("#lib-bar");
+  if (bar) bar.style.width = overall + "%";
+  const hint = $("#lib-task-hint");
+  if (hint) {
+    const idx = total ? Math.min(Math.max(doneBooks + (o.running ? 1 : 0), 1), total) : 0;
+    const head = o.batch ? `OCR 批量 ${idx}/${total} 本 · 总体 ${overall}%` : `OCR 识别中 · ${overall}%`;
+    const inner = o.running && o.total ? ` · 当前书 ${o.done}/${o.total} 页` : " · 正在切下一本";
+    const name = o.book_title ? ` · ${o.book_title.slice(0, 26)}` : "";
+    hint.innerHTML =
+      `${head}${inner}${name}` +
+      ` <a href="#" id="lib-ocr-peek" style="color:var(--accent)">查看</a>`;
+    const peek = $("#lib-ocr-peek");
+    if (peek) {
+      peek.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        // follow=true：之后每换一本书，抽屉自动跟着切
+        if (o.book_id) openOcr({ id: o.book_id, title: o.book_title || "" }, true);
+      });
+    }
+  }
+  if (!libPoll) libPoll = setInterval(pollLibTask, 2000);
 }
 
 async function doScan(dirId) {
@@ -872,6 +924,8 @@ if (_btnOcr) _btnOcr.addEventListener("click", async () => {
     toast(r.msg || `已开始识别 ${ids.length} 本`, "ok");
     libSelected.clear();
     updateLibImportBtn();
+    // 立刻接上进度轮询：以前这里只延迟刷一次列表，所以批量跑起来完全看不到进度
+    pollLibTask();
     setTimeout(() => loadLibBooks().catch(() => {}), 6000);
   } catch (e) {
     toast(e.message, "err");
@@ -882,23 +936,45 @@ if (_btnOcr) _btnOcr.addEventListener("click", async () => {
 let ocrBook = null;
 let ocrPageNo = 0;
 let ocrPoll = null;
+// 批量识别时，抽屉自动跟着「正在识别的那本书」走
+let ocrFollow = false;
+// 自动预览当前正在识别的页；用户手动点过页就关掉，避免抢走他的选择
+let ocrAutoPage = true;
 
-function openOcr(book) {
+function openOcr(book, follow = false) {
   ocrBook = book;
   ocrPageNo = 0;
-  $("#ocr-title").textContent = book.title || book.path;
-  $("#ocr-sub").textContent = `${(book.format || "").toUpperCase()} · ${book.pages || "?"} 页`;
+  ocrFollow = follow;
+  ocrAutoPage = true;
+  $("#ocr-title").textContent = book.title || book.path || "—";
+  $("#ocr-sub").textContent = `${(book.format || "").toUpperCase()}${book.pages ? " · " + book.pages + " 页" : ""}`;
   $("#ocr-text").value = "";
   $("#ocr-page-info").textContent = "";
   $("#ocr-img").removeAttribute("src");
+  $("#ocr-page-list").innerHTML = "";
   $("#ocr-drawer").classList.add("open");
   loadOcrPages();
   pollOcr();
 }
 
+// 批量识别跑到下一本时，把抽屉整个重挂到新书上
+function attachOcrBook(s) {
+  ocrBook = { id: s.book_id, title: s.book_title || "", format: "", pages: s.total || 0 };
+  ocrPageNo = -1;
+  ocrAutoPage = true;
+  $("#ocr-title").textContent = ocrBook.title || "（正在准备）";
+  $("#ocr-sub").textContent = "批量识别中…";
+  $("#ocr-text").value = "";
+  $("#ocr-page-info").textContent = "";
+  $("#ocr-img").removeAttribute("src");
+  $("#ocr-page-list").innerHTML = "";
+  loadOcrPages();
+}
+
 function closeOcr() {
   $("#ocr-drawer").classList.remove("open");
   ocrBook = null;
+  ocrFollow = false;
   if (ocrPoll) {
     clearInterval(ocrPoll);
     ocrPoll = null;
@@ -933,8 +1009,9 @@ async function loadOcrPages() {
   }
 }
 
-async function selectOcrPage(pno) {
+async function selectOcrPage(pno, auto = false) {
   if (!ocrBook) return;
+  if (!auto) ocrAutoPage = false;
   ocrPageNo = pno;
   $$("#ocr-page-list .pg").forEach((el) =>
     el.classList.toggle("active", +el.dataset.pg === pno)
@@ -943,9 +1020,12 @@ async function selectOcrPage(pno) {
   $("#ocr-page-info").textContent = "加载中…";
   try {
     const d = await api(`/api/library/books/${ocrBook.id}/ocr/${pno}`);
-    $("#ocr-text").value = d.text || "";
+    // 自动预览时别覆盖用户正在编辑的文本框
+    if (!auto || document.activeElement !== $("#ocr-text")) {
+      $("#ocr-text").value = d.text || "";
+    }
     $("#ocr-page-info").textContent =
-      `${d.chars} 字 · ${d.engine}${d.elapsed ? " · " + d.elapsed + "s" : ""}${d.edited ? " · 已校对" : ""}`;
+      `${d.chars} 字 · ${d.engine}${d.elapsed ? " · " + Math.round(d.elapsed * 10) / 10 + "s" : ""}${d.edited ? " · 已校对" : ""}`;
   } catch (_) {
     $("#ocr-text").value = "";
     $("#ocr-page-info").textContent = "这一页还没识别";
@@ -975,8 +1055,35 @@ async function startOcr() {
 async function pollOcr() {
   try {
     const s = await api("/api/ocr/state");
+    const batch = !!s.batch;
+
+    // 批量识别换了书：抽屉跟着切过去，否则会一直停在第一本上
+    if (
+      batch && ocrFollow &&
+      $("#ocr-drawer").classList.contains("open") &&
+      s.book_id && (!ocrBook || ocrBook.id !== s.book_id)
+    ) {
+      attachOcrBook(s);
+    }
+    // 书名是任务线程读到 PDF 之后才回填的，抽屉标题要跟着补上
+    if (ocrBook && s.book_id === ocrBook.id && s.book_title && ocrBook.title !== s.book_title) {
+      ocrBook.title = s.book_title;
+      $("#ocr-title").textContent = s.book_title;
+    }
+
     paintOcrTask(s);
-    if (s.running) {
+
+    // 实时预览：正在识别的页往前走了，自动翻到那一页
+    if (batch && s.running && ocrBook && s.book_id === ocrBook.id && s.page > 0) {
+      const pno = s.page - 1;
+      if (ocrAutoPage && pno !== ocrPageNo) {
+        selectOcrPage(pno, true);
+        loadOcrPages();
+      }
+    }
+
+    // 批量期间两本书之间 running 会短暂为 false，不能因此停掉轮询
+    if (s.running || batch) {
       if (!ocrPoll) ocrPoll = setInterval(pollOcr, 2000);
     } else if (ocrPoll) {
       clearInterval(ocrPoll);
@@ -988,15 +1095,33 @@ async function pollOcr() {
 }
 
 function paintOcrTask(s) {
-  const mine = s.running && ocrBook && s.book_id === ocrBook.id;
-  $("#ocr-start").disabled = !!s.running;
-  $("#ocr-stop").disabled = !s.running;
+  const busy = !!s.running || !!s.batch;
+  const isCur = !!ocrBook && s.book_id === ocrBook.id;
+  $("#ocr-start").disabled = busy;
+  $("#ocr-stop").disabled = !busy;
+  const bar = $("#ocr-bar");
   if (s.running) {
     const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
-    $("#ocr-bar").style.width = pct + "%";
-    $("#ocr-status").textContent = `${s.done}/${s.total} 页 · 第 ${s.page} 页 · ${s.chars} 字 · ${s.elapsed}s`;
+    if (s.batch && ocrBook && !isCur) {
+      // 抽屉里看的是别的书：只报批量总进度，别把当前书的页数糊上来
+      const idx = Math.min((s.batch_done || 0) + 1, s.batch_total || 0);
+      bar.style.width = "0%";
+      $("#ocr-status").textContent =
+        `批量识别中 · 第 ${idx}/${s.batch_total || 0} 本正在识别，本书排在后面`;
+      return;
+    }
+    bar.style.width = pct + "%";
+    const outer = s.batch
+      ? `批量 第 ${Math.min((s.batch_done || 0) + 1, s.batch_total || 0)}/${s.batch_total || 0} 本 · `
+      : "";
+    $("#ocr-status").textContent =
+      `${outer}${s.done}/${s.total} 页 · 第 ${s.page} 页 · ${s.chars} 字 · ${s.elapsed}s`;
+  } else if (s.batch) {
+    // 两本之间的空档，别把进度条清空
+    $("#ocr-status").textContent =
+      `批量识别中 · 已完成 ${s.batch_done || 0}/${s.batch_total || 0} 本 · 正在切下一本`;
   } else {
-    $("#ocr-bar").style.width = "0%";
+    bar.style.width = "0%";
     $("#ocr-status").textContent = "";
   }
 }

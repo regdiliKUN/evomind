@@ -337,7 +337,15 @@ def ocr_book_async(
     if not _internal:
         with _task_lock:
             if _task["running"] or _task.get("batch"):
-                return {"ok": False, "msg": "已有 OCR 任务在跑，请先等待或停止"}
+                # 看门狗：running 为真但 5 分钟没翻页，说明线程已经死了。
+                # 不释放的话，之后每次点「开始识别」都会被互斥检查拒掉，
+                # 表现就是「点好几次才动」。
+                last = _task.get("last_ts") or 0
+                if last and (time.time() - last) > 300:
+                    _task.update(running=False, batch=False, stage="idle",
+                                 stop=False, last_ts=0)
+                else:
+                    return {"ok": False, "msg": "已有 OCR 任务在跑，请先等待或停止"}
 
     # 书库导入和 OCR 都是重任务，同时跑会互相拖慢（都吃 CPU/GPU）
     try:
@@ -426,6 +434,7 @@ def ocr_book_async(
                     _task["page"] = pno + 1
                     _task["chars"] += len(text)
                     _task["elapsed"] = round(time.time() - t_all, 1)
+                    _task["last_ts"] = time.time()
                 if (i + 1) % 5 == 0 or i == 0:
                     _emit(
                         on_event, "info",
@@ -436,6 +445,7 @@ def ocr_book_async(
                 with _task_lock:
                     _task["failed"] += 1
                     _task["done"] = i + 1
+                    _task["last_ts"] = time.time()
                 _emit(on_event, "warn", f"第 {pno+1} 页识别失败：{str(e)[:70]}")
 
         # 汇总：把有文字的页拼成章节，让书目变成可导入状态
@@ -478,9 +488,25 @@ def ocr_book_async(
 
     # 先占位再起线程：否则批量队列会在线程还没跑到 running=True 时就以为任务结束了，
     # 结果所有书并发开跑，反而更慢
+    # 同时把上一本的计数清零：批量换书时旧计数会残留几秒（解析 PDF 期间），
+    # 前端就会看到进度条先冲到 100% 再跳回 17%
     with _task_lock:
-        _task.update(running=True, stage="starting", book_id=book_id)
-    threading.Thread(target=go, daemon=True).start()
+        _task.update(running=True, stage="starting", book_id=book_id,
+                     book_title="", total=0, done=0, failed=0, page=0,
+                     chars=0, elapsed=0.0, stop=False, last_ts=time.time())
+
+    # 用 finally 兜底：go() 内部任何未捕获异常都会让 running 永久为 True，
+    # 之后所有「开始识别」都会被互斥检查拒掉——表现就是「点好几次才动」
+    def _safe_go() -> None:
+        try:
+            go()
+        except Exception as e:  # noqa: BLE001
+            _emit(on_event, "error", f"识别异常终止：{str(e)[:100]}")
+        finally:
+            with _task_lock:
+                _task.update(running=False, stage="idle")
+
+    threading.Thread(target=_safe_go, daemon=True).start()
     return {"ok": True}
 
 
@@ -554,7 +580,17 @@ def ocr_batch_async(
             _task.update(batch=False, running=False, stage="idle", stop=False)
         _emit(on_event, "ok", f"批量识别结束：完成 {done}/{len(ids)} 本")
 
-    threading.Thread(target=go, daemon=True).start()
+    def _safe_go() -> None:
+        try:
+            go()
+        except Exception as e:  # noqa: BLE001
+            _emit(on_event, "error", f"批量识别异常终止：{str(e)[:100]}")
+        finally:
+            # batch 不清掉的话，之后单本 OCR 会一直被拒
+            with _task_lock:
+                _task.update(running=False, batch=False, stage="idle", stop=False)
+
+    threading.Thread(target=_safe_go, daemon=True).start()
     return {"ok": True, "msg": f"已开始批量识别 {len(ids)} 本"}
 
 
