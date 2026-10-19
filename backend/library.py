@@ -485,13 +485,23 @@ def _text_cache_maybe_trim() -> None:
     try:
         items = []
         total = 0
-        for f in TEXT_CACHE_DIR.rglob("*.txt"):
+        # 缓存是按 <目录>/<id 前 2 位>/<id>.txt 两级存放的，直接扫这两层比
+        # rglob 递归遍历快（rglob 会连目录一起 stat）
+        for sub in os.scandir(TEXT_CACHE_DIR):
             try:
-                st = f.stat()
+                if not sub.is_dir(follow_symlinks=False):
+                    continue
+                for e in os.scandir(sub.path):
+                    if not e.name.endswith(".txt"):
+                        continue
+                    try:
+                        st = e.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    items.append((st.st_atime, st.st_size, Path(e.path)))
+                    total += st.st_size
             except OSError:
                 continue
-            items.append((st.st_atime, st.st_size, f))
-            total += st.st_size
         if total <= TEXT_CACHE_MAX_BYTES:
             return
         items.sort(key=lambda x: x[0])     # 最久未用的先删
@@ -800,14 +810,15 @@ def import_book(
         if not r.get("ok"):
             return r
         raw_text = r.get("text") or ""
-        # 只有切出多章时才复用：单章意味着用的是兜底标题，而兜底标题在
-        # parse_book 与 import_book 里可能不同（epub 元数据会改 title），
-        # 复用了会让章节名和原来不一致。单章的情况重新切一次，开销也就几毫秒。
-        cl = r.get("chapter_list") or []
-        if len(cl) > 1:
-            chapters = cl
         row = c.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
         book = dict(row)
+        # 复用 parse_book 切好的章节，不再切一遍。
+        # 单章时标题是兜底标题，而这里用的是（可能被 epub 元数据更新过的）
+        # book['title']，对齐一下，保证章节名和原来完全一致。
+        cl = r.get("chapter_list") or []
+        if cl:
+            chapters = ([{"title": book["title"], "text": cl[0]["text"]}]
+                        if len(cl) == 1 else cl)
     else:
         raw_text = _text_cache_load(book_id, p)
         if raw_text is None:
@@ -1148,23 +1159,35 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
     topic = topic or f"网页 · {title[:40]}"
     text = doc["text"]
     chapters = _split_chapters(text, title)
-    total = 0
-    used = 0
+
+    # 先把要处理的块收齐（上限 MAX_CHUNKS_PER_BOOK），才能并发提炼。
+    # 原来这里是一条接一条串行调模型，网页正文长的时候要等很久。
+    blocks: list[dict] = []
     for ch in chapters:
         for chunk in _chunk(ch["text"]):
-            if used >= MAX_CHUNKS_PER_BOOK:
+            if len(blocks) >= MAX_CHUNKS_PER_BOOK:
                 break
-            used += 1
-            try:
-                data = llm.chat_json(
-                    EXTRACT_SYSTEM,
-                    EXTRACT_USER.format(topic=topic, title=title,
-                                        chapter=ch["title"][:60], text=chunk[:9000]),
-                    temperature=0.2,
-                )
-            except Exception as e:  # noqa: BLE001
-                _emit(on_event, "warn", f"提炼失败（内部已重试）：{str(e)[:60]}")
+            blocks.append({"chapter": ch["title"], "text": chunk})
+
+    def _extract(b: dict) -> dict | None:
+        try:
+            return llm.chat_json(
+                EXTRACT_SYSTEM,
+                EXTRACT_USER.format(topic=topic, title=title,
+                                    chapter=b["chapter"][:60], text=b["text"][:9000]),
+                temperature=0.2,
+            )
+        except Exception as e:  # noqa: BLE001
+            _emit(on_event, "warn", f"提炼失败（内部已重试）：{str(e)[:60]}")
+            return None
+
+    min_rel = float(config.get("min_relevance", 0.45))
+    total = 0
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        for data in ex.map(_extract, blocks):
+            if data is None:
                 continue
+            cands: list[tuple[str, str, float, Any]] = []
             for pt in (data.get("points") or [])[:6]:
                 claim = (pt.get("claim") or "").strip()
                 if len(claim) < 12:
@@ -1174,14 +1197,24 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
                     conf = float(pt.get("confidence", 0.6))
                 except Exception:
                     rel, conf = 0.5, 0.6
-                if rel < float(config.get("min_relevance", 0.45)):
+                if rel < min_rel:
                     continue
+                detail = (pt.get("detail") or "").strip()[:1200]
+                cands.append((claim, detail, max(0.1, min(1.0, conf)),
+                              pt.get("tags") or []))
+            if not cands:
+                continue
+            # 向量一次算一批，别一条一条往返
+            try:
+                vecs = llm.embed([f"{c[0]} {c[1][:400]}" for c in cands])
+            except Exception:  # noqa: BLE001
+                vecs = []
+            for i, (claim, detail, conf, tags) in enumerate(cands):
                 pid = memory.add_point(
-                    topic=topic, claim=claim,
-                    detail=(pt.get("detail") or "").strip()[:1200],
+                    topic=topic, claim=claim, detail=detail,
                     source_url=url, source_title=title,
-                    source_kind="web", tags=pt.get("tags") or [],
-                    confidence=max(0.1, min(1.0, conf)),
+                    source_kind="web", tags=tags, confidence=conf,
+                    vec=vecs[i] if i < len(vecs) else None,
                 )
                 if pid:
                     total += 1
@@ -1259,18 +1292,29 @@ def book_detail(book_id: str) -> dict:
 def library_stats() -> dict:
     init_db()
     c = memory.conn()
-    def n(sql: str, *p: Any) -> int:
-        return c.execute(sql, p).fetchone()["n"]
-
+    # 原来七个状态各发一条 COUNT，界面每刷一次就是八次往返。
+    # 合成一条标量子查询：一次往返拿回全部计数。
+    row = c.execute(
+        "SELECT"
+        " (SELECT COUNT(*) FROM library_dirs) AS dirs,"
+        " (SELECT COUNT(*) FROM books) AS books,"
+        " (SELECT COUNT(*) FROM books WHERE status='pending') AS pending,"
+        " (SELECT COUNT(*) FROM books WHERE status='ready') AS ready,"
+        " (SELECT COUNT(*) FROM books WHERE status='done') AS done,"
+        " (SELECT COUNT(*) FROM books WHERE status='skipped') AS skipped,"
+        " (SELECT COUNT(*) FROM books WHERE status='failed') AS failed,"
+        " (SELECT COUNT(*) FROM knowledge"
+        "   WHERE book_id IS NOT NULL AND book_id!='') AS points"
+    ).fetchone()
     return {
-        "dirs": n("SELECT COUNT(*) n FROM library_dirs"),
-        "books": n("SELECT COUNT(*) n FROM books"),
-        "pending": n("SELECT COUNT(*) n FROM books WHERE status='pending'"),
-        "ready": n("SELECT COUNT(*) n FROM books WHERE status='ready'"),
-        "done": n("SELECT COUNT(*) n FROM books WHERE status='done'"),
-        "skipped": n("SELECT COUNT(*) n FROM books WHERE status='skipped'"),
-        "failed": n("SELECT COUNT(*) n FROM books WHERE status='failed'"),
-        "points": n("SELECT COUNT(*) n FROM knowledge WHERE book_id IS NOT NULL AND book_id!=''"),
+        "dirs": row["dirs"],
+        "books": row["books"],
+        "pending": row["pending"],
+        "ready": row["ready"],
+        "done": row["done"],
+        "skipped": row["skipped"],
+        "failed": row["failed"],
+        "points": row["points"],
         "by_format": [
             {"format": r["format"], "count": r["n"]}
             for r in c.execute(

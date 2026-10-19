@@ -18,7 +18,7 @@ from . import config, llm
 
 _lock = threading.RLock()
 _local = threading.local()
-_vec_cache: dict[int, tuple[list[int], np.ndarray]] | None = None
+_vec_cache: dict[int, "_VecStore"] | None = None
 _cache_lock = threading.RLock()
 
 SCHEMA = """
@@ -180,6 +180,35 @@ def _from_blob(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.float32)
 
 
+class _VecStore:
+    """同一维度的 rowid + 单位向量，追加摊还 O(1)。
+
+    直接用 np.vstack 追加会把整块矩阵复制一遍：4000 条 1024 维就是 16MB，
+    导一本 240 点的书要复制几 GB。这里按 2 倍扩容预分配，写入位置永远在
+    已有行之后，所以对外给出的 view 不会被后来的追加改写。
+    """
+
+    __slots__ = ("ids", "_buf", "n")
+
+    def __init__(self, dim: int, cap: int = 0) -> None:
+        self.ids: list[int] = []
+        self._buf = np.zeros((max(cap, 1024), dim), dtype=np.float32)
+        self.n = 0
+
+    def add(self, rowid: int, unit: np.ndarray) -> None:
+        if self.n == self._buf.shape[0]:
+            grown = np.zeros((self._buf.shape[0] * 2, self._buf.shape[1]),
+                             dtype=np.float32)
+            grown[: self.n] = self._buf[: self.n]
+            self._buf = grown
+        self._buf[self.n] = unit
+        self.ids.append(rowid)
+        self.n += 1
+
+    def view(self) -> np.ndarray:
+        return self._buf[: self.n]
+
+
 def _invalidate() -> None:
     global _vec_cache
     with _cache_lock:
@@ -202,44 +231,54 @@ def _append_vector(rowid: int, vec: list[float]) -> None:
         if _vec_cache is None:
             return  # 缓存还没建过，下次 _all_vectors 自然会把它一起读进来
         dim = len(vec)
-        ids, mat = _vec_cache.get(dim, ([], np.empty((0, dim), dtype=np.float32)))
         v = np.asarray(vec, dtype=np.float32)
         norm = float(np.linalg.norm(v))
         if not np.isfinite(norm) or norm == 0:
             return
-        v = (v / norm)[None, :]
-        if len(ids):
-            mat = np.vstack([mat, v]) if mat.shape[1] == dim else v
-        else:
-            mat = v
-        _vec_cache[dim] = (ids + [rowid], mat)
+        store = _vec_cache.get(dim)
+        if store is None:
+            store = _vec_cache[dim] = _VecStore(dim)
+        store.add(rowid, v / norm)
 
 
 def _all_vectors(dimension: int) -> tuple[list[int], np.ndarray]:
-    """按维度缓存单位向量，避免模型切换后混合维度导致 vstack 崩溃。"""
+    """按维度缓存单位向量，避免模型切换后混合维度导致矩阵形状不匹配。"""
     global _vec_cache
     with _cache_lock:
-        if _vec_cache is not None:
-            return _vec_cache.get(dimension, ([], np.empty((0, dimension), dtype=np.float32)))
-        rows = conn().execute(
-            "SELECT rowid, embedding FROM knowledge WHERE embedding IS NOT NULL"
-        ).fetchall()
-        groups: dict[int, tuple[list[int], list[np.ndarray]]] = {}
-        for r in rows:
-            try:
-                v = _from_blob(r["embedding"])
-                if not v.size or not np.isfinite(v).all():
+        if _vec_cache is None:
+            rows = conn().execute(
+                "SELECT rowid, embedding FROM knowledge WHERE embedding IS NOT NULL"
+            ).fetchall()
+            groups: dict[int, tuple[list[int], list[np.ndarray]]] = {}
+            for r in rows:
+                try:
+                    v = _from_blob(r["embedding"])
+                    if not v.size or not np.isfinite(v).all():
+                        continue
+                    norm = float(np.linalg.norm(v))
+                    if not np.isfinite(norm) or norm == 0:
+                        continue
+                    ids, vecs = groups.setdefault(v.size, ([], []))
+                    ids.append(r["rowid"])
+                    vecs.append(v / norm)
+                except (TypeError, ValueError):
                     continue
-                norm = float(np.linalg.norm(v))
-                if not np.isfinite(norm) or norm == 0:
-                    continue
-                ids, vecs = groups.setdefault(v.size, ([], []))
-                ids.append(r["rowid"])
-                vecs.append(v / norm)
-            except (TypeError, ValueError):
-                continue
-        _vec_cache = {size: (ids, np.vstack(vecs)) for size, (ids, vecs) in groups.items()}
-        return _vec_cache.get(dimension, ([], np.empty((0, dimension), dtype=np.float32)))
+            _vec_cache = {}
+            for size, (ids, vecs) in groups.items():
+                store = _VecStore(size, cap=len(ids))
+                store.ids = ids
+                store.n = len(ids)
+                if vecs:
+                    store._buf[: len(ids)] = np.asarray(vecs, dtype=np.float32)
+                _vec_cache[size] = store
+        store = _vec_cache.get(dimension)
+        if store is None:
+            return [], np.empty((0, dimension), dtype=np.float32)
+        # 矩阵给 view 而不是副本，否则每次读取都要复制 16MB，优化就白做了；
+        # 追加只写 n 之后的位置，view 不会被改写。
+        # id 列表则给快照：它是活的，并发追加会让它比矩阵长，
+        # similarity 里 k 超过矩阵行数就会下标越界。复制 4000 个指针只要几微秒。
+        return store.ids[:], store.view()
 
 
 def _normalize(m: np.ndarray) -> np.ndarray:
