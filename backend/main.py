@@ -468,6 +468,12 @@ def api_ocr_vision() -> dict:
     return {"available": ok, "model": info}
 
 
+@app.get("/api/ocr/device")
+def api_ocr_device() -> dict:
+    """识别后端状态：GPU 是否真的在用、并发几线程。"""
+    return ocr.device_status()
+
+
 @app.post("/api/library/books/{bid}/ocr")
 def api_book_ocr(bid: str, body: dict = Body(...)) -> dict:
     return ocr.ocr_book_async(

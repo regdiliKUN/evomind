@@ -954,7 +954,27 @@ function openOcr(book, follow = false) {
   $("#ocr-page-list").innerHTML = "";
   $("#ocr-drawer").classList.add("open");
   loadOcrPages();
+  paintOcrDevice();
   pollOcr();
+}
+
+// 让用户看得见识别到底跑在 GPU 还是 CPU 上
+async function paintOcrDevice() {
+  const el = $("#ocr-device");
+  if (!el) return;
+  try {
+    const d = await api("/api/ocr/device");
+    const gpu = d.active === "gpu";
+    el.textContent = gpu ? `GPU · ${d.workers} 线程` : `CPU · ${d.workers} 线程`;
+    el.style.color = gpu ? "var(--green)" : "var(--text-dim)";
+    el.title = gpu
+      ? "识别走 CUDA，页面渲染与识别并行"
+      : d.cuda_available
+        ? "已检测到 CUDA，但配置里关掉了（ocr_device=cpu）"
+        : "未检测到 CUDA：装 onnxruntime-gpu 即可用显卡加速";
+  } catch (_) {
+    el.textContent = "";
+  }
 }
 
 // 批量识别跑到下一本时，把抽屉整个重挂到新书上
@@ -1043,7 +1063,7 @@ async function startOcr() {
     });
     if (!r.ok) return toast(r.msg || "启动失败", "err");
     toast(
-      engine === "vision" ? "精细识别已开始，每页约 40 秒" : "识别已开始，每页约 5 秒",
+      engine === "vision" ? "精细识别已开始，每页约 40 秒" : "识别已开始，进度看这里",
       "ok"
     );
     pollOcr();

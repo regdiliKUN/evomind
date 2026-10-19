@@ -31,6 +31,10 @@ DEFAULTS: dict[str, Any] = {
     # 视觉模型：扫描件 OCR 精修用，留空则用默认值 qwen3.8:27b
     "vision_model": "qwen3.8:27b",
     "ocr_dpi": 200,                  # PDF 渲染 DPI，200 够识别正文
+    # OCR 跑在哪：auto=有 CUDA 就用 GPU；gpu=强制 GPU；cpu=强制 CPU（排查用）
+    "ocr_device": "auto",
+    "ocr_workers": 0,                # 并发识别线程数，0=自动（GPU 上 2，纯 CPU 上 1）
+    "ocr_rec_batch": 16,             # GPU 上文本行识别的批大小，越大越吃满显卡
     "model": "qwen3.8:27b",          # 主推理模型（大脑）
     "embed_model": "bge-m3",         # 向量化模型（记忆）
     "temperature": 0.3,
@@ -78,6 +82,7 @@ def _validated(patch: dict[str, Any]) -> dict[str, Any]:
     ranges = {
         "temperature": (0, 2), "context_num": (256, 131072),
         "ocr_dpi": (72, 600), "max_rounds": (1, 100),
+        "ocr_workers": (0, 8), "ocr_rec_batch": (1, 64),
         "queries_per_round": (1, 20), "fetch_per_round": (1, 50),
         "min_relevance": (0, 1), "dedup_threshold": (0, 1),
         "idle_minutes": (0, 10080), "auto_rounds": (1, 100),

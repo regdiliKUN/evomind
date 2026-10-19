@@ -1,9 +1,13 @@
 """扫描件 OCR：把图片型书籍变成可学习的语料。
 
-双引擎设计（实测数据）：
-  - rapid：RapidOCR(ONNXRuntime)，约 5 秒/页，纯文字识别，适合批量跑
+双引擎设计（实测数据，RTX 4090 / 200 DPI）：
+  - rapid：RapidOCR(ONNXRuntime)，CPU 约 2.0 秒/页 → GPU 约 0.15-0.4 秒/页，
+            纯文字识别，适合批量跑
   - vision：本地视觉模型（qwen3.8:27b），约 30-60 秒/页，
             能理解表格与版面，质量明显更高，适合精修关键页
+
+调度：渲染（CPU）与识别（GPU）流水线化——一个生产者线程提前把页面渲染进队列，
+多个 worker 并行推理，GPU 不会因为等 PDF 渲染而空转。
 
 流程：逐页渲染 → 识别 → 存 ocr_pages → 可校对 → 拼成章节 → 走 library 的提炼入库
 支持断点续做：已识别的页会跳过，中断后重跑不会重复消耗时间。
@@ -11,10 +15,14 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import io
+import os
+import queue
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 import httpx
@@ -89,14 +97,181 @@ def state() -> dict:
 # --------------------------------------------------------------------------
 # 引擎
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 设备：让识别真正跑在 GPU 上
+# --------------------------------------------------------------------------
+_device_info: dict[str, Any] = {"device": "", "providers": []}
+_dll_ready = False
+_gpu_total: int | None = None
+
+
+def _torch_lib_dir() -> Path | None:
+    """torch 自带的 CUDA/cuDNN DLL 目录（不 import torch，省 1-2 秒启动时间）。"""
+    try:
+        spec = importlib.util.find_spec("torch")
+        if not spec or not spec.submodule_search_locations:
+            return None
+        lib = Path(list(spec.submodule_search_locations)[0]) / "lib"
+        return lib if lib.is_dir() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _enable_cuda_dlls() -> None:
+    """让 onnxruntime-gpu 找到 CUDA 运行库。
+
+    ORT 的 CUDA EP 是延迟加载的，按 PATH 找 cublas/cudnn。本机没单独装 CUDA
+    Toolkit，但 venv 里的 torch(cu124) 自带 cudart/cublas/cudnn9，把 torch/lib
+    加进 DLL 搜索路径就能直接用，省掉几个 G 的独立安装。
+    """
+    global _dll_ready
+    if _dll_ready or os.name != "nt":
+        return
+    _dll_ready = True
+    lib = _torch_lib_dir()
+    if not lib:
+        return
+    try:
+        os.add_dll_directory(str(lib))
+    except Exception:  # noqa: BLE001
+        pass
+    os.environ["PATH"] = str(lib) + os.pathsep + os.environ.get("PATH", "")
+
+
+def _cuda_available() -> bool:
+    _enable_cuda_dlls()
+    try:
+        import onnxruntime as ort
+
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _patch_rapidocr_prefix() -> None:
+    """修 RapidOCR 1.2.x 的参数前缀 bug。
+
+    它的 UpdateParameters 只给 det 剥了 `det_` 前缀，rec/cls 只认 model_path，
+    所以 `rec_use_cuda=True` 会变成一个没人读的键——检测跑在 GPU 上，
+    识别却还留在 CPU，整页耗时仍然被识别卡住。这里补上映射。
+    """
+    from rapidocr_onnxruntime import utils as ru
+
+    if getattr(ru.UpdateParameters, "_evomind_patched", False):
+        return
+
+    def _strip(prefix: str, cfg: dict, sub: dict) -> dict:
+        if not sub:
+            return cfg
+        clean: dict[str, Any] = {}
+        for k, v in sub.items():
+            if k == f"{prefix}use_cuda":
+                clean["use_cuda"] = v
+            elif k == f"{prefix}model_path":
+                clean["model_path"] = v
+            elif k == f"{prefix}label_list":
+                clean["label_list"] = v
+            else:
+                # rec_batch_num / cls_batch_num 这类本来就是配置里的键名
+                clean[k] = v
+        if not clean.get("model_path"):
+            clean["model_path"] = str(ru.root_dir / cfg["model_path"])
+        cfg.update(clean)
+        return cfg
+
+    ru.UpdateParameters.update_cls_params = (
+        lambda self, cfg, d: _strip("cls_", cfg, d)
+    )
+    ru.UpdateParameters.update_rec_params = (
+        lambda self, cfg, d: _strip("rec_", cfg, d)
+    )
+    ru.UpdateParameters._evomind_patched = True
+
+
 def _rapid():
     global _ocr_engine
     with _engine_lock:
         if _ocr_engine is None:
+            _patch_rapidocr_prefix()
             from rapidocr_onnxruntime import RapidOCR
 
-            _ocr_engine = RapidOCR()
+            want = str(config.get("ocr_device", "auto") or "auto").lower()
+            cuda = want != "cpu" and _cuda_available()
+            kwargs: dict[str, Any] = {
+                "det_use_cuda": cuda, "det_model_path": "",
+                "cls_use_cuda": cuda, "cls_model_path": "",
+                "rec_use_cuda": cuda, "rec_model_path": "",
+            }
+            if cuda:
+                # GPU 上一次多喂几行文本，利用率更高（CPU 上加大反而更慢）
+                kwargs["rec_batch_num"] = int(config.get("ocr_rec_batch", 16) or 16)
+                kwargs["cls_batch_num"] = 16
+            _ocr_engine = RapidOCR(**kwargs)
+            providers: list[str] = []
+            try:
+                providers = _ocr_engine.text_detector.infer.session.get_providers()
+            except Exception:  # noqa: BLE001
+                pass
+            _device_info.update(
+                device="gpu" if "CUDAExecutionProvider" in providers else "cpu",
+                providers=providers,
+            )
         return _ocr_engine
+
+
+def device_status() -> dict:
+    """给前端看：现在识别到底跑在 GPU 还是 CPU，并发开几个。"""
+    cuda = _cuda_available()
+    want = str(config.get("ocr_device", "auto") or "auto").lower()
+    return {
+        "cuda_available": cuda,
+        "setting": want,
+        "active": _device_info.get("device") or ("gpu" if cuda and want != "cpu" else "cpu"),
+        "providers": _device_info.get("providers", []),
+        "workers": _worker_count("rapid"),
+    }
+
+
+def _gpu_total_mb() -> int:
+    """显存总量（MB）。用来决定并发开几个，免得小显存机器 OOM。"""
+    global _gpu_total
+    if _gpu_total is not None:
+        return _gpu_total
+    _gpu_total = 0
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if out.returncode == 0:
+            _gpu_total = int(float(out.stdout.strip().splitlines()[0]))
+    except Exception:  # noqa: BLE001
+        pass
+    return _gpu_total
+
+
+def _worker_count(engine: str) -> int:
+    """并发识别线程数。
+
+    vision 引擎走 Ollama，单模型串行，多开会互相排队抢显存，固定 1。
+    rapid 在 GPU 上按显存开 2-3 个：GPU 推理时 CPU 在切图/预处理，
+    几页交错才能把 GPU 喂满。实测（319 页中文扫描书，41 页样本）：
+      CPU 1 线程 24 页/分钟 → GPU 2 线程 124 → 3 线程 170 → 6 线程 183
+    6 线程只多 8% 却多吃 3-4GB 显存，不划算。
+    纯 CPU 上 ORT 本身已吃满所有核心，开多反而互相拖慢。
+    """
+    if engine == "vision":
+        return 1
+    n = int(config.get("ocr_workers", 0) or 0)
+    if n > 0:
+        return max(1, min(8, n))
+    want = str(config.get("ocr_device", "auto") or "auto").lower()
+    if want == "cpu" or not _cuda_available():
+        return 1
+    return 3 if _gpu_total_mb() >= 20000 else 2
+
 
 
 def _pix_to_array(pix) -> Any:
@@ -406,47 +581,100 @@ def ocr_book_async(
                 page=0, chars=0, stage="ocr", stop=False, elapsed=0.0,
             )
         _emit(on_event, "stage", f"开始 OCR：《{row['title']}》 共 {len(targets)} 页（引擎 {engine}）")
+        if engine != "vision":
+            st = device_status()
+            _emit(
+                on_event, "info",
+                f"识别后端：{st['active'].upper()} · 并发 {st['workers']} 线程"
+                + ("" if st["cuda_available"] else "（未检测到 CUDA，装 onnxruntime-gpu 可用 GPU）"),
+            )
 
         t_all = time.time()
-        for i, pno in enumerate(targets):
-            if _task["stop"]:
-                _emit(on_event, "warn", "收到停止指令，已中断（进度已保存，可续做）")
-                break
-            try:
-                img_bytes, arr = render_page(doc, pno, dpi)
+        workers = _worker_count(engine)
+        q: queue.Queue = queue.Queue(maxsize=max(4, workers * 2))
+        render_lock = threading.Lock()   # pymupdf 的 doc 不能多线程同时读
+        counter = {"done": 0}
+        stop_flag = threading.Event()
+
+        def producer() -> None:
+            """提前把页面渲染进队列：渲染在 CPU、识别在 GPU，串着做 GPU 会空转。"""
+            for pno in targets:
+                if stop_flag.is_set() or _task["stop"]:
+                    break
+                try:
+                    with render_lock:
+                        img_bytes, arr = render_page(doc, pno, dpi)
+                    q.put((pno, img_bytes, arr))
+                except Exception as e:  # noqa: BLE001
+                    _emit(on_event, "warn", f"第 {pno+1} 页渲染失败：{str(e)[:60]}")
+                    q.put((pno, b"", None))
+            for _ in range(workers):
+                q.put(None)
+
+        def worker() -> None:
+            wc = memory.conn()   # 每个线程自己的连接（SQLite 连接不能跨线程共享）
+            while True:
+                item = q.get()
+                if item is None:
+                    return
+                pno, img_bytes, arr = item
+                if arr is None:
+                    with _task_lock:
+                        _task["failed"] += 1
+                        counter["done"] += 1
+                        _task["done"] = counter["done"]
+                        _task["last_ts"] = time.time()
+                    continue
                 t0 = time.time()
-                if engine == "vision":
-                    text = ocr_vision(img_bytes)
-                else:
-                    text = ocr_rapid(arr)
+                try:
+                    text = ocr_vision(img_bytes) if engine == "vision" else ocr_rapid(arr)
+                except Exception as e:  # noqa: BLE001
+                    with _task_lock:
+                        _task["failed"] += 1
+                        counter["done"] += 1
+                        _task["done"] = counter["done"]
+                        _task["last_ts"] = time.time()
+                    _emit(on_event, "warn", f"第 {pno+1} 页识别失败：{str(e)[:70]}")
+                    continue
                 el = time.time() - t0
-                c.execute(
-                    "INSERT INTO ocr_pages(book_id,page_no,text,engine,chars,elapsed,edited,created_at)"
-                    " VALUES (?,?,?,?,?,?,0,?)"
-                    " ON CONFLICT(book_id,page_no) DO UPDATE SET"
-                    " text=excluded.text, engine=excluded.engine, chars=excluded.chars,"
-                    " elapsed=excluded.elapsed, edited=0",
-                    (book_id, pno, text, engine, len(text), el, time.time()),
-                )
-                c.commit()
+                try:
+                    wc.execute(
+                        "INSERT INTO ocr_pages(book_id,page_no,text,engine,chars,elapsed,edited,created_at)"
+                        " VALUES (?,?,?,?,?,?,0,?)"
+                        " ON CONFLICT(book_id,page_no) DO UPDATE SET"
+                        " text=excluded.text, engine=excluded.engine, chars=excluded.chars,"
+                        " elapsed=excluded.elapsed, edited=0",
+                        (book_id, pno, text, engine, len(text), el, time.time()),
+                    )
+                    wc.commit()
+                except Exception as e:  # noqa: BLE001
+                    _emit(on_event, "warn", f"第 {pno+1} 页写入失败：{str(e)[:60]}")
                 with _task_lock:
-                    _task["done"] = i + 1
-                    _task["page"] = pno + 1
+                    counter["done"] += 1
+                    _task["done"] = counter["done"]
+                    # 并发下页可能乱序完成，页号取最大值，免得预览往回跳
+                    _task["page"] = max(_task["page"], pno + 1)
                     _task["chars"] += len(text)
                     _task["elapsed"] = round(time.time() - t_all, 1)
                     _task["last_ts"] = time.time()
-                if (i + 1) % 5 == 0 or i == 0:
+                    n_done = counter["done"]
+                if n_done % 5 == 0 or n_done == 1:
                     _emit(
                         on_event, "info",
                         f"第 {pno+1}/{total_pages} 页 · {len(text)} 字 · {el:.1f}s"
-                        f"（{i+1}/{len(targets)}）",
+                        f"（{n_done}/{len(targets)}）",
                     )
-            except Exception as e:  # noqa: BLE001
-                with _task_lock:
-                    _task["failed"] += 1
-                    _task["done"] = i + 1
-                    _task["last_ts"] = time.time()
-                _emit(on_event, "warn", f"第 {pno+1} 页识别失败：{str(e)[:70]}")
+
+        prod = threading.Thread(target=producer, daemon=True)
+        prod.start()
+        ws = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+        for w in ws:
+            w.start()
+        prod.join()
+        for w in ws:
+            w.join()
+        if _task["stop"]:
+            _emit(on_event, "warn", "收到停止指令，已中断（进度已保存，可续做）")
 
         # 汇总：把有文字的页拼成章节，让书目变成可导入状态
         rows = c.execute(
