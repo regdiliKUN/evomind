@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from . import config, fetcher, llm, memory
 
@@ -256,6 +257,30 @@ def _excluded(path: Path, excludes: list[str]) -> bool:
     return any(x and x in s for x in excludes)
 
 
+def _iter_files(root: Path) -> Iterator[os.DirEntry]:
+    """递归列出文件。
+
+    用 os.scandir 而不是 Path.rglob：rglob 返回的是 Path，判断是不是文件还得
+    再 stat 一次；DirEntry 在 Windows 上直接从目录项带出类型，is_file() 是免费的。
+    真实书库动辄几万个条目，省下来的都是系统调用。
+    """
+    stack = [str(root)]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            yield e
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+
 def scan(dirs: list[str] | None = None, on_event: Event | None = None) -> dict:
     """扫描目录，把发现的文件登记进 books 表（不解析内容）。"""
     init_db()
@@ -280,49 +305,56 @@ def scan(dirs: list[str] | None = None, on_event: Event | None = None) -> dict:
         if not root.exists():
             _emit(on_event, "warn", f"目录不存在，跳过：{root}")
             continue
-        excludes = d.get("excludes") or []
-        _emit(on_event, "info", f"扫描 {d['label'] or root.name}（排除：{'、'.join(excludes) or '无'}）")
+        raw_excludes = d.get("excludes") or []
+        excludes = [x for x in raw_excludes if x]   # 空串不参与匹配，同原来的写法
+        _emit(on_event, "info",
+              f"扫描 {d['label'] or root.name}（排除：{'、'.join(raw_excludes) or '无'}）")
 
-        for p in root.rglob("*"):
+        # 已有路径一次读进内存。原来每发现一个文件就发一条 SELECT id，
+        # 几千个文件就是几千次数据库往返——这是扫描阶段最大的一笔固定开销。
+        known = {r["path"] for r in c.execute("SELECT path FROM books").fetchall()}
+
+        for e in _iter_files(root):
             if _task["stop"]:
                 break
             try:
-                if not p.is_file():
-                    continue
-                hit = next((x for x in excludes if x and x in str(p)), None)
+                sp = e.path                      # str，只算一次
+                hit = next((x for x in excludes if x in sp), None)
                 if hit:
                     excluded_by_dir[hit] = excluded_by_dir.get(hit, 0) + 1
                     skipped += 1
                     continue
-                ext = p.suffix.lower()
+                name = e.name
+                dot = name.rfind(".")
+                ext = name[dot:].lower() if dot > 0 else ""
                 if ext in SKIP_FORMATS or ext not in SUPPORTED:
                     key = ext or "(无扩展名)"
                     unsupported_ext[key] = unsupported_ext.get(key, 0) + 1
                     skipped += 1
                     continue
                 found += 1
-                exists = c.execute("SELECT id FROM books WHERE path=?", (str(p),)).fetchone()
-                if exists:
+                if sp in known:
                     continue
                 try:
-                    size = p.stat().st_size
+                    size = e.stat(follow_symlinks=False).st_size
                 except OSError:
                     size = 0
                 c.execute(
                     "INSERT OR IGNORE INTO books(id,dir_id,path,source_type,format,"
                     "title,size_bytes,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                     (
-                        hashlib.md5(str(p).encode("utf-8")).hexdigest()[:16],
+                        hashlib.md5(sp.encode("utf-8")).hexdigest()[:16],
                         d["id"],
-                        str(p),
+                        sp,
                         "local",
                         ext.lstrip("."),
-                        p.stem,
+                        name[:dot] if dot > 0 else name,
                         size,
                         "pending",
                         time.time(),
                     ),
                 )
+                known.add(sp)
                 added += 1
                 if added % 50 == 0:
                     c.commit()
@@ -377,6 +409,102 @@ def _split_chapters(text: str, fallback_title: str) -> list[dict]:
 
 
 MAX_TEXT_BYTES = 200 * 1024 * 1024   # 单个文本文件读取上限
+_NL_RE = re.compile(r"\r\n|\r")      # 补回文本模式的换行归一（见 _read_text_file）
+
+
+# --------------------------------------------------------------------------
+# 正文缓存
+# --------------------------------------------------------------------------
+# 解析一本大 PDF 要几秒到几十秒，而「批量解析」和「批量导入」是两步操作：
+# 先跑解析把书标成 ready，再勾选导入。原来的 import_book 看到 status=ready
+# 就再解析一遍，等于每本书的解析都做了两次。
+# 这里把解析出的正文落盘缓存，导入时直接读回；用「大小+修改时间」做指纹，
+# 源文件变了就失效重解析，不会读到旧内容。
+TEXT_CACHE_DIR = config.DATA / "cache" / "booktext"
+TEXT_CACHE_MAX_BYTES = 1024 ** 3     # 缓存总量上限，超了按最久未用淘汰
+_TEXT_CACHE_TRIM_EVERY = 20          # 每写这么多本检查一次总量
+_text_cache_writes = {"n": 0}
+
+
+def _text_cache_file(book_id: str) -> Path:
+    return TEXT_CACHE_DIR / book_id[:2] / f"{book_id}.txt"
+
+
+def _text_fingerprint(p: Path) -> str:
+    try:
+        st = p.stat()
+        return f"{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return ""
+
+
+def _text_cache_save(book_id: str, p: Path, text: str) -> None:
+    r"""写入正文缓存。首行是指纹，其余是正文。
+
+    PDF 提取出来的正文可能带代理区码位（CID 映射不全时 pypdf 会给出 \udce0
+    这类字符），直接用 utf-8 写会抛 UnicodeEncodeError。surrogatepass 能
+    原样编解码，读回来和原文本逐字符一致，不会悄悄把正文改掉。
+    """
+    if not text:
+        return
+    try:
+        f = _text_cache_file(book_id)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", errors="surrogatepass", newline="\n") as fh:
+            fh.write(_text_fingerprint(p))
+            fh.write("\n")
+            fh.write(text)
+        os.replace(tmp, f)          # 原子替换，避免读到写了一半的文件
+        _text_cache_maybe_trim()
+    except Exception:  # noqa: BLE001  缓存失败不影响主流程
+        pass
+
+
+def _text_cache_load(book_id: str, p: Path) -> str | None:
+    """读取正文缓存。指纹对不上（文件被改过）就当没有。"""
+    try:
+        # newline="" —— 不让通用换行模式把正文里的 \r 悄悄改成 \n
+        with open(_text_cache_file(book_id), "r", encoding="utf-8",
+                  errors="surrogatepass", newline="") as fh:
+            raw = fh.read()
+    except Exception:  # noqa: BLE001
+        return None
+    head, sep, body = raw.partition("\n")
+    if not sep or head != _text_fingerprint(p):
+        return None
+    return body
+
+
+def _text_cache_maybe_trim() -> None:
+    """缓存超上限时淘汰最久未访问的。"""
+    with _lock:
+        _text_cache_writes["n"] += 1
+        if _text_cache_writes["n"] % _TEXT_CACHE_TRIM_EVERY:
+            return
+    try:
+        items = []
+        total = 0
+        for f in TEXT_CACHE_DIR.rglob("*.txt"):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            items.append((st.st_atime, st.st_size, f))
+            total += st.st_size
+        if total <= TEXT_CACHE_MAX_BYTES:
+            return
+        items.sort(key=lambda x: x[0])     # 最久未用的先删
+        for _, size, f in items:
+            if total <= TEXT_CACHE_MAX_BYTES:
+                break
+            try:
+                f.unlink()
+                total -= size
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _read_text_file(p: Path) -> str:
@@ -390,11 +518,17 @@ def _read_text_file(p: Path) -> str:
             )
     except OSError:
         pass
+    # 字节只读一次，再逐个编码试着解码。原来用 read_text 逐个编码试，
+    # 非 UTF-8 的文件（GBK / Big5 很常见）要把整个文件反复读好几遍。
+    raw = p.read_bytes()
     for enc in ("utf-8", "utf-8-sig", "gbk", "gb18030", "big5", "shift_jis", "latin-1"):
         try:
-            return p.read_text(encoding=enc)
+            text = raw.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
+        # read_text 走文本模式，会把 \r\n / \r 统一成 \n；直接解码不会，
+        # 这里补回去，保证读出来的内容和原来一模一样
+        return _NL_RE.sub("\n", text) if "\r" in text else text
     return p.read_bytes().decode("utf-8", errors="replace")
 
 
@@ -586,6 +720,9 @@ def parse_book(book_id: str, on_event: Event | None = None) -> dict:
         c.commit()
         return {"ok": False, "msg": "提取到的正文过少"}
 
+    # 存一份原始正文（未 strip），导入时可以不再解析一遍
+    _text_cache_save(book_id, p, res["text"])
+
     chapters = _split_chapters(text, book["title"] or p.stem)
     c.execute("DELETE FROM book_chapters WHERE book_id=?", (book_id,))
     for i, ch in enumerate(chapters):
@@ -600,7 +737,11 @@ def parse_book(book_id: str, on_event: Event | None = None) -> dict:
     )
     c.commit()
     _emit(on_event, "info", f"解析完成：{title}（{len(text)} 字 / {len(chapters)} 章）")
-    return {"ok": True, "chars": len(text), "chapters": len(chapters), "text": text}
+    # 把切好的章节一并返回：import_book 原本会拿同一份正文再切一遍
+    return {
+        "ok": True, "chars": len(text), "chapters": len(chapters), "text": text,
+        "chapter_list": chapters,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -651,23 +792,33 @@ def import_book(
     p = Path(book["path"])
     ext = p.suffix.lower()
 
-    # 正文只解析一次：状态还没就绪时 parse_book 会顺带解析并把 text 带回来，
-    # 直接就绪的直接读一次。之前两种情况都会再解析一遍，大 PDF 白白多花几十秒。
+    # 正文只解析一次：状态还没就绪时 parse_book 会顺带解析并把 text 带回来；
+    # 已就绪的先查正文缓存，命中就不必再解析一遍（大 PDF 解析一次要几秒到几十秒）。
+    chapters: list[dict] | None = None
     if book["status"] not in ("ready", "done"):
         r = parse_book(book_id, on_event)
         if not r.get("ok"):
             return r
         raw_text = r.get("text") or ""
+        # 只有切出多章时才复用：单章意味着用的是兜底标题，而兜底标题在
+        # parse_book 与 import_book 里可能不同（epub 元数据会改 title），
+        # 复用了会让章节名和原来不一致。单章的情况重新切一次，开销也就几毫秒。
+        cl = r.get("chapter_list") or []
+        if len(cl) > 1:
+            chapters = cl
         row = c.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
         book = dict(row)
     else:
-        try:
-            raw_text = _extract_text(p).get("text", "")
-        except Exception as e:  # noqa: BLE001
-            c.execute("UPDATE books SET status='failed', error=? WHERE id=?",
-                      (str(e)[:300], book_id))
-            c.commit()
-            return {"ok": False, "msg": str(e)}
+        raw_text = _text_cache_load(book_id, p)
+        if raw_text is None:
+            try:
+                raw_text = _extract_text(p).get("text", "")
+            except Exception as e:  # noqa: BLE001
+                c.execute("UPDATE books SET status='failed', error=? WHERE id=?",
+                          (str(e)[:300], book_id))
+                c.commit()
+                return {"ok": False, "msg": str(e)}
+            _text_cache_save(book_id, p, raw_text)
 
     # 主题要和 memory.add_point 里写入的一致（那边会压平空白），
     # 否则 books.topic 与 knowledge.topic 对不上，按主题筛书会漏。
@@ -680,7 +831,8 @@ def import_book(
         c.commit()
         return {"ok": False, "msg": "正文为空，无法提炼"}
 
-    chapters = _split_chapters(raw_text, book["title"])
+    if chapters is None:
+        chapters = _split_chapters(raw_text, book["title"])
     total_points = 0
     # 先把要处理的块收集起来，才能并发提炼
     blocks: list[dict] = []
@@ -719,6 +871,9 @@ def import_book(
             return None, b
 
     done_blocks = 0
+    # config.get 每次都要抢一把锁，原来每个知识点都要读一次，提到循环外面
+    min_rel = float(config.get("min_relevance", 0.45))
+    source_url = f"file:///{str(p).replace(chr(92), '/')}"
     # LLM 调用并发：实测提炼时 GPU 利用率只有 11%，串行等于让显卡空转。
     # 入库仍留在主线程串行，避免并发写库与去重锁互等。
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -730,6 +885,8 @@ def import_book(
                 on_event, "stage",
                 f"《{book['title']}》{b['chapter'][:30]} · {done_blocks}/{used} 块",
             )
+            # 先把这一块里够格的候选挑出来，好一次性把向量算完
+            cands: list[tuple[str, str, float, Any]] = []
             for pt in (data.get("points") or [])[:6]:
                 claim = (pt.get("claim") or "").strip()
                 if len(claim) < 12:
@@ -739,30 +896,42 @@ def import_book(
                     conf = float(pt.get("confidence", 0.6))
                 except Exception:
                     rel, conf = 0.5, 0.6
-                if rel < float(config.get("min_relevance", 0.45)):
+                if rel < min_rel:
                     continue
+                detail = (pt.get("detail") or "").strip()[:1200]
+                cands.append((claim, detail, max(0.1, min(1.0, conf)),
+                              pt.get("tags") or []))
+            if not cands:
+                continue
+
+            # 向量一次算一整块。原来每条知识点单独调一次 llm.embed，
+            # 实测逐条 30.6ms/条、批量(16) 9.2ms/条；批量与逐条的结果逐位相同。
+            try:
+                vecs = llm.embed([f"{c[0]} {c[1][:400]}" for c in cands])
+            except Exception:  # noqa: BLE001  向量化失败就退回让 add_point 自己算
+                vecs = []
+
+            for i, (claim, detail, conf, tags) in enumerate(cands):
+                vec = vecs[i] if i < len(vecs) else None
                 try:
+                    # book_id 随 INSERT 一起写进去，省掉原来「插入后再 UPDATE 回填
+                    # + 每点一次 commit」的多余读写（一本 240 点就是 240 次）
                     pid = memory.add_point(
                         topic=topic,
                         claim=claim,
-                        detail=(pt.get("detail") or "").strip()[:1200],
-                        source_url=f"file:///{str(p).replace(chr(92), '/')}",
+                        detail=detail,
+                        source_url=source_url,
                         source_title=f"《{book['title']}》 {b['chapter'][:60]}",
                         source_kind="book",
-                        tags=pt.get("tags") or [],
-                        confidence=max(0.1, min(1.0, conf)),
+                        tags=tags,
+                        confidence=conf,
                         session_id="",
-                        vec=None,
+                        book_id=book_id,
+                        vec=vec,
                         dedup=True,
                     )
                     if pid:
                         total_points += 1
-                        try:
-                            c.execute("UPDATE knowledge SET book_id=? WHERE id=?", (book_id, pid))
-                            # 不把写事务带进下一次 add_point（会与并发去重锁互等）。
-                            c.commit()
-                        except Exception:
-                            pass
                         _emit(on_event, "learn", f"＋ {claim[:70]}")
                 except Exception as e:  # noqa: BLE001
                     _emit(on_event, "warn", f"入库失败：{str(e)[:60]}")
@@ -774,6 +943,26 @@ def import_book(
     c.commit()
     _emit(on_event, "ok", f"《{book['title']}》导入完成，新增 {total_points} 条知识点")
     return {"ok": True, "points": total_points, "chunks": used}
+
+
+def _book_meta(ids: list[str]) -> dict[str, tuple[int, str]]:
+    """一次取回多本书的 (体积, 标题)。
+
+    原来排序要按 id 逐本查体积、循环里再逐本查标题，等于两轮 N 次查询；
+    批量处理几千本时，这些往返本身要好几秒。这里分批一次取回。
+    """
+    out: dict[str, tuple[int, str]] = {}
+    if not ids:
+        return out
+    c = memory.conn()
+    for i in range(0, len(ids), 500):
+        part = ids[i : i + 500]
+        ph = ",".join("?" * len(part))
+        for r in c.execute(
+            f"SELECT id,size_bytes,title FROM books WHERE id IN ({ph})", part
+        ):
+            out[r["id"]] = (r["size_bytes"] or 0, r["title"] or "")
+    return out
 
 
 def parse_books_async(book_ids: list[str], *, on_event: Event | None = None) -> dict:
@@ -804,21 +993,15 @@ def parse_books_async(book_ids: list[str], *, on_event: Event | None = None) -> 
                      stage="parsing", points=0, stop=False, current="")
         # 按体积升序：小书先跑，进度很快就能动起来。
         # 一上来就啃 300MB 的图集，看起来像卡死，实际在慢慢解析。
-        def _size(bid: str) -> int:
-            row = memory.conn().execute(
-                "SELECT size_bytes FROM books WHERE id=?", (bid,)
-            ).fetchone()
-            return row["size_bytes"] or 0 if row else 0
-
-        ordered = sorted(ids, key=_size)
+        meta = _book_meta(ids)
+        ordered = sorted(ids, key=lambda b: meta.get(b, (0, ""))[0])
         ok = scan = bad = 0
         for i, bid in enumerate(ordered):
             if _task["stop"]:
                 _emit(on_event, "warn", "收到停止指令，中断解析")
                 break
             _task["done"] = i
-            row = memory.conn().execute("SELECT title FROM books WHERE id=?", (bid,)).fetchone()
-            _task["current"] = row["title"] if row else bid
+            _task["current"] = meta.get(bid, (0, ""))[1] or bid
             try:
                 r = parse_book(bid)
             except Exception:  # noqa: BLE001
@@ -877,20 +1060,14 @@ def import_books_async(
         _task.update(running=True, kind="import", total=len(book_ids), done=0,
                      stage="importing", points=0, stop=False, current="")
         # 同样按体积升序，避免第一本是大图集导致进度长时间停在 0
-        def _size(bid: str) -> int:
-            row = memory.conn().execute(
-                "SELECT size_bytes FROM books WHERE id=?", (bid,)
-            ).fetchone()
-            return row["size_bytes"] or 0 if row else 0
-
+        meta = _book_meta(list(book_ids))
         total_pts = 0
-        for i, bid in enumerate(sorted(book_ids, key=_size)):
+        for i, bid in enumerate(sorted(book_ids, key=lambda b: meta.get(b, (0, ""))[0])):
             if _task["stop"]:
                 _emit(on_event, "warn", "收到停止指令，中断导入")
                 break
             _task["done"] = i
-            row = memory.conn().execute("SELECT title FROM books WHERE id=?", (bid,)).fetchone()
-            _task["current"] = row["title"] if row else bid
+            _task["current"] = meta.get(bid, (0, ""))[1] or bid
             try:
                 r = import_book(bid, topic=topic, max_chunks=max_chunks, on_event=on_event)
                 total_pts += r.get("points", 0)

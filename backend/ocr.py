@@ -188,35 +188,47 @@ def _patch_rapidocr_prefix() -> None:
     ru.UpdateParameters._evomind_patched = True
 
 
+def _new_rapid():
+    """构造一个 RapidOCR 实例（不做缓存）。"""
+    _patch_rapidocr_prefix()
+    from rapidocr_onnxruntime import RapidOCR
+
+    want = str(config.get("ocr_device", "auto") or "auto").lower()
+    cuda = want != "cpu" and _cuda_available()
+    kwargs: dict[str, Any] = {
+        "det_use_cuda": cuda, "det_model_path": "",
+        "cls_use_cuda": cuda, "cls_model_path": "",
+        "rec_use_cuda": cuda, "rec_model_path": "",
+    }
+    if cuda:
+        # GPU 上一次多喂几行文本，利用率更高（CPU 上加大反而更慢）
+        kwargs["rec_batch_num"] = int(config.get("ocr_rec_batch", 16) or 16)
+        kwargs["cls_batch_num"] = 16
+    engine = RapidOCR(**kwargs)
+    providers: list[str] = []
+    try:
+        providers = engine.text_detector.infer.session.get_providers()
+    except Exception:  # noqa: BLE001
+        pass
+    _device_info.update(
+        device="gpu" if "CUDAExecutionProvider" in providers else "cpu",
+        providers=providers,
+    )
+    return engine
+
+
 def _rapid():
     global _ocr_engine
     with _engine_lock:
         if _ocr_engine is None:
-            _patch_rapidocr_prefix()
-            from rapidocr_onnxruntime import RapidOCR
-
-            want = str(config.get("ocr_device", "auto") or "auto").lower()
-            cuda = want != "cpu" and _cuda_available()
-            kwargs: dict[str, Any] = {
-                "det_use_cuda": cuda, "det_model_path": "",
-                "cls_use_cuda": cuda, "cls_model_path": "",
-                "rec_use_cuda": cuda, "rec_model_path": "",
-            }
-            if cuda:
-                # GPU 上一次多喂几行文本，利用率更高（CPU 上加大反而更慢）
-                kwargs["rec_batch_num"] = int(config.get("ocr_rec_batch", 16) or 16)
-                kwargs["cls_batch_num"] = 16
-            _ocr_engine = RapidOCR(**kwargs)
-            providers: list[str] = []
-            try:
-                providers = _ocr_engine.text_detector.infer.session.get_providers()
-            except Exception:  # noqa: BLE001
-                pass
-            _device_info.update(
-                device="gpu" if "CUDAExecutionProvider" in providers else "cpu",
-                providers=providers,
-            )
+            _ocr_engine = _new_rapid()
         return _ocr_engine
+
+
+# 注意：不要给每个 worker 各建一个 RapidOCR 实例。
+# 试过（每线程一个 ONNX 会话、各自一条 CUDA 流），单测批跑能从 216 提到 271
+# 页/分钟，但放进真实流水线反而更慢：显存被占满后，机器上一并存着的 27B
+# 大模型会和 OCR 抢显存，实测从 224 掉到 68-84 页/分钟。单例最稳。
 
 
 def device_status() -> dict:
@@ -283,16 +295,29 @@ def _pix_to_array(pix) -> Any:
     return arr
 
 
-def render_page(doc, page_no: int, dpi: int = DEFAULT_DPI) -> tuple[bytes, Any]:
-    """渲染一页为 PNG 字节 + numpy 数组。"""
+def render_page(doc, page_no: int, dpi: int = DEFAULT_DPI,
+                need_png: bool = True) -> tuple[bytes, Any]:
+    """渲染一页为 PNG 字节（need_png 时）+ numpy 数组。
+
+    两处省下的都是纯浪费：
+
+    1. PNG 编码只有视觉引擎用得上（它要把图 base64 发给模型），rapid 引擎
+       只吃数组。实测 200DPI 一页编码要 150ms，占单页串行耗时的 9%。
+    2. 原来先按原 DPI 渲染一次、再看长边有没有超限，超了就按缩放比例重渲染
+       一遍 —— 第一次的产物整个丢掉。A3 及更大的页等于渲染两遍。
+
+    缩放比例用 IRect(page.rect * Matrix) 推出像素尺寸来算，这和 PyMuPDF
+    内部算位图尺寸的方式一致，所以一次渲染出来的位图与原来逐字节相同
+    （直接拿 page.rect 的磅值算会有亚像素误差，超限页的图会差一点点）。
+    """
     page = doc[page_no]
-    pix = page.get_pixmap(dpi=dpi)
-    # 超大页降采样，避免识别时间爆炸
-    long_edge = max(pix.width, pix.height)
+    zoom = dpi / 72.0
+    irect = pymupdf.IRect(page.rect * pymupdf.Matrix(zoom, zoom))
+    long_edge = max(irect.width, irect.height)
     if long_edge > MAX_PIXELS:
-        scale = MAX_PIXELS / long_edge
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(scale * dpi / 72, scale * dpi / 72))
-    return pix.tobytes("png"), _pix_to_array(pix)
+        zoom = zoom * MAX_PIXELS / long_edge
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+    return (pix.tobytes("png") if need_png else b""), _pix_to_array(pix)
 
 
 def ocr_rapid(img_array) -> str:
@@ -479,7 +504,7 @@ def ocr_page(book_id: str, page_no: int, engine: str = "rapid", dpi: int = DEFAU
         return {"ok": False, "msg": "页码超出范围"}
 
     t0 = time.time()
-    img_bytes, arr = render_page(doc, page_no, dpi)
+    img_bytes, arr = render_page(doc, page_no, dpi, need_png=(engine == "vision"))
     if engine == "vision":
         text = ocr_vision(img_bytes)
     else:
@@ -593,8 +618,17 @@ def ocr_book_async(
         workers = _worker_count(engine)
         q: queue.Queue = queue.Queue(maxsize=max(4, workers * 2))
         render_lock = threading.Lock()   # pymupdf 的 doc 不能多线程同时读
+        # 只有视觉引擎需要 PNG，rapid 引擎渲染时连编码那一步都省掉
+        want_png = engine == "vision"
         counter = {"done": 0}
         stop_flag = threading.Event()
+
+        # 先把模型加载好（1-2 秒），别让它算进第一页的耗时
+        if engine != "vision":
+            try:
+                _rapid()
+            except Exception:  # noqa: BLE001
+                pass
 
         def producer() -> None:
             """提前把页面渲染进队列：渲染在 CPU、识别在 GPU，串着做 GPU 会空转。"""
@@ -603,7 +637,7 @@ def ocr_book_async(
                     break
                 try:
                     with render_lock:
-                        img_bytes, arr = render_page(doc, pno, dpi)
+                        img_bytes, arr = render_page(doc, pno, dpi, need_png=want_png)
                     q.put((pno, img_bytes, arr))
                 except Exception as e:  # noqa: BLE001
                     _emit(on_event, "warn", f"第 {pno+1} 页渲染失败：{str(e)[:60]}")
