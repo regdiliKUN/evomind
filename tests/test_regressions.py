@@ -654,5 +654,51 @@ class _FakeClient:
         return _FakeResp()
 
 
+class TestStatsCache(IsolatedTest):
+    """stats() 版本键缓存：库没变过直接命中；写入后失效并反映新内容。"""
+
+    def _seed(self, n: int) -> None:
+        import hashlib
+
+        def fake_embed(texts, **_):
+            return [[(b - 127.5) / 127.5 for b in hashlib.sha256(t.encode()).digest()[:64]]
+                    for t in texts]
+
+        with patch.object(llm, "embed", side_effect=fake_embed):
+            for i in range(n):
+                memory.add_point(
+                    topic="t", claim=f"用于缓存测试的知识点陈述内容第 {i} 条",
+                    detail="", source_url="", source_title="", source_kind="web",
+                    tags=[], confidence=0.8, session_id="", dedup=False,
+                )
+
+    def _db_fields(self, d: dict) -> dict:
+        return {k: d[k] for k in d if k not in ("disk_gb", "budget_gb", "free_disk_gb", "ver")}
+
+    def test_cache_is_transparent(self):
+        self._seed(5)
+        a = self._db_fields(memory.stats())
+        b = self._db_fields(memory.stats())  # 版本未变，应命中缓存
+        self.assertEqual(a, b)
+        self.assertEqual(a["points"], 5)
+
+    def test_cache_invalidates_on_write(self):
+        self._seed(3)
+        before = memory.stats()["points"]
+        self.assertEqual(before, 3)
+        self._seed(1)  # 写入会 bump 版本号并失效缓存
+        after = memory.stats()["points"]
+        self.assertEqual(after, 4)
+
+    def test_disabled_path_is_equivalent(self):
+        self._seed(6)
+        memory._DISABLE_STATS_CACHE = True
+        recomputed = self._db_fields(memory.stats())
+        memory._DISABLE_STATS_CACHE = False
+        cached = self._db_fields(memory.stats())
+        self.assertEqual(recomputed, cached)
+        self.assertEqual(cached["points"], 6)
+
+
 if __name__ == "__main__":
     unittest.main()

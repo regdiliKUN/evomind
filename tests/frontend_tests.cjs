@@ -37,7 +37,7 @@ function consoleApp(fetch) {
   });
   const source = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
   vm.runInContext(
-    source + "\nglobalThis.app = {state, loadKnowledge, refreshAll, loadAnalytics};",
+    source + "\nglobalThis.app = {state, loadKnowledge, refreshAll, loadAnalytics, renderMilestones};",
     ctx
   );
   return { app: ctx.app, document, nodes };
@@ -174,4 +174,23 @@ test("knowledge polling skips refetch when the write version is unchanged", asyn
   // 近重复扫描同样按版本门控，不该每轮重问
   const dupFetches = urls.filter((u) => u.startsWith("/api/knowledge/duplicates"));
   assert.ok(dupFetches.length <= 3, `近重复请求次数异常：${dupFetches.length}`);
+});
+
+/* ---- 第十四轮：成长里程碑进度条 ---- */
+test("milestone bar shows current progress and the next unlock target", () => {
+  const { app, document } = consoleApp(async () => ({ ok: true, json: async () => ({}) }));
+  app.renderMilestones(45); // 已过 30，未到 120
+  const html = document.querySelector("#milestone").innerHTML;
+  assert.match(html, /检验所学/);          // 30 里程碑已达成，应出现
+  assert.match(html, /权重进化/);          // 下一个目标里程碑
+  assert.match(html, /再学\s*<b>75<\/b>\s*条/); // 120 - 45 = 75
+  assert.match(html, /data-goto="finetune"/); // 点里程碑可跳转
+
+  app.renderMilestones(0);
+  const empty = document.querySelector("#milestone").innerHTML;
+  assert.match(empty, /还没有知识/);
+
+  app.renderMilestones(2000);
+  const full = document.querySelector("#milestone").innerHTML;
+  assert.match(full, /已抵达全部里程碑/);
 });

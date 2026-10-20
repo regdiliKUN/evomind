@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>EvoMind · 自进化学习引擎</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236c8cff'/><text x='16' y='23' font-size='18' font-family='sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'>E</text></svg>" />
-<link rel="stylesheet" href="/static/style.css?v=13" />
+<link rel="stylesheet" href="/static/style.css?v=14" />
 </head>
 <body>
 <div class="app">
@@ -47,6 +47,7 @@
       <div class="metric"><b id="m-docs">0</b><span>已读资料</span></div>
       <div class="metric"><b id="m-disk">0 GB</b><span>资源占用</span></div>
       <div class="metric"><b id="m-state">空闲</b><span>引擎状态</span></div>
+      <div class="metric metric-lat" title="最近一次状态轮询的端到端耗时（越低越好）"><b id="m-latency">—</b><span>响应延迟</span></div>
     </header>
 
     <div class="content">
@@ -100,6 +101,11 @@
         <div class="card" style="margin-top:14px">
           <div class="card-title">下一步建议<span class="tag">自动判断</span></div>
           <div id="next-steps"></div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">成长里程碑<span class="tag" id="ms-level">—</span></div>
+          <div id="milestone"><div class="empty">加载中…</div></div>
         </div>
       </section>
 
@@ -611,6 +617,6 @@
     <div class="pdrawer-body" id="pt-body"></div>
   </aside>
 
-<script src="/static/app.js?v=13"></script>
+<script src="/static/app.js?v=14"></script>
 </body>
 </html>

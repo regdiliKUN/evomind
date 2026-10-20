@@ -324,6 +324,7 @@ async function loadDashboard(st, forceEvents = false) {
   }
   paintTopbar(st);
   renderNextSteps(st);
+  renderMilestones(s.points);
   await syncDashEvents(forceEvents);
 }
 
@@ -577,6 +578,59 @@ function renderNextSteps(st) {
   setHTML($("#next-steps"), html);
 }
 
+/* ---------------- 成长里程碑（增强引导） ---------------- */
+// 把「知识库到哪个阶段了、下一步该干嘛」画成一条带刻度里程碑的进度条。
+// 用户不必自己算「还差多少条才能去微调」——差几条第几个里程碑直接写出来，
+// 点里程石还能跳到对应功能页。数据来自 /api/status 的 stats.points（已被版本缓存，
+// 轮询几乎零成本，所以这个进度条可以放心每次状态刷新都重算）。
+const MILESTONES = [
+  { n: 30, label: "检验所学", view: "chat" },
+  { n: 120, label: "权重进化", view: "finetune" },
+  { n: 500, label: "规模成型", view: "analytics" },
+  { n: 2000, label: "知识上限", view: "knowledge" },
+];
+const MS_CAP = 2000;
+
+function renderMilestones(points) {
+  const box = $("#milestone");
+  if (!box) return;
+  points = points | 0;
+  const frac = Math.max(0, Math.min(points, MS_CAP)) / MS_CAP;
+  const pct = (frac * 100).toFixed(1);
+  const ticks = MILESTONES.map((m) => {
+    const left = (m.n / MS_CAP) * 100;
+    const reached = points >= m.n;
+    return `<span class="ms-tick ${reached ? "reached" : ""}" style="left:${left}%"></span>`;
+  }).join("");
+  const legend = MILESTONES.map((m) => {
+    const reached = points >= m.n;
+    return `<span class="ms-chip ${reached ? "reached" : ""}" data-goto="${m.view}" title="点击去「${m.label}」">
+      <b>${m.n}</b> ${m.label}${reached ? " ✓" : ""}</span>`;
+  }).join("");
+  const next = MILESTONES.find((m) => points < m.n);
+  let guide;
+  if (points === 0) {
+    guide = "还没有知识。去「自主进化」定个方向，跑 3 轮就能站上第一个里程碑。";
+  } else if (!next) {
+    guide = "已抵达全部里程碑！知识库规模与质量都足以支撑权重进化。";
+  } else {
+    guide = `再学 <b>${next.n - points}</b> 条即可解锁「${next.label}」（共 ${next.n} 条）。`;
+  }
+  setHTML(
+    box,
+    `<div class="ms-head"><span>当前 <b>${points}</b> / ${MS_CAP} 条</span><span class="ms-pct">${pct}%</span></div>
+     <div class="ms-track">
+       <div class="ms-fill" style="width:${pct}%"></div>
+       <div class="ms-cursor" style="left:${pct}%"></div>
+       ${ticks}
+     </div>
+     <div class="ms-legend">${legend}</div>
+     <div class="ms-guide">${guide}</div>`
+  );
+  const lvl = $("#ms-level");
+  if (lvl) lvl.textContent = next ? `距 ${next.label} 还差 ${next.n - points}` : "已全达成";
+}
+
 function paintTopbar(st) {
   $("#m-points").textContent = st.stats.points;
   $("#m-docs").textContent = st.stats.documents;
@@ -584,6 +638,15 @@ function paintTopbar(st) {
   const running = st.engine.running;
   $("#m-state").textContent = running ? "学习中" : "空闲";
   $("#m-state").style.color = running ? "var(--green)" : "";
+
+  // 响应延迟徽标：绿（≤20ms）/ 黄（≤60ms）/ 红（更慢），直接反映轮询优化效果
+  const rms = st.response_ms;
+  const lat = $("#m-latency");
+  if (lat && typeof rms === "number") {
+    lat.textContent = rms.toFixed(0) + " ms";
+    lat.style.color =
+      rms <= 20 ? "var(--green)" : rms <= 60 ? "var(--amber, #e0a23b)" : "var(--red, #d9534f)";
+  }
 
   const llmOk = st.llm.healthy;
   const checking = !!st.llm.checking && !llmOk;

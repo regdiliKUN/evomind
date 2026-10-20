@@ -67,6 +67,9 @@ def api_status() -> dict:
         "disk": downloader.disk_report(),
         "finetune": {"ready": env["ready"], "gpu": env.get("gpu"), "cuda": env.get("cuda")},
         "finetune_state": finetune.state(),
+        # 本次状态接口自身的端到端耗时（ms）。前端据此画一个延迟徽标，
+        # 也正好是「优化有没有让轮询变快」的最直观证据（命中缓存后这项会明显降）。
+        "response_ms": round((time.perf_counter() - t0) * 1000, 2),
     }
     memory.record_status_poll((time.perf_counter() - t0) * 1000)
     return out

@@ -216,6 +216,8 @@ def _invalidate() -> None:
     _bump_topic_index()
     # 近重复扫描按库版本缓存；测试换库时版本号会归零，必须显式清掉
     _dup_cache.update(ver=-1, thr=None, topic=None, val=None)
+    # 主题索引 / 向量缓存失效时，stats 的 SQL 部分也已与库不一致，一并作废
+    _STATS_CACHE["db"] = None
 
 
 def _append_vector(rowid: int, vec: list[float]) -> None:
@@ -837,7 +839,25 @@ def scale_warn(total: int) -> str:
     return ""
 
 
-def stats() -> dict:
+# --------------------------------------------------------------------------
+# stats() 版本键缓存 + 磁盘 TTL
+# --------------------------------------------------------------------------
+# /api/status 是轮询最密的接口（总览每 6 秒一次），它每次都调 memory.stats()，
+# 而 stats() 要跑 6 条 SQL（knowledge 总数 / 已读文档 / GROUP BY topic / 近 24h
+# 新增 / 任务数 / 资源数）+ 两次磁盘调用。这 6 条全是「库内容 + 配置」的确定函数，
+# 库没变过结果必然一样——旧实现每轮询都重跑一遍（2000 条约 2-4ms，随库线性增长），
+# 每个打开总览的标签页每小时白烧几百次查询。
+# 用写入版本号（memory.version，每次写入 +1）+ DB 文件身份做键缓存 SQL 部分；
+# 磁盘占用变化以秒计，单独用 8s TTL（disk_usage_gb 内部已有 15s TTL，这里顺带
+# 把 free_disk_gb 也一起收住，避免每次轮询都打一次 syscall）。
+_STATS_CACHE: dict = {"key": None, "db": None, "disk": None, "disk_ts": 0.0}
+_STATS_DISK_TTL = 8.0
+#: 压测/对照用：置 True 时 stats() 退回「每次重跑 6 条 SQL」的旧路径
+_DISABLE_STATS_CACHE = False
+
+
+def _compute_stats_db() -> dict:
+    """stats 里只依赖库内容的部分（6 条 SQL）。版本键缓存，库不变就跳过。"""
     c = conn()
     total = c.execute("SELECT COUNT(*) n FROM knowledge").fetchone()["n"]
     docs = c.execute("SELECT COUNT(*) n FROM documents WHERE ok=1").fetchone()["n"]
@@ -856,14 +876,45 @@ def stats() -> dict:
         "new_24h": new24,
         "sessions": sessions,
         "resources": res,
-        "scale_warn": scale_warn(total),
         "topics": [{"topic": r["topic"], "count": r["n"]} for r in topics],
-        "disk_gb": config.disk_usage_gb(),
-        "budget_gb": config.get("disk_budget_gb"),
-        "free_disk_gb": config.free_disk_gb(),
+        "scale_warn": scale_warn(total),
+    }
+
+
+def stats() -> dict:
+    global _STATS_CACHE
+    ver = version()
+    key = (ver, str(config.DB_FILE))
+    db = None
+    if not _DISABLE_STATS_CACHE and _STATS_CACHE["db"] is not None and _STATS_CACHE["key"] == key:
+        db = _STATS_CACHE["db"]
+    if db is None:
+        db = _compute_stats_db()
+        if not _DISABLE_STATS_CACHE:
+            _STATS_CACHE["key"] = key
+            _STATS_CACHE["db"] = db
+    # 磁盘部分：8s TTL（占用是 GB 量级，8 秒内的变化肉眼不可见；下载前的预算闸门
+    # 走 _disk_usage_gb_uncached，不受这里缓存影响）。
+    now = time.time()
+    disk = _STATS_CACHE["disk"]
+    if disk is None or (now - _STATS_CACHE["disk_ts"]) >= _STATS_DISK_TTL:
+        disk = (config.disk_usage_gb(), config.get("disk_budget_gb"), config.free_disk_gb())
+        _STATS_CACHE["disk"] = disk
+        _STATS_CACHE["disk_ts"] = now
+    return {
+        "points": db["points"],
+        "documents": db["documents"],
+        "new_24h": db["new_24h"],
+        "sessions": db["sessions"],
+        "resources": db["resources"],
+        "topics": db["topics"],
+        "scale_warn": db["scale_warn"],
+        "disk_gb": disk[0],
+        "budget_gb": disk[1],
+        "free_disk_gb": disk[2],
         # 写入版本号：前端据此判断「库有没有变过」，没变就跳过整轮
         # 重新拉取 + 重渲染（知识库列表、分析图表都不必为同样的数据重建 DOM）。
-        "ver": version(),
+        "ver": ver,
     }
 
 

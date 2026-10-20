@@ -565,3 +565,43 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
   background: #10161f; border: 1px solid var(--border-soft);
   border-radius: 4px; padding: 1px 5px; color: #e6c179;
 }
+
+/* ============ 总览「成长里程碑」进度条 ============ */
+.ms-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 12.5px; color: var(--text-faint); margin-bottom: 12px; }
+.ms-head b { font-family: var(--mono); font-size: 15px; color: var(--text); }
+.ms-pct { font-family: var(--mono); font-size: 15px; color: var(--accent); font-weight: 600; }
+.ms-track {
+  position: relative; height: 10px; border-radius: 6px;
+  background: #0c121b; border: 1px solid var(--border-soft); margin: 22px 4px 26px;
+}
+.ms-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px;
+  background: linear-gradient(90deg, var(--accent), var(--green));
+  transition: width .35s ease;
+}
+.ms-cursor {
+  position: absolute; top: -4px; bottom: -4px; width: 2px;
+  background: #fff; border-radius: 2px; box-shadow: 0 0 6px rgba(255,255,255,.5);
+  transform: translateX(-1px);
+}
+.ms-tick {
+  position: absolute; top: -5px; bottom: -5px; width: 2px; transform: translateX(-1px);
+  background: var(--text-faint); opacity: .5;
+}
+.ms-tick.reached { background: var(--green); opacity: .9; box-shadow: 0 0 6px var(--green); }
+.ms-legend { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.ms-chip {
+  display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  font-size: 11.5px; color: var(--text-faint);
+  padding: 4px 9px; border-radius: 999px; border: 1px solid var(--border-soft);
+  background: rgba(255,255,255,.02); user-select: none; transition: all .15s;
+}
+.ms-chip b { font-family: var(--mono); color: var(--text-dim); }
+.ms-chip:hover { border-color: var(--accent); color: #a9c7ff; }
+.ms-chip.reached { color: var(--text); border-color: var(--green-soft); background: var(--green-soft); }
+.ms-chip.reached b { color: var(--green); }
+.ms-guide { font-size: 13px; line-height: 1.7; color: var(--text-dim); }
+.ms-guide b { color: var(--accent); font-family: var(--mono); }
+
+/* 顶栏响应延迟徽标 */
+.metric-lat b { font-variant-numeric: tabular-nums; }
