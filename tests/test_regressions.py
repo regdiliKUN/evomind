@@ -107,6 +107,41 @@ class MemoryTests(IsolatedTest):
             self.assertEqual(memory.search("q", k=0), [])
             self.assertEqual(memory.search("q", k=-1), [])
 
+    def test_similar_points_excludes_self_and_orders_by_similarity(self):
+        base = self.point(1, vec=[1.0, 0.0, 0.0])
+        near = self.point(2, vec=[0.98, 0.19, 0.0])
+        far = self.point(3, vec=[0.0, 0.0, 1.0])
+        sims = memory.similar_points(base, k=5)
+        self.assertEqual([p["id"] for p in sims], [near, far])
+        self.assertNotIn(base, [p["id"] for p in sims])
+        self.assertGreater(sims[0]["similarity"], sims[1]["similarity"])
+        self.assertAlmostEqual(sims[1]["similarity"], 0.0, places=4)
+
+    def test_similar_points_respects_k_and_missing_input(self):
+        self.point(1, vec=[1.0, 0.0])
+        for i in range(2, 8):
+            self.point(i, vec=[1.0, i / 100])
+        self.assertEqual(len(memory.similar_points(self.point(99, vec=[1.0, 0.0]), k=3)), 3)
+        self.assertEqual(memory.similar_points("no-such-id", k=3), [])
+        # k 夹紧到 0 直接返回空，不做任何计算
+        self.assertEqual(memory.similar_points(self.point(100, vec=[1.0, 0.0]), k=0), [])
+
+    def test_similar_points_without_vector_returns_empty(self):
+        pid = self.point(1, vec=[1.0, 0.0])
+        c = memory.conn()
+        c.execute("UPDATE knowledge SET embedding=NULL WHERE id=?", (pid,))
+        c.commit()
+        memory._invalidate()
+        self.assertEqual(memory.similar_points(pid, k=3), [])
+
+    def test_scale_warn_single_source_of_truth(self):
+        """stats 与学习建议共用同一套阈值（重构后不能各写一份）"""
+        self.assertEqual(memory.scale_warn(0), "")
+        self.assertIn("开始变慢", memory.scale_warn(5000))
+        self.assertIn("明显变慢", memory.scale_warn(20000))
+        stats = memory.stats()
+        self.assertEqual(stats["scale_warn"], memory.scale_warn(stats["points"]))
+
     def test_concurrent_dedup_is_atomic(self):
         config.load()
         barrier = threading.Barrier(2)
@@ -334,6 +369,31 @@ class ApiTests(IsolatedTest):
         self.assertEqual(len(h["dims"]), 4)
         self.assertTrue(0 <= h["score"] <= 100)
 
+    def test_knowledge_detail_endpoint(self):
+        pid = self.point(1, topic="方向甲", vec=[1.0, 0.0])
+        other = self.point(2, topic="方向甲", vec=[0.9, 0.1])
+        body = self.client.get(f"/api/knowledge/{pid}").json()
+        self.assertEqual(body["item"]["id"], pid)
+        self.assertNotIn("embedding", body["item"])
+        self.assertEqual([s["id"] for s in body["similar"]], [other])
+        self.assertEqual(self.client.get("/api/knowledge/nope").status_code, 404)
+
+    def test_detail_route_does_not_shadow_keyword_search(self):
+        """/api/knowledge/{pid} 声明在 /api/knowledge/search 之后，别把 search 当 id"""
+        self.point(1, topic="方向甲", vec=[1.0, 0.0])
+        with patch.object(llm, "embed", return_value=[[1.0, 0.0]]):
+            r = self.client.get("/api/knowledge/search", params={"q": "回归", "k": 3})
+        self.assertEqual(r.status_code, 200)
+        self.assertIsInstance(r.json(), list)
+
+    def test_suggestions_endpoint_returns_items(self):
+        for i in range(40):
+            self.point(i, topic="方向甲", vec=[1.0, i / 100])
+        items = self.client.get("/api/analytics/suggestions").json()["items"]
+        self.assertTrue(items)
+        for it in items:
+            self.assertEqual(set(it), {"level", "icon", "title", "detail", "view", "btn"})
+
 
 class AnalyticsCacheTests(IsolatedTest):
     """第十一轮：写入版本号 + 版本键聚合缓存。"""
@@ -391,6 +451,49 @@ class AnalyticsCacheTests(IsolatedTest):
         v = memory.stats()["ver"]
         self.point(vec=[1., 0.])
         self.assertEqual(memory.stats()["ver"], v + 1)
+
+
+class SuggestionsCacheTests(IsolatedTest):
+    """第十二轮：学习建议改吃版本缓存的聚合，不再每次轮询重算。"""
+
+    def test_suggestions_reuse_cached_aggregates(self):
+        for i in range(12):
+            self.point(i, topic="方向甲", vec=[1.0, i / 100])
+        analytics._reset_caches()
+        analytics.snapshot()  # 真实场景里分析页/健康卡片已拉过一次
+        first = analytics.suggestions()
+        with patch.object(analytics, "topic_stats", side_effect=AssertionError("重算了聚合")), \
+             patch.object(analytics, "growth_by_day", side_effect=AssertionError("重算了聚合")), \
+             patch.object(analytics, "source_breakdown", side_effect=AssertionError("重算了聚合")), \
+             patch.object(memory, "stats", side_effect=AssertionError("重算了 stats")):
+            second = analytics.suggestions()
+        self.assertEqual(first, second)
+
+    def test_suggestions_follow_new_writes(self):
+        for i in range(5):
+            self.point(i, topic="方向甲", vec=[1.0, i / 100])
+        first = analytics.suggestions()
+        self.assertTrue(any("目前 5 条" in i["detail"] for i in first))
+        for i in range(5, 35):
+            self.point(i, topic="方向甲", vec=[1.0, i / 100])
+        second = analytics.suggestions()
+        self.assertTrue(any("已有 35 条" in i["detail"] for i in second))
+        self.assertNotEqual(first, second)
+
+    def test_suggestions_empty_library_guides_onboarding(self):
+        items = analytics.suggestions()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["view"], "learn")
+        self.assertEqual(items[0]["level"], "act")
+
+    def test_suggestions_do_not_mutate_cached_snapshot(self):
+        for i in range(8):
+            self.point(i, topic="方向甲", vec=[1.0, i / 100])
+        analytics._reset_caches()
+        before = analytics.snapshot()
+        analytics.suggestions()
+        after = analytics.snapshot()
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":

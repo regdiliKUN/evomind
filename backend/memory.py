@@ -806,6 +806,22 @@ def count_points(topic: str | None = None) -> int:
     return conn().execute(sql, params).fetchone()[0]
 
 
+def scale_warn(total: int) -> str:
+    """规模提醒文案（单一真源：stats 与学习建议共用同一套阈值）。
+
+    语义检索是全量向量比对，规模上去会线性变慢（1000 条约 25ms，1 万条约 250ms）。
+    到阈值就明确提示，别等用户自己发现「怎么越来越卡」。
+    """
+    if total >= 20000:
+        return (
+            f"知识点已达 {total} 条，语义检索明显变慢（每次全量比对）。"
+            "建议按方向拆分知识库，或引入近似索引（HNSW/FAISS）。"
+        )
+    if total >= 5000:
+        return f"知识点已达 {total} 条，检索开始变慢，注意观察响应时间。"
+    return ""
+
+
 def stats() -> dict:
     c = conn()
     total = c.execute("SELECT COUNT(*) n FROM knowledge").fetchone()["n"]
@@ -819,23 +835,13 @@ def stats() -> dict:
     ).fetchone()["n"]
     sessions = c.execute("SELECT COUNT(*) n FROM sessions").fetchone()["n"]
     res = c.execute("SELECT COUNT(*) n FROM resources WHERE status='done'").fetchone()["n"]
-    # 语义检索是全量向量比对，规模上去会线性变慢（1000 条约 25ms，1 万条约 250ms）。
-    # 到阈值就明确提示，别等用户自己发现「怎么越来越卡」。
-    scale_warn = ""
-    if total >= 20000:
-        scale_warn = (
-            f"知识点已达 {total} 条，语义检索明显变慢（每次全量比对）。"
-            "建议按方向拆分知识库，或引入近似索引（HNSW/FAISS）。"
-        )
-    elif total >= 5000:
-        scale_warn = f"知识点已达 {total} 条，检索开始变慢，注意观察响应时间。"
     return {
         "points": total,
         "documents": docs,
         "new_24h": new24,
         "sessions": sessions,
         "resources": res,
-        "scale_warn": scale_warn,
+        "scale_warn": scale_warn(total),
         "topics": [{"topic": r["topic"], "count": r["n"]} for r in topics],
         "disk_gb": config.disk_usage_gb(),
         "budget_gb": config.get("disk_budget_gb"),
@@ -873,6 +879,82 @@ def list_points(topic: str | None = None, limit: int = 50, offset: int = 0) -> l
         except Exception:
             d["tags"] = []
         out.append(d)
+    return out
+
+
+def get_point(pid: str) -> dict | None:
+    """按 id 取单条知识点全文（不含向量），供详情面板使用。"""
+    row = conn().execute(
+        "SELECT id,topic,claim,detail,source_url,source_title,source_kind,tags,"
+        "confidence,created_at FROM knowledge WHERE id=?",
+        (pid,),
+    ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["tags"] = json.loads(d.get("tags") or "[]")
+    except Exception:
+        d["tags"] = []
+    return d
+
+
+def similar_points(pid: str, k: int = 5) -> list[dict]:
+    """与某条知识点语义最近的邻居（按向量余弦降序，排除自己）。
+
+    直接复用已缓存、已归一化的向量矩阵：一条点的邻居就是它与全库的点积排序。
+    点积在 numpy 里一次算完（2000 条约 0.1ms），不需要再过 LLM 做嵌入。
+    找不到该点或无向量时返回空列表——调用方给「还没有足够数据」的引导。
+    """
+    k = max(0, min(int(k), 50))
+    if k == 0:
+        return []
+    row = conn().execute(
+        "SELECT rowid AS _rid, length(embedding)/4 dim FROM knowledge WHERE id=?", (pid,)
+    ).fetchone()
+    if not row or not row["dim"]:
+        return []
+    dim = int(row["dim"])
+    rowids, mat = _all_vectors(dim)
+    if not rowids:
+        return []
+    idx = {rid: i for i, rid in enumerate(rowids)}
+    me = idx.get(row["_rid"])
+    if me is None:  # 缓存里没有它（尚未建好/维度不一致）
+        return []
+    sims = mat @ mat[me]  # 全库对它的余弦（矩阵已是单位向量）
+    # argpartition 只挑前 k+1 个（含自己），再对候选精确排序，O(n) 而非 O(n log n)
+    want = min(len(rowids), k + 1)
+    cand = np.argpartition(-sims, want - 1)[:want]
+    cand = cand[np.argsort(-sims[cand])]
+    picked = [(rowids[i], float(sims[i])) for i in cand if rowids[i] != row["_rid"]][:k]
+    return _attach_similar_rows(picked)
+
+
+def _attach_similar_rows(picked: list[tuple[int, float]]) -> list[dict]:
+    """把 (rowid, 相似度) 补成完整知识点字典，保持相似度降序。"""
+    if not picked:
+        return []
+    placeholders = ",".join("?" * len(picked))
+    rows = conn().execute(
+        f"SELECT rowid AS _rid, id,topic,claim,detail,source_url,source_title,"
+        f"source_kind,tags,confidence,created_at FROM knowledge "
+        f"WHERE rowid IN ({placeholders})",
+        [rid for rid, _ in picked],
+    ).fetchall()
+    by_rid = {r["_rid"]: dict(r) for r in rows}
+    out = []
+    for rid, score in picked:
+        rec = by_rid.get(rid)
+        if not rec:
+            continue
+        rec.pop("_rid", None)
+        try:
+            rec["tags"] = json.loads(rec.get("tags") or "[]")
+        except Exception:
+            rec["tags"] = []
+        rec["similarity"] = round(score, 4)
+        out.append(rec)
     return out
 
 

@@ -244,6 +244,19 @@ def api_knowledge_search(q: str = Query(...), k: int = 8) -> list[dict]:
     return memory.search(q, k=k)
 
 
+@app.get("/api/knowledge/{pid}")
+def api_knowledge_detail(pid: str, k: int = 5) -> dict:
+    """单条知识点详情 + 语义最近邻，供知识库详情面板使用。
+
+    必须声明在 /api/knowledge/search 之后：FastAPI 按声明顺序匹配，
+    否则 "search" 会被当成 {pid} 吞掉。
+    """
+    item = memory.get_point(pid)
+    if item is None:
+        raise HTTPException(404, "知识点不存在")
+    return {"item": item, "similar": memory.similar_points(pid, k=k)}
+
+
 # --------------------------------------------------------------------------
 # 资源
 # --------------------------------------------------------------------------

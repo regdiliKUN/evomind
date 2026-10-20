@@ -193,13 +193,25 @@ def session_timeline(limit: int = 20) -> dict:
     }
 
 
+# 建议结果的版本键缓存：建议是「库内容 + 今天日期」的确定函数。
+# 旧实现每次被轮询都重算 topic_stats / growth_by_day / source_breakdown 三份聚合，
+# 外加一次 memory.stats()（它自己又是 6 条 SQL）；而这三份聚合 snapshot 里已经
+# 算好并按版本缓存了。6 秒轮询下等于每 6 秒把同样的 GROUP BY 重跑一遍。
+# 键里带日期是因为「已经 N 天没学」会跨天变化。
+_SUGG_CACHE: dict = {"key": None, "val": None}
+
+
 def suggestions(limit: int = 4) -> list[dict]:
     """学习建议（引导）：从知识库现状推导「下一步做什么」。
 
     返回统一结构的条目 {level, icon, title, detail, view, btn}，前端「下一步建议」
     卡片直接渲染；view/btn 用于跳转（如 learn=去学习）。空库时给新手上路。
     """
-    total = memory.count_points()
+    snap = snapshot()
+    total = int(snap.get("total") or 0)
+    key = (snap.get("ver", memory.version()), date.today().isoformat(), limit)
+    if _SUGG_CACHE["key"] == key and _SUGG_CACHE["val"] is not None:
+        return _SUGG_CACHE["val"]
     items: list[dict] = []
 
     def add(level: str, icon: str, title: str, detail: str, view: str, btn: str) -> None:
@@ -209,9 +221,9 @@ def suggestions(limit: int = 4) -> list[dict]:
         )
 
     # 规模是性能问题，优先级最高（和前端旧规则保持一致）
-    scale_warn = (memory.stats() or {}).get("scale_warn") or ""
-    if scale_warn:
-        add("warn", "!", "知识库规模提醒", scale_warn, "knowledge", "去整理")
+    warn = memory.scale_warn(total)
+    if warn:
+        add("warn", "!", "知识库规模提醒", warn, "knowledge", "去整理")
 
     if total == 0:
         add(
@@ -220,11 +232,12 @@ def suggestions(limit: int = 4) -> list[dict]:
             "之后总览和分析页就有东西看了。",
             "learn", "去学习",
         )
+        _SUGG_CACHE.update(key=key, val=items[:limit])
         return items[:limit]
 
-    topics = topic_stats()
-    growth = growth_by_day(days=30)
-    sources = source_breakdown()
+    topics = snap.get("topics") or []
+    growth = snap.get("growth") or []
+    sources = snap.get("sources") or []
 
     # 1) 久未学习：按最后新增日期算闲置天数
     if growth:
@@ -321,7 +334,9 @@ def suggestions(limit: int = 4) -> list[dict]:
 
     order = {"act": 0, "warn": 1, "info": 2}
     items.sort(key=lambda x: order.get(x["level"], 3))
-    return items[:limit]
+    out = items[:limit]
+    _SUGG_CACHE.update(key=key, val=out)
+    return out
 
 
 def search_explain(query: str, k: int = 8) -> dict:
@@ -480,3 +495,4 @@ def _reset_caches() -> None:
     _SNAP_CACHE.update(ver=-1, ts=0.0, val=None)
     _GRAPH_CACHE.update(ver=-1, edge_min=None, val=None)
     _TMAP_CACHE.update(ver=-1, val=None)
+    _SUGG_CACHE.update(key=None, val=None)

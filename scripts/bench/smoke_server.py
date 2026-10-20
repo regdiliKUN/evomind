@@ -31,11 +31,12 @@ if memory.count_points() == 0:
         "收缩补偿通常采用反向缩放变换，在切片层面按层高线性调整",
         "硬表面雕刻强调硬边控制，先用遮罩再抛光，倒角均匀取决于曲率",
     ]
-    # 主题向量带聚类：相邻主题共享一个基向量，语义网络才有边可画
-    bases = [rng.standard_normal(64).astype(np.float32) for _ in range(2)]
+    # 主题向量带聚类：每个主题一个基向量 + 噪声，主题内相似度高、
+    # 主题间有可分辨的差距，语义网络才会既有边、又能看出「哪两条最像」
+    bases = [rng.standard_normal(64).astype(np.float32) for _ in range(len(topics))]
     for i in range(46):
         t = topics[i % len(topics)]
-        v = bases[(i % len(topics)) // 2] + rng.standard_normal(64).astype(np.float32) * 0.35
+        v = bases[i % len(topics)] + rng.standard_normal(64).astype(np.float32) * 0.32
         v /= np.linalg.norm(v)
         memory.add_point(
             topic=t, claim=claims[i % len(claims)] + f"（变体 {i}）",

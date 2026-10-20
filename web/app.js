@@ -17,6 +17,7 @@ const state = {
   // 用户正在选的文字、把滚动位置弹回顶部。
   kbVer: -1,
   anVer: -1,
+  pointId: null,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -70,6 +71,9 @@ const TITLES = {
 };
 
 function switchView(v, fromHash) {
+  // 深链：#knowledge/<pid> 直接定位到某条知识点的详情（可复制分享）
+  const [view, pid] = String(v || "").split("/");
+  v = view;
   if (!TITLES[v]) v = "dashboard";
   state.view = v;
   if (!fromHash && location.hash.slice(1) !== v) location.hash = v;
@@ -84,6 +88,7 @@ function switchView(v, fromHash) {
   if (v === "dashboard") { loadDashboard(null, true); refreshSuggestions(true); refreshHealth(true); }
   if (v === "settings") fillSettings();
   if (v === "learn") loadAuto();
+  if (pid) openPoint(decodeURIComponent(pid));
 }
 
 $$(".nav-item").forEach((n) => n.addEventListener("click", () => switchView(n.dataset.view)));
@@ -94,22 +99,63 @@ window.addEventListener("hashchange", () => switchView(location.hash.slice(1), t
 document.addEventListener("click", (e) => {
   const goto = e.target.closest("[data-goto]");
   if (goto) {
+    // 带 data-topic 的跳转（如「在这个方向继续学」）：落地时顺手按该方向筛选
+    const t = goto.dataset.topic || "";
     switchView(goto.dataset.goto);
+    if (t && goto.dataset.goto === "knowledge") {
+      selectTopic(t);
+      loadKnowledge();
+    }
     return;
   }
   // 分析页方向分布条 → 下钻知识库并按该方向筛选（跨视图联动）
   const drill = e.target.closest(".kb-drill");
   if (drill) {
-    const t = drill.dataset.topic || "";
-    const sel = $("#kb-topic");
-    if (t && sel && !Array.from(sel.options).some((o) => o.value === t)) {
-      sel.insertAdjacentHTML("beforeend", `<option value="${esc(t)}">${esc(t)}</option>`);
-    }
-    if (sel) sel.value = t;
+    selectTopic(drill.dataset.topic || "");
     switchView("knowledge");
     loadKnowledge();
+    return;
+  }
+  // 知识点（列表行 / 详情里的相似条目）→ 打开详情抽屉；点来源链接不算
+  const pt = e.target.closest("[data-pid]");
+  if (pt && !e.target.closest("a")) {
+    openPoint(pt.dataset.pid);
+    return;
+  }
+  // 「就这条提问」：带着这条结论跳到问答，省得用户再打一遍
+  const ask = e.target.closest(".pt-ask");
+  if (ask) {
+    closePoint();
+    switchView("chat");
+    const q = $("#chat-q");
+    if (q) {
+      q.value = `关于「${ask.dataset.claim || ""}」，这条结论成立的前提和边界是什么？`;
+      q.focus();
+    }
+    return;
+  }
+  // 复制深链（#knowledge/<id>）：发给别人能直接打开同一条
+  const copy = e.target.closest(".pt-copy");
+  if (copy && state.pointId) {
+    const url = `${location.origin}/#knowledge/${encodeURIComponent(state.pointId)}`;
+    location.hash = `knowledge/${encodeURIComponent(state.pointId)}`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(() => toast("链接已复制"), () => toast(url, "info"));
+    } else {
+      toast(url, "info");
+    }
   }
 });
+
+/* 把某个方向塞进下拉并选中（下拉里没有就先补一个选项） */
+function selectTopic(t) {
+  const sel = $("#kb-topic");
+  if (!sel) return;
+  if (t && !Array.from(sel.options).some((o) => o.value === t)) {
+    sel.insertAdjacentHTML("beforeend", `<option value="${esc(t)}">${esc(t)}</option>`);
+  }
+  sel.value = t || "";
+}
 
 /* 引导浮层：按钮接线 + 首次自动弹出 + 侧栏手动入口 */
 $("#ob-next").addEventListener("click", () => {
@@ -665,7 +711,7 @@ function renderKnowledge(items) {
             p.source_title || p.source_url
           ).slice(0, 70)}</a>`
         : "";
-      return `<div class="row">
+      return `<div class="row" data-pid="${esc(p.id || "")}" title="点击查看详情与相似知识点">
         <div class="claim">${esc(p.claim)}</div>
         ${p.detail ? `<div class="detail">${esc(p.detail)}</div>` : ""}
         <div class="meta">
@@ -679,6 +725,102 @@ function renderKnowledge(items) {
     })
     .join("");
 }
+
+/* ---------------- 知识点详情抽屉 ---------------- */
+/* 点任一条知识点，右侧滑出详情：全文 + 出处 + 与它语义最近的邻居。
+   邻居来自后端 similar_points（点积排序，不再走一次 LLM 嵌入），
+   相似度条把「这条和哪条最像」直接画出来——这是判断一条结论可不可靠
+   最省事的办法：如果最近邻都跟它说的不是一回事，说明它可能是孤证。 */
+async function openPoint(pid) {
+  if (!pid) return;
+  const mask = $("#pt-mask");
+  const drawer = $("#pt-drawer");
+  if (!mask || !drawer) return;
+  state.pointId = pid;
+  mask.hidden = false;
+  drawer.hidden = false;
+  setHTML($("#pt-body"), '<div class="hint" style="padding:8px 2px">加载中…</div>');
+  let d;
+  try {
+    d = await api(`/api/knowledge/${encodeURIComponent(pid)}?k=5`);
+  } catch (e) {
+    setHTML($("#pt-body"), `<div class="empty">加载失败：${esc(e.message)}</div>`);
+    return;
+  }
+  if (state.pointId !== pid) return; // 期间又点了别的，丢弃这次结果
+  renderPoint(d);
+}
+
+function closePoint() {
+  state.pointId = null;
+  const mask = $("#pt-mask");
+  const drawer = $("#pt-drawer");
+  if (mask) mask.hidden = true;
+  if (drawer) drawer.hidden = true;
+  // 从深链进来时把地址退回列表，避免刷新又弹一次
+  if (String(location.hash).startsWith("#knowledge/")) location.hash = "knowledge";
+}
+
+function renderPoint(d) {
+  const p = d.item || {};
+  const sims = d.similar || [];
+  const conf = Math.round((p.confidence || 0) * 100);
+  const tags = (p.tags || []).map((t) => `<span class="tagmini">${esc(t)}</span>`).join(" ");
+  const src = p.source_url
+    ? `<a href="${esc(p.source_url)}" target="_blank" rel="noreferrer">${esc(
+        p.source_title || p.source_url
+      )}</a>`
+    : '<span class="dim">没有记录出处</span>';
+
+  const simHtml = sims.length
+    ? sims
+        .map((s) => {
+          const pct = Math.max(0, Math.min(100, (s.similarity || 0) * 100)).toFixed(1);
+          return `<div class="sim-item" data-pid="${esc(s.id || "")}" title="点击查看这条">
+            <div class="sim-claim">${esc(s.claim)}</div>
+            <div class="sim-meta">
+              <span class="tagmini">${esc(s.topic)}</span>
+              <span class="mono dim">相似 ${(+s.similarity || 0).toFixed(3)}</span>
+            </div>
+            <div class="sim-bar"><i style="width:${pct}%"></i></div>
+          </div>`;
+        })
+        .join("")
+    : `<div class="empty" style="text-align:left;line-height:1.8;padding:2px 2px 6px">
+        <div style="font-weight:600;margin-bottom:4px">这条还比较孤立</div>
+        <div>库里暂时没有语义相近的知识点。同方向再多学几轮、或补几份不同视角的资料，这里就会出现互为参照的邻居——它们是检验一条结论是否可靠最省事的材料。</div>
+        <button class="btn primary sm" data-goto="learn" style="margin-top:10px">去学同方向</button>
+      </div>`;
+
+  setHTML(
+    $("#pt-body"),
+    `<div class="pt-topic">${esc(p.topic || "")}</div>
+     <div class="pt-claim">${esc(p.claim || "")}</div>
+     ${p.detail ? `<div class="pt-detail">${esc(p.detail)}</div>` : ""}
+     <div class="pt-meta">
+       <span>可信度 <span class="conf-bar"><i style="width:${conf}%"></i></span> <span class="mono dim">${(+(p.confidence || 0)).toFixed(2)}</span></span>
+       ${tags}
+       <span class="dim">${fmtTime(p.created_at)}</span>
+     </div>
+     <div class="pt-src"><span class="dim">出处</span> ${src}</div>
+     <div class="pt-actions">
+       <button class="btn sm" data-goto="knowledge" data-topic="${esc(p.topic || "")}">只看这个方向</button>
+       <button class="btn sm pt-ask" data-claim="${esc((p.claim || "").slice(0, 120))}">就这条提问</button>
+       <button class="btn sm pt-copy">复制链接</button>
+     </div>
+     <div class="pt-sim-head">
+       <span>语义最近的 ${sims.length} 条</span>
+       <span class="hint" style="margin:0">向量余弦，越高越接近</span>
+     </div>
+     <div class="pt-sims">${simHtml}</div>`
+  );
+}
+
+$("#pt-close").addEventListener("click", closePoint);
+$("#pt-mask").addEventListener("click", closePoint);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && state.pointId) closePoint();
+});
 
 $("#btn-kb-search").addEventListener("click", () => {
   const q = $("#kb-search").value.trim();
