@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>EvoMind · 自进化学习引擎</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236c8cff'/><text x='16' y='23' font-size='18' font-family='sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'>E</text></svg>" />
-<link rel="stylesheet" href="/static/style.css?v=14" />
+<link rel="stylesheet" href="/static/style.css?v=15" />
 </head>
 <body>
 <div class="app">
@@ -82,7 +82,7 @@
             <div id="topic-list"><div class="empty">还没有任何学习记录</div></div>
           </div>
           <div class="card">
-            <div class="card-title">最近活动<span class="tag">实时</span></div>
+            <div class="card-title">最近活动<span class="tag" id="feed-live">实时</span></div>
             <div class="stream" id="dash-stream" style="height:300px;min-height:300px"></div>
           </div>
         </div>
@@ -617,6 +617,6 @@
     <div class="pdrawer-body" id="pt-body"></div>
   </aside>
 
-<script src="/static/app.js?v=14"></script>
+<script src="/static/app.js?v=15"></script>
 </body>
 </html>

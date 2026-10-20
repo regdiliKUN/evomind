@@ -240,11 +240,36 @@ function updateRing(round) {
   $("#round-label").textContent = `第 ${round} / ${total} 轮`;
 }
 
+// SSE 实时通道是否活着。活着时「最近活动」由 SSE 直接推送（零延迟、零额外请求），
+// 不再每 6 秒轮询 /api/events/recent——那条轮询是 SSE 上线前的遗留，纯冗余；
+// 只有 SSE 断开时才回退成轮询，保证断线时活动流不僵死。
+let sseAlive = false;
+
+/* 总览「最近活动」头部的实时状态徽标：让「实时」两个字名副其实——
+   绿=SSE 实时推送，琥珀=通道断开、已回退定时刷新。 */
+function updateFeedLive() {
+  const tag = $("#feed-live");
+  if (!tag) return;
+  if (sseAlive) {
+    tag.textContent = "实时";
+    tag.style.color = "var(--green)";
+    tag.title = "通过实时通道推送，无需轮询";
+  } else {
+    tag.textContent = "重连中";
+    tag.style.color = "var(--amber)";
+    tag.title = "实时通道断开，已回退为定时刷新";
+  }
+}
+
 function connectSSE() {
   const es = new EventSource("/api/events");
   // 服务端回放历史后会发 history-end，之前收到的都算历史，不播入场动画
   let sseReady = false;
   let firstMsg = true;
+  es.onopen = () => {
+    sseAlive = true;
+    updateFeedLive();
+  };
   es.addEventListener("history-end", () => {
     sseReady = true;
   });
@@ -257,14 +282,24 @@ function connectSSE() {
         const box = $("#learn-stream");
         if (box) box.innerHTML = "";
       }
+      // 事件缓冲只保留最近 500 条：原来只 push 从不清理，长时间学习会无限增长
       state.events.push(evt);
-      pushEvent(evt, null, sseReady);
+      if (state.events.length > 500) state.events.splice(0, state.events.length - 500);
+      // 按当前视图把事件送对 feed：总览 → #dash-stream（实时，按 id 去重），
+      // 其余视图 → #learn-stream。SSE 早已打开，没必要再让总览每 6 秒轮询一次。
+      if (state.view === "dashboard") {
+        appendDashEvent(evt, sseReady);
+      } else {
+        pushEvent(evt, null, sseReady);
+      }
       if (evt.level === "download" || evt.level === "error") {
         if (evt.msg.includes("下载完成")) toast(evt.msg, "ok");
       }
     } catch (_) {}
   };
   es.onerror = () => {
+    sseAlive = false;
+    updateFeedLive();
     es.close();
     sseReady = false;
     setTimeout(connectSSE, 4000);
@@ -325,7 +360,9 @@ async function loadDashboard(st, forceEvents = false) {
   paintTopbar(st);
   renderNextSteps(st);
   renderMilestones(s.points);
-  await syncDashEvents(forceEvents);
+  // SSE 在线时活动流已实时推送，别再每 6 秒轮询 /api/events/recent；
+  // 只有初次/强制加载、或 SSE 断开回退时才拉一次。
+  if (forceEvents || !sseAlive) await syncDashEvents(forceEvents);
 }
 
 /* 增量同步「最近活动」：只追加新事件，绝不重建已有行。
@@ -358,6 +395,16 @@ async function syncDashEvents(force) {
   if (empty) empty.remove();
   fresh.forEach((e) => pushEvent(e, box, true));
   dashEvtId = fresh[fresh.length - 1].id || dashEvtId;
+}
+
+/* SSE 实时推送进总览「最近活动」：按 id 去重后追加。
+   SSE 重连会重放历史、初次加载也会拉 recent，两边都靠 id 兜底，不会重复堆叠。 */
+function appendDashEvent(evt, animate) {
+  const box = $("#dash-stream");
+  if (!box) return;
+  if ((evt.id || 0) <= dashEvtId) return; // 已展示过（初次加载 / 历史回放）
+  pushEvent(evt, box, animate);
+  dashEvtId = evt.id || dashEvtId;
 }
 
 /* 本地启发式兜底：后端 /api/analytics/suggestions 拉不到时，

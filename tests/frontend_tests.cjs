@@ -9,13 +9,28 @@ function consoleApp(fetch) {
   const nodes = new Map();
   const element = () => {
     const el = {
-      value: "", dataset: {}, style: {}, textContent: "", _html: "", writes: 0,
+      value: "", dataset: {}, style: {}, className: "", textContent: "", _html: "", writes: 0,
+      children: [], scrollTop: 0, scrollHeight: 0,
       addEventListener() {}, classList: { toggle() {} },
+      appendChild(c) { el.children.push(c); el._html += c._html || ""; return c; },
+      removeChild(c) { const i = el.children.indexOf(c); if (i >= 0) el.children.splice(i, 1); return c; },
+      remove() {},
+      // 只支持测试用到的 ".empty" 探测：命中就从 _html 里摘掉该占位
+      querySelector(sel) {
+        if (sel === ".empty" && el._html.includes("empty")) {
+          const e = element();
+          e.remove = () => { el._html = el._html.replace(/<div class="empty">[\s\S]*?<\/div>/, ""); };
+          return e;
+        }
+        return null;
+      },
     };
-    // innerHTML 走 setter：测试据此判断「这一轮到底有没有重建 DOM」
+    Object.defineProperty(el, "firstChild", { get() { return el.children[0]; } });
+    // innerHTML 走 setter：测试据此判断「这一轮到底有没有重建 DOM」。
+    // 置空（""）时同步清掉 children，模拟真实 DOM 的替换语义。
     Object.defineProperty(el, "innerHTML", {
       get() { return el._html; },
-      set(v) { el._html = v; el.writes++; },
+      set(v) { el._html = v == null ? "" : String(v); el.writes++; if (!v) el.children = []; },
     });
     return el;
   };
@@ -29,18 +44,23 @@ function consoleApp(fetch) {
     querySelectorAll: () => [],
     createElement: element,
   };
+  // EventSource 记为可控实例：测试据此手动触发 onopen / onmessage / onerror
+  const esRef = { current: null };
   const ctx = vm.createContext({
     document, fetch, URLSearchParams, console, Date,
     location: { hash: "#chat" }, window: { addEventListener() {} },
-    EventSource: class { addEventListener() {} close() {} },
+    EventSource: class {
+      constructor(url) { this.url = url; esRef.current = this; }
+      addEventListener() {} close() {}
+    },
     setInterval() {}, setTimeout() {}, clearInterval() {}, clearTimeout() {},
   });
   const source = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
   vm.runInContext(
-    source + "\nglobalThis.app = {state, loadKnowledge, refreshAll, loadAnalytics, renderMilestones};",
+    source + "\nglobalThis.app = {state, loadKnowledge, refreshAll, loadAnalytics, renderMilestones, loadDashboard, appendDashEvent};",
     ctx
   );
-  return { app: ctx.app, document, nodes };
+  return { app: ctx.app, document, nodes, es: esRef.current };
 }
 
 const response = (items = []) => ({ ok: true, json: async () => ({ items, total: items.length }) });
@@ -193,4 +213,86 @@ test("milestone bar shows current progress and the next unlock target", () => {
   app.renderMilestones(2000);
   const full = document.querySelector("#milestone").innerHTML;
   assert.match(full, /已抵达全部里程碑/);
+});
+
+/* ---- 第十五轮：活动流改 SSE 实时推送，去冗余轮询 ---- */
+const statusPayload = (ver = 7) => ({
+  stats: {
+    points: 12, documents: 1, disk_gb: 0, new_24h: 2, sessions: 1,
+    resources: 0, scale_warn: null, topics: [], ver,
+  },
+  engine: { running: false, stage: "idle", round: 0 },
+  llm: { healthy: true }, finetune: { ready: false, cuda: false },
+  config: { auto_download: true }, disk: {}, response_ms: 0.3,
+});
+
+function feedConsole(recentEvents) {
+  const urls = [];
+  const { app, document, es } = consoleApp(async (url) => {
+    urls.push(url);
+    if (url.includes("/api/status")) return { ok: true, json: async () => statusPayload() };
+    if (url.includes("/api/events/recent"))
+      return { ok: true, json: async () => recentEvents };
+    if (url.includes("/api/analytics/health")) return { ok: true, json: async () => ({ empty: true }) };
+    return { ok: true, json: async () => ({ items: [] }) };
+  });
+  app.state.view = "dashboard";
+  return { app, document, es, urls };
+}
+
+test("dashboard activity feed is pushed live over SSE, not polled every cycle", async () => {
+  const recent = [
+    { id: 1, level: "info", msg: "历史一", ts: 1 },
+    { id: 2, level: "ok", msg: "历史二", ts: 2 },
+  ];
+  const { app, document, es, urls } = feedConsole(recent);
+  // 初次进总览：拉一次 recent 打底（之后交给 SSE）
+  await app.loadDashboard(null, true);
+  const afterInit = urls.filter((u) => u.includes("/api/events/recent")).length;
+  assert.equal(afterInit, 1, "初次应拉一次 recent 打底");
+  const box = document.querySelector("#dash-stream");
+  assert.match(box.innerHTML, /历史一/);
+  assert.match(box.innerHTML, /历史二/);
+
+  // SSE 上线：徽标变「实时」
+  es.onopen();
+  assert.equal(document.querySelector("#feed-live").textContent, "实时");
+
+  // SSE 实时推三条新事件，立即进总览活动流
+  for (const id of [3, 4, 5])
+    es.onmessage({ data: JSON.stringify({ id, level: "info", msg: `实时${id}`, ts: 10 + id }) });
+  assert.match(box.innerHTML, /实时3/);
+  assert.match(box.innerHTML, /实时5/);
+
+  // 之后每 6 秒的 refreshAll 不再轮询 /api/events/recent（SSE 已实时推送）
+  await app.refreshAll();
+  await app.refreshAll();
+  await app.refreshAll();
+  assert.equal(
+    urls.filter((u) => u.includes("/api/events/recent")).length,
+    afterInit,
+    "SSE 在线时不应再轮询 /api/events/recent"
+  );
+});
+
+test("SSE drop falls back to polling; reconnect replay never duplicates the feed", async () => {
+  const recent = [{ id: 1, level: "info", msg: "事件一", ts: 1 }];
+  const { app, document, es, urls } = feedConsole(recent);
+  await app.loadDashboard(null, true);
+  es.onopen();
+
+  // 断开：徽标回退，活动流改轮询兜底（不僵死）
+  es.onerror();
+  assert.equal(document.querySelector("#feed-live").textContent, "重连中");
+  await app.refreshAll();
+  assert.ok(
+    urls.filter((u) => u.includes("/api/events/recent")).length >= 2,
+    "SSE 断开应回退轮询 recent"
+  );
+
+  // 重连：SSE 重放同一条历史，总览活动流不能重复堆叠
+  es.onopen();
+  es.onmessage({ data: JSON.stringify({ id: 1, level: "info", msg: "事件一", ts: 1 }) });
+  const shown = (document.querySelector("#dash-stream").innerHTML.match(/事件一/g) || []).length;
+  assert.equal(shown, 1, "重放历史不应在总览活动流里重复");
 });

@@ -605,3 +605,6 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 
 /* 顶栏响应延迟徽标 */
 .metric-lat b { font-variant-numeric: tabular-nums; }
+
+/* 总览「最近活动」实时徽标：绿=SSE 实时推送，琥珀=通道断开回退轮询 */
+#feed-live { transition: color .3s; }
