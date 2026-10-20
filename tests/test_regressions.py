@@ -9,6 +9,7 @@ import gc
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -247,7 +248,7 @@ class EngineTests(IsolatedTest):
         engine = evolve.Engine()
         sid = memory.start_session("test")
         engine.state["running"] = True
-        with patch.object(llm, "healthy", return_value=False):
+        with patch.object(llm, "tags", return_value=(False, [])):
             engine._run("test", 1, sid)
         session = memory.list_sessions()[0]
         self.assertEqual(session["status"], "error")
@@ -350,6 +351,23 @@ class ApiTests(IsolatedTest):
         for path in ("/", "/static/app.js", "/static/style.css"):
             with self.subTest(path=path):
                 self.assertEqual(self.client.get(path).status_code, 200)
+
+    def test_duplicates_endpoint_not_shadowed_by_detail_route(self):
+        memory.add_point(topic="甲", claim="同一条结论的第一种说法原文", vec=[1., 0.],
+                         dedup=False)
+        memory.add_point(topic="甲", claim="同一条结论的第二种说法原文", vec=[1., 0.],
+                         dedup=False)
+        response = self.client.get("/api/knowledge/duplicates", params={"threshold": 0.9})
+        self.assertEqual(response.status_code, 200, "duplicates 不能被 /{pid} 吞掉")
+        body = response.json()
+        self.assertIn("pairs", body)
+        self.assertIn("threshold", body)
+        self.assertEqual(len(body["pairs"]), 1)
+
+    def test_status_reports_probe_pending_instead_of_blocking(self):
+        response = self.client.get("/api/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("checking", response.json()["llm"])
 
     def test_analytics_payload_carries_write_version(self):
         response = self.client.get("/api/analytics")
@@ -494,6 +512,146 @@ class SuggestionsCacheTests(IsolatedTest):
         analytics.suggestions()
         after = analytics.snapshot()
         self.assertEqual(before, after)
+
+
+class DuplicateTests(IsolatedTest):
+    """第十三轮新功能：近重复知识点整理。"""
+
+    def add(self, topic: str, claim: str, vec: list[float]) -> None:
+        memory.add_point(topic=topic, claim=claim, detail="细节", source_url="u://" + claim,
+                         source_title="t", source_kind="web", tags=[], confidence=0.6,
+                         vec=vec, dedup=False)
+
+    def test_finds_near_duplicate_pair_inside_topic(self):
+        self.add("甲方向", "同一条结论的第一种说法", [1.0, 0.0, 0.0])
+        self.add("甲方向", "同一条结论的第二种说法", [0.99, 0.02, 0.0])
+        self.add("甲方向", "完全无关的另一条结论", [0.0, 1.0, 0.0])
+        r = memory.near_duplicates(threshold=0.9)
+        self.assertEqual(len(r["pairs"]), 1)
+        self.assertGreaterEqual(r["pairs"][0]["sim"], 0.9)
+        self.assertNotEqual(r["pairs"][0]["a"]["id"], r["pairs"][0]["b"]["id"])
+
+    def test_cross_topic_pairs_are_never_reported(self):
+        self.add("甲方向", "甲方向里的一条结论原文", [1.0, 0.0])
+        self.add("乙方向", "乙方向里同样的一条结论", [1.0, 0.0])
+        r = memory.near_duplicates(threshold=0.9)
+        self.assertEqual(r["pairs"], [])
+
+    def test_threshold_controls_sensitivity(self):
+        self.add("甲方向", "两条相似但不相同的结论之一", [1.0, 0.0])
+        self.add("甲方向", "两条相似但不相同的结论之二", [0.9, 0.436])
+        self.assertEqual(memory.near_duplicates(threshold=0.99)["pairs"], [])
+        self.assertEqual(len(memory.near_duplicates(threshold=0.8)["pairs"]), 1)
+
+    def test_scan_is_cached_by_write_version(self):
+        self.add("甲方向", "两条相似但不相同的结论之一", [1.0, 0.0])
+        self.add("甲方向", "两条相似但不相同的结论之二", [1.0, 0.0])
+        first = memory.near_duplicates(threshold=0.9)
+        with patch.object(memory, "_all_vectors", side_effect=AssertionError("重复扫描")):
+            second = memory.near_duplicates(threshold=0.9)
+        self.assertEqual([p["sim"] for p in first["pairs"]], [p["sim"] for p in second["pairs"]])
+        # 写入后必须重算（版本号接线）
+        self.add("甲方向", "新加进来的第三条结论原文", [1.0, 0.0])
+        third = memory.near_duplicates(threshold=0.9)
+        self.assertGreater(len(third["pairs"]), len(first["pairs"]))
+
+    def test_empty_library_returns_empty_shape(self):
+        r = memory.near_duplicates()
+        self.assertEqual(r["pairs"], [])
+        self.assertEqual(r["scanned"], 0)
+        self.assertIn("threshold", r)
+
+
+class LlmTagsTests(IsolatedTest):
+    """第十三轮：/api/tags 改「先返回、后台刷新」，调用方不再被远端往返阻塞。"""
+
+    def setUp(self):
+        super().setUp()
+        self.remote = {"down": False, "calls": 0, "rtt": 0.0}
+        self._reset()
+        self.patch = patch.object(llm, "_client", side_effect=lambda *a, **k: _FakeClient(self.remote))
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self._reset()
+        super().tearDown()
+
+    def _reset(self) -> None:
+        with llm._tags_lock:
+            llm._tags_cache.update(
+                probed=False, healthy=False, models=[], ts=0.0,
+                refreshing=False, fail_streak=0, next_try=0.0,
+            )
+
+    def _settle(self, wait: float = 0.3) -> None:
+        llm.tags()
+        time.sleep(wait)
+
+    def test_first_call_returns_immediately_while_probing(self):
+        self.remote["rtt"] = 0.25
+        t0 = time.perf_counter()
+        healthy, models = llm.tags()
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 0.1, "首次调用不应等远端往返")
+        self.assertFalse(healthy)
+        self.assertEqual(models, [])
+        self.assertTrue(llm.tags_pending())
+        time.sleep(0.4)
+        healthy, models = llm.tags()
+        self.assertTrue(healthy)
+        self.assertEqual([m["name"] for m in models], ["m1"])
+        self.assertFalse(llm.tags_pending())
+
+    def test_list_models_shares_the_same_cache(self):
+        self._settle()
+        self.remote["calls"] = 0
+        models = llm.list_models()
+        self.assertEqual([m["name"] for m in models], ["m1"])
+        self.assertEqual(self.remote["calls"], 0, "list_models 不应再单独往返")
+
+    def test_failure_is_cached_with_backoff(self):
+        self.remote["down"] = True
+        self._settle()
+        calls = self.remote["calls"]
+        for _ in range(6):
+            llm.tags()
+        time.sleep(0.1)
+        self.assertEqual(self.remote["calls"], calls, "退避期内不应重复撞远端")
+
+    def test_invalidate_schedules_exactly_one_refresh(self):
+        self._settle()
+        self.remote["rtt"] = 0.2
+        self.remote["calls"] = 0
+        llm._invalidate_tags()
+        for _ in range(5):
+            llm.tags()
+        time.sleep(0.4)
+        self.assertEqual(self.remote["calls"], 1, "并发调用只应触发一次刷新")
+
+
+class _FakeResp:
+    status_code = 200
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return {"models": [{"name": "m1", "size": 1024 ** 3,
+                            "details": {"parameter_size": "7B"}}]}
+
+
+class _FakeClient:
+    def __init__(self, remote: dict) -> None:
+        self.remote = remote
+
+    def get(self, path: str, timeout: float | None = None) -> _FakeResp:
+        self.remote["calls"] += 1
+        if self.remote["rtt"]:
+            time.sleep(self.remote["rtt"])
+        if self.remote["down"]:
+            raise ConnectionError("refused")
+        return _FakeResp()
 
 
 if __name__ == "__main__":

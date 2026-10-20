@@ -60,7 +60,9 @@ def api_status() -> dict:
     out = {
         "engine": evolve.engine.snapshot(),
         "stats": memory.stats(),
-        "llm": {"healthy": ok, "models": models},
+        # checking=True 表示首次探测还没回来（Ollama 没启动时它会等满连接超时）。
+        # 前端据此显示「检测中…」而不是直接判定「未连接」，避免第一帧误报。
+        "llm": {"healthy": ok, "models": models, "checking": llm.tags_pending()},
         "config": config.load(),
         "disk": downloader.disk_report(),
         "finetune": {"ready": env["ready"], "gpu": env.get("gpu"), "cuda": env.get("cuda")},
@@ -242,6 +244,17 @@ def api_perf() -> dict:
 @app.get("/api/knowledge/search")
 def api_knowledge_search(q: str = Query(...), k: int = 8) -> list[dict]:
     return memory.search(q, k=k)
+
+
+@app.get("/api/knowledge/duplicates")
+def api_knowledge_duplicates(
+    threshold: float = 0.90, limit: int = 30, topic: str | None = None
+) -> dict:
+    """近重复知识点对（0.85~0.92 那一带：很像但没被去重挡掉的）。
+
+    声明位置同样必须在 /api/knowledge/{pid} 之前，否则 "duplicates" 会被当 id。
+    """
+    return memory.near_duplicates(threshold=threshold, limit=limit, topic=topic)
 
 
 @app.get("/api/knowledge/{pid}")
@@ -613,15 +626,21 @@ def _startup() -> None:
         library.recover_stale_states()
     except Exception:
         pass
-    if not llm.healthy():
-        memory.log_event("warn", "Ollama 未运行")
     try:
         scheduler.start_auto_if_needed()
     except Exception:
         pass
 
-    # 后台预热 ZBrushCentral 的主题索引（首次要拉十几页，别让用户等）
+    # 后台做两件慢事：探测 Ollama、预热 ZBrushCentral 主题索引。
+    # Ollama 未启动时健康探测要等满连接超时（实测 2 秒），放在 startup 里
+    # 会让 uvicorn 迟迟不开始 accept——第一屏要等它，等于开机就卡 2 秒。
     def _warm() -> None:
+        # 后台线程里可以放心同步探测：这里阻塞不影响任何请求
+        try:
+            if not llm.tags(fresh=True)[0]:
+                memory.log_event("warn", "Ollama 未运行")
+        except Exception:
+            pass
         try:
             from . import search as _s
 

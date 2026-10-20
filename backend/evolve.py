@@ -232,7 +232,10 @@ class Engine:
         t0 = time.time()
         try:
             self._emit("info", f"开始学习「{direction}」，计划 {rounds} 轮", stage="init")
-            if not llm.healthy():
+            # 用户点了「开始学习」就是要一个确定答案：这里必须同步探测一次，
+            # 不能拿轮询用的缓存态（healthy()）去判——服务刚启动时它还是 False，
+            # 会把明明可用的 Ollama 误判成未运行。这一次阻塞是用户主动触发的。
+            if not llm.tags(fresh=True)[0]:
                 raise llm.LLMError("Ollama 未运行，无法开始学习")
             llm.ensure_models(lambda m: self._emit("info", m))
 

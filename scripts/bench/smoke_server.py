@@ -47,6 +47,22 @@ if memory.count_points() == 0:
             tags=["标签甲", "标签乙"], confidence=0.45 + (i % 10) / 20,
             vec=v.tolist(), dedup=False,
         )
+    # 三条几乎同义的结论：让「近重复整理」卡片有真实内容可看可点
+    for k, txt in enumerate([
+        "收缩补偿采用反向缩放，补偿量按层高线性调整",
+        "收缩补偿用反向缩放的思路，补偿量按层高线性给定",
+        "补偿量按层高线性调整，即用反向缩放做收缩补偿",
+    ]):
+        v = bases[0] + rng.standard_normal(64).astype(np.float32) * 0.05
+        v /= np.linalg.norm(v)
+        memory.add_point(
+            topic=topics[0], claim=txt,
+            detail="三种写法讲的是同一件事，用于演示近重复整理。",
+            source_url=f"https://example.com/dup/{k}",
+            source_title=f"资料《收缩补偿笔记 {k}》",
+            source_kind="web", tags=["收缩补偿"], confidence=0.7,
+            vec=v.tolist(), dedup=False,
+        )
     # 造几天的学习记录，让增长曲线/热力图/新鲜度有东西可画
     c = memory.conn()
     with c:

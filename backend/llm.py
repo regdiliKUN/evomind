@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from typing import Any, Iterable, Iterator
 
@@ -45,56 +46,108 @@ def _parse_tags(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-#: tags() 的 TTL 缓存。/api/status 每 6 秒轮询一次，而 healthy() 与 list_models()
-#: 打的是同一个 /api/tags —— 分开调用等于每次轮询向 Ollama 发两次完全相同的请求。
-#: TTL 取 8s（略大于轮询周期）：模型清单与健康状态几秒内不会变，staleness 对
-#: 状态展示无感；刚拉完模型由 pull_model 主动失效，不影响即时性。
-_tags_cache: dict[str, Any] = {"ts": 0.0, "healthy": False, "models": []}
+#: /api/tags 的「先返回旧值、后台刷新」缓存。
+#:
+#: 为什么不能用普通 TTL：`/api/status` 每 6 秒轮询一次，而 Ollama 没启动时
+#: 这个请求要 2 秒才失败（连接被拒 + 重试）。TTL 一到，轮询线程就同步等这 2 秒，
+#: 整轮刷新（状态栏、图表、建议全部排队）跟着卡住。实测空转 10 分钟就卡 75 次。
+#: 现在调用方永远拿「最近一次探测结果」，过期只触发**后台线程**去刷，
+#: 失败则指数退避（8s→16s→32s→60s 封顶），不再每 8 秒重付一次失败代价。
+_tags_cache: dict[str, Any] = {
+    "probed": False,      # 是否至少完成过一次探测（成功或失败）
+    "healthy": False,
+    "models": [],
+    "ts": 0.0,            # 上次探测完成的 monotonic 时刻
+    "refreshing": False,  # 是否有后台探测在跑（防止并发重复请求）
+    "fail_streak": 0,     # 连续失败次数（退避用）
+    "next_try": 0.0,      # 退避期内不允许再探测
+}
+_tags_lock = threading.Lock()
 TAGS_TTL = 8.0
+TAGS_BACKOFF_MAX = 60.0
+TAGS_TIMEOUT = 5.0
 
 
 def _invalidate_tags() -> None:
-    global _tags_cache
-    _tags_cache.update(ts=0.0, healthy=False, models=[])
+    """让下次调用重新探测（拉完模型后用），但不清掉已有结果，避免界面闪空。"""
+    with _tags_lock:
+        _tags_cache["ts"] = 0.0
+        _tags_cache["next_try"] = 0.0
+        _tags_cache["fail_streak"] = 0
 
 
-def tags() -> tuple[bool, list[dict[str, Any]]]:
-    """一次 /api/tags 同时拿回「服务是否健康」和「模型清单」。
-
-    带 2s TTL：模型清单几秒内不会变，而轮询频率远高于此，能省掉重复往返。
-    需要强制刷新（刚拉完模型）时传 fresh=True。
-    """
-    global _tags_cache
+def _refresh_tags() -> None:
+    """真正打一次 /api/tags。只由 tags() 在后台线程或 fresh 模式调用。"""
     now = time.monotonic()
-    if now - _tags_cache["ts"] < TAGS_TTL:
-        return _tags_cache["healthy"], [dict(m) for m in _tags_cache["models"]]
     try:
-        r = _client().get("/api/tags", timeout=10)
+        r = _client().get("/api/tags", timeout=TAGS_TIMEOUT)
         if r.status_code != 200:
-            _tags_cache.update(ts=now, healthy=False, models=[])
-            return False, []
+            raise LLMError(f"HTTP {r.status_code}")
         models = _parse_tags(r.json())
     except Exception:
-        _tags_cache.update(ts=now, healthy=False, models=[])
-        return False, []
-    _tags_cache.update(ts=now, healthy=True, models=models)
-    return True, [dict(m) for m in models]
+        with _tags_lock:
+            c = _tags_cache
+            c["probed"] = True
+            c["healthy"] = False
+            c["ts"] = now
+            c["fail_streak"] += 1
+            # 2**(n-1) 指数退避：连不上时不要每 8 秒再撞一次 2 秒的墙
+            c["next_try"] = now + min(
+                TAGS_TTL * (2 ** (c["fail_streak"] - 1)), TAGS_BACKOFF_MAX
+            )
+            c["refreshing"] = False
+        return
+    with _tags_lock:
+        c = _tags_cache
+        c["probed"] = True
+        c["healthy"] = True
+        c["models"] = models
+        c["ts"] = now
+        c["fail_streak"] = 0
+        c["next_try"] = 0.0
+        c["refreshing"] = False
+
+
+def tags(*, fresh: bool = False) -> tuple[bool, list[dict[str, Any]]]:
+    """返回 (服务是否健康, 模型清单)，**不阻塞**调用方。
+
+    默认走缓存：过期只在后台刷新，本次调用立刻返回上一次的结果。
+    只有 fresh=True（刚拉完模型要立刻看到）才同步探测一次。
+    首次调用返回 (False, []) 并以 tags_pending() 告知「还在探测」。
+    """
+    global _tags_cache
+    if fresh:
+        _refresh_tags()
+        with _tags_lock:
+            return _tags_cache["healthy"], [dict(m) for m in _tags_cache["models"]]
+
+    now = time.monotonic()
+    start = False
+    with _tags_lock:
+        c = _tags_cache
+        stale = (now - c["ts"]) >= TAGS_TTL
+        if not c["refreshing"] and (not c["probed"] or (stale and now >= c["next_try"])):
+            c["refreshing"] = True
+            start = True
+        healthy, models = c["healthy"], [dict(m) for m in c["models"]]
+    if start:
+        threading.Thread(target=_refresh_tags, name="tags-probe", daemon=True).start()
+    return healthy, models
+
+
+def tags_pending() -> bool:
+    """是否还没拿到首个结果 / 正在后台探测（前端据此显示「检测中」而不是「未连接」）。"""
+    with _tags_lock:
+        return (not _tags_cache["probed"]) or _tags_cache["refreshing"]
 
 
 def healthy() -> bool:
-    try:
-        return _client().get("/api/tags", timeout=5).status_code == 200
-    except Exception:
-        return False
+    return tags()[0]
 
 
 def list_models() -> list[dict[str, Any]]:
-    try:
-        r = _client().get("/api/tags", timeout=10)
-        r.raise_for_status()
-        return _parse_tags(r.json())
-    except Exception:
-        return []
+    """模型清单。与 healthy() 共用同一份 /api/tags 缓存，不再每次重新往返。"""
+    return tags()[1]
 
 
 def has_model(name: str) -> bool:

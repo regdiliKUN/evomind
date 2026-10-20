@@ -17,6 +17,7 @@ const state = {
   // 用户正在选的文字、把滚动位置弹回顶部。
   kbVer: -1,
   anVer: -1,
+  dupVer: -1,
   pointId: null,
 };
 
@@ -114,6 +115,21 @@ document.addEventListener("click", (e) => {
     selectTopic(drill.dataset.topic || "");
     switchView("knowledge");
     loadKnowledge();
+    return;
+  }
+  // 近重复整理：保留 A 就删掉 B（删单条是已有接口，用户明确点击才发生）
+  const keep = e.target.closest(".dup-keep");
+  if (keep) {
+    const drop = keep.dataset.drop;
+    if (!drop) return;
+    if (!confirm(`删掉另一条相似的结论？\n\n${keep.dataset.claim || ""}\n\n删掉后不可恢复，但可以重新学习再入库。`)) return;
+    api(`/api/knowledge/${encodeURIComponent(drop)}`, { method: "DELETE" })
+      .then(() => {
+        toast("已删除重复项");
+        state.dupVer = -1;
+        loadKnowledge();
+      })
+      .catch((err) => toast("删除失败：" + err.message, "err"));
     return;
   }
   // 知识点（列表行 / 详情里的相似条目）→ 打开详情抽屉；点来源链接不算
@@ -527,6 +543,10 @@ function maybeShowOnboarding() {
   try {
     if (localStorage.getItem(OB_KEY)) return;
   } catch (_) {}
+  // 深链直达某个具体视图（#knowledge、#knowledge/<id>、分享链接）的访客
+  // 多半不是第一次用，不要拿引导浮层挡住他想看的东西
+  const target = location.hash.slice(1).split("/")[0];
+  if (target && target !== "dashboard") return;
   // 总览数据到位后再弹，避免一上来挡着 loading
   setTimeout(openOnboarding, 600);
 }
@@ -566,8 +586,17 @@ function paintTopbar(st) {
   $("#m-state").style.color = running ? "var(--green)" : "";
 
   const llmOk = st.llm.healthy;
-  $("#dot-llm").className = "dot " + (llmOk ? "on" : "off");
-  $("#txt-llm").textContent = llmOk ? "模型在线" : "模型离线";
+  const checking = !!st.llm.checking && !llmOk;
+  $("#dot-llm").className = "dot " + (llmOk ? "on" : checking ? "warn" : "off");
+  $("#txt-llm").textContent = llmOk ? "模型在线" : checking ? "检测中…" : "模型离线";
+  const dot = $("#dot-llm");
+  if (dot) {
+    dot.title = llmOk
+      ? (st.llm.models || []).length + " 个模型可用"
+      : checking
+        ? "正在探测本地 Ollama（首次探测可能要等连接超时）"
+        : "连不上 Ollama：确认它已启动（ollama serve），或在设置里改服务地址";
+  }
 
   $("#dot-gpu").className = "dot " + (st.finetune.cuda ? "on" : "warn");
   $("#txt-gpu").textContent = st.finetune.cuda
@@ -672,9 +701,78 @@ async function loadKnowledge(q = state.knowledgeQuery) {
     // 记下本次渲染对应的写入版本：refreshAll 之后只在版本变化时再拉一次
     const ver = state.status && state.status.stats && state.status.stats.ver;
     if (ver !== undefined) state.kbVer = ver;
+    // 近重复扫描按库版本缓存，题库没变时服务端直接命中缓存（~0ms），
+    // 但仍省一次往返：版本一致就不重复问。
+    if (ver !== state.dupVer) loadDuplicates();
   } catch (e) {
     toast("知识库加载失败：" + e.message, "err");
   }
+}
+
+/* ---------------- 近重复整理（新） ---------------- */
+async function loadDuplicates(threshold = 0.9) {
+  let d;
+  try {
+    d = await api(`/api/knowledge/duplicates?threshold=${threshold}&limit=12`);
+  } catch (_) {
+    return;
+  }
+  const ver = state.status && state.status.stats && state.status.stats.ver;
+  if (ver !== undefined) state.dupVer = ver;
+  renderDuplicates(d);
+}
+
+function renderDuplicates(d) {
+  const card = $("#dup-card");
+  const box = $("#dup-body");
+  if (!card || !box) return;
+  const pairs = (d && d.pairs) || [];
+  const scanned = (d && d.scanned) || 0;
+  // 没有重复、且扫描量太小（说明库还不够大）时整块隐藏，不占版面
+  if (!pairs.length && scanned < 20) {
+    card.hidden = true;
+    setHTML(box, "");
+    return;
+  }
+  card.hidden = false;
+  if (!pairs.length) {
+    setHTML(
+      box,
+      `<div class="empty" style="text-align:left;line-height:1.75;padding:2px 0">
+       扫了 ${scanned} 条，没有发现相似度 ≥ ${(d.threshold || 0.9).toFixed(2)} 的重复项——
+       说明入库去重工作正常，这部分不用操心。
+       <div class="hint" style="margin-top:6px">相似度调到 0.85 会更严格地找「换个说法讲同一件事」的条目。</div>
+      </div>`
+    );
+    return;
+  }
+  const html =
+    `<div class="hint" style="margin:-2px 0 12px">
+       扫了 ${scanned} 条，发现 ${pairs.length} 组很像的结论。它们不是一字不差的重复
+       （那样入库时就被挡掉了），而是「换个说法讲同一件事」——留着会互相挤占检索名额。
+     </div>` +
+    pairs
+      .map((p) => {
+        const pct = Math.max(0, Math.min(100, (p.sim - 0.8) / 0.2 * 100));
+        const side = (it, dropId) =>
+          `<div class="dup-side">
+             <div class="dup-claim" data-pid="${esc(it.id)}">${esc(it.claim)}</div>
+             <div class="dup-meta"><span class="tagmini">${esc(it.topic || "")}</span>
+               <span class="dim mono">可信 ${(+it.confidence || 0).toFixed(2)}</span></div>
+             <button class="btn sm dup-keep" data-drop="${esc(dropId)}" data-claim="${esc((it.claim || "").slice(0, 60))}">保留这条</button>
+           </div>`;
+        return `<div class="dup-pair">
+            ${side(p.a, p.b.id)}
+            <div class="dup-mid">
+              <div class="dup-sim">${p.sim.toFixed(3)}</div>
+              <div class="dup-bar"><i style="width:${pct.toFixed(0)}%"></i></div>
+              <div class="dup-sep">相似</div>
+            </div>
+            ${side(p.b, p.a.id)}
+          </div>`;
+      })
+      .join("");
+  setHTML(box, html);
 }
 
 function fillTopicSelect(items, activeTopic = "") {
@@ -1806,14 +1904,38 @@ async function fillSettings() {
   try {
     const [cfg, models] = await Promise.all([api("/api/config"), api("/api/models")]);
     state.cfg = cfg;
-    $("#cfg-model").innerHTML = models
-      .map(
-        (m) =>
-          `<option value="${esc(m.name)}" ${m.name === cfg.model ? "selected" : ""}>${esc(
-            m.name
-          )} · ${m.size_gb}GB ${m.caps?.includes("tools") ? "· 工具调用" : ""}</option>`
-      )
-      .join("");
+    const hint = $("#cfg-model-hint");
+    $("#cfg-model").innerHTML = models.length
+      ? models
+          .map(
+            (m) =>
+              `<option value="${esc(m.name)}" ${m.name === cfg.model ? "selected" : ""}>${esc(
+                m.name
+              )} · ${m.size_gb}GB ${m.caps?.includes("tools") ? "· 工具调用" : ""}</option>`
+          )
+          .join("")
+      : `<option value="${esc(cfg.model)}">${esc(cfg.model)} · 未检测到</option>`;
+    // 一个模型都没探到，通常不是「没装模型」而是 Ollama 没启动——直接说清怎么修
+    if (hint) {
+      hint.hidden = models.length > 0;
+      hint.innerHTML = models.length
+        ? ""
+        : `没读到模型清单。多数情况是 <b>Ollama 没启动</b>：开一个终端跑
+           <code>ollama serve</code>（或直接启动 Ollama 应用），然后刷新本页。
+           若 Ollama 在别的地址，改下面的「服务地址」再试。`;
+    }
+    // 探测是异步的：首帧可能还没回来（服务端改成后台探测，不再阻塞设置页）。
+    // 2.5 秒后补拉一次，模型清单到了就自动填上，用户不用手动刷新。
+    if (!models.length) {
+      setTimeout(() => {
+        if (state.view !== "settings") return;
+        api("/api/models")
+          .then((later) => {
+            if (later && later.length) fillSettings();
+          })
+          .catch(() => {});
+      }, 2500);
+    }
     $("#cfg-embed").value = cfg.embed_model;
     $("#cfg-qpr").value = cfg.queries_per_round;
     $("#cfg-fpr").value = cfg.fetch_per_round;

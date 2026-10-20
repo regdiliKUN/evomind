@@ -553,7 +553,9 @@ def test_network():
     from backend import llm, search
 
     def ollama_health():
-        assert llm.healthy(), "Ollama 不可用"
+        # healthy() 现在是「最近一次探测结果」（供轮询用，不阻塞）；
+        # 要一个确定性答案必须显式 fresh 探测一次。
+        assert llm.tags(fresh=True)[0], "Ollama 不可用"
         return "在线"
 
     def llm_short():

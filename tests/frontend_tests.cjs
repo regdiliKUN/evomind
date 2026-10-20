@@ -51,13 +51,15 @@ test("polling retains the submitted search and topic, and clearing resets the qu
   document.querySelector("#kb-topic").value = "topic with spaces";
   await app.loadKnowledge("vector search");
   await app.loadKnowledge();
-  for (const url of urls) {
+  // 只核对知识库列表请求：同一轮还会拉一次 /api/knowledge/duplicates（近重复卡片）
+  for (const url of urls.filter((u) => u.startsWith("/api/knowledge?"))) {
     const params = new URL(url, "http://localhost").searchParams;
     assert.equal(params.get("q"), "vector search");
     assert.equal(params.get("topic"), "topic with spaces");
   }
   await app.loadKnowledge("");
-  assert.equal(new URL(urls.at(-1), "http://localhost").searchParams.has("q"), false);
+  const last = urls.filter((u) => u.startsWith("/api/knowledge?")).at(-1);
+  assert.equal(new URL(last, "http://localhost").searchParams.has("q"), false);
 });
 
 test("a late search response cannot replace the newer results", async () => {
@@ -167,6 +169,9 @@ test("knowledge polling skips refetch when the write version is unchanged", asyn
   await app.refreshAll();
   await app.refreshAll();
   await app.refreshAll();
-  const kbFetches = urls.filter((u) => u.includes("/api/knowledge"));
+  const kbFetches = urls.filter((u) => u.startsWith("/api/knowledge?"));
   assert.equal(kbFetches.length, 1, "版本未变时知识库只应拉取一次");
+  // 近重复扫描同样按版本门控，不该每轮重问
+  const dupFetches = urls.filter((u) => u.startsWith("/api/knowledge/duplicates"));
+  assert.ok(dupFetches.length <= 3, `近重复请求次数异常：${dupFetches.length}`);
 });

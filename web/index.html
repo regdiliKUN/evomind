@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>EvoMind · 自进化学习引擎</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236c8cff'/><text x='16' y='23' font-size='18' font-family='sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'>E</text></svg>" />
-<link rel="stylesheet" href="/static/style.css?v=11" />
+<link rel="stylesheet" href="/static/style.css?v=13" />
 </head>
 <body>
 <div class="app">
@@ -192,6 +192,10 @@
             <select id="kb-topic" style="max-width:260px"><option value="">全部方向</option></select>
             <button class="btn" id="btn-kb-search">搜索</button>
           </div>
+        </div>
+        <div class="card" id="dup-card" style="margin-bottom:14px" hidden>
+          <div class="card-title">近重复知识点<span class="tag">相似度 ≥ 0.90</span></div>
+          <div id="dup-body"></div>
         </div>
         <div class="list" id="kb-list"><div class="empty">暂无知识点</div></div>
       </section>
@@ -496,6 +500,7 @@
           <div class="card">
             <div class="card-title">学习与推理</div>
             <label class="field"><span>主推理模型</span><select id="cfg-model"></select></label>
+            <div class="field-hint" id="cfg-model-hint" hidden></div>
             <label class="field"><span>向量模型</span><input id="cfg-embed" /></label>
             <label class="field"><span>每轮检索式数量</span><input id="cfg-qpr" type="number" min="1" max="8" /></label>
             <label class="field"><span>每轮抓取网页数</span><input id="cfg-fpr" type="number" min="1" max="20" /></label>
@@ -597,15 +602,15 @@
   </div>
 
   <!-- ---------- 知识点详情（右侧抽屉） ---------- -->
-  <div class="drawer-mask" id="pt-mask" hidden></div>
-  <aside class="drawer" id="pt-drawer" hidden aria-label="知识点详情">
-    <div class="drawer-head">
-      <div class="drawer-title">知识点详情</div>
+  <div class="pdrawer-mask" id="pt-mask" hidden></div>
+  <aside class="pdrawer" id="pt-drawer" hidden aria-label="知识点详情">
+    <div class="pdrawer-head">
+      <div class="pdrawer-title">知识点详情</div>
       <button class="btn sm" id="pt-close">关闭</button>
     </div>
-    <div class="drawer-body" id="pt-body"></div>
+    <div class="pdrawer-body" id="pt-body"></div>
   </aside>
 
-<script src="/static/app.js?v=12"></script>
+<script src="/static/app.js?v=13"></script>
 </body>
 </html>

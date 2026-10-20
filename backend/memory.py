@@ -214,6 +214,8 @@ def _invalidate() -> None:
     with _cache_lock:
         _vec_cache = None
     _bump_topic_index()
+    # 近重复扫描按库版本缓存；测试换库时版本号会归零，必须显式清掉
+    _dup_cache.update(ver=-1, thr=None, topic=None, val=None)
 
 
 def _append_vector(rowid: int, vec: list[float]) -> None:
@@ -303,6 +305,8 @@ def _normalize(m: np.ndarray) -> np.ndarray:
 # 排除非本主题行 —— 零额外 DB 往返、零矩阵复制。
 _topic_index: dict[str, set[int]] | None = None
 _topic_index_lock = threading.Lock()
+#: near_duplicates() 的版本键缓存：扫描是 O(Σ 主题内点数²)，库不变就不必重算。
+_dup_cache: dict = {"ver": -1, "thr": None, "topic": None, "val": None}
 # 压测/对照用：置 True 时 search(topic=) 退回「每次 DB 查询 + 矩阵复制」的旧路径
 _DISABLE_TOPIC_INDEX = False
 
@@ -320,6 +324,17 @@ def _topic_index_get(topic: str) -> set[int]:
             for r in conn().execute("SELECT rowid, topic FROM knowledge"):
                 _topic_index.setdefault(r["topic"], set()).add(r["rowid"])
         return _topic_index.get(topic, set())
+
+
+def _topic_index_all() -> dict[str, set[int]]:
+    """整份主题索引（近重复扫描要按主题逐个比，需要拿到全部主题名）。"""
+    global _topic_index
+    with _topic_index_lock:
+        if _topic_index is None:
+            _topic_index = {}
+            for r in conn().execute("SELECT rowid, topic FROM knowledge"):
+                _topic_index.setdefault(r["topic"], set()).add(r["rowid"])
+        return _topic_index
 
 
 def _bump_topic_index() -> None:
@@ -929,6 +944,116 @@ def similar_points(pid: str, k: int = 5) -> list[dict]:
     cand = cand[np.argsort(-sims[cand])]
     picked = [(rowids[i], float(sims[i])) for i in cand if rowids[i] != row["_rid"]][:k]
     return _attach_similar_rows(picked)
+
+
+def near_duplicates(
+    threshold: float = 0.90, limit: int = 30, topic: str | None = None,
+    per_topic_cap: int = 400,
+) -> dict:
+    """找「很像但没被去重挡掉」的知识点对，供人工整理。
+
+    去重阈值（默认 0.92 上下）只挡几乎一字不差的重复；0.85~0.92 这一带
+    往往是同一结论的不同说法，检索时会互相挤占名额，让 top-k 里塞满近义项。
+    这里把这一带挑出来给用户过目。
+
+    实现要点：
+      - 只在**同一主题内**比（跨主题的近重复几乎不存在，却要付全部平方代价），
+        用内存里的主题索引取 rowid 集合，零额外 SQL。
+      - 每个主题按 rowid 取最近的 per_topic_cap 条：大主题全量两两比是
+        O(n²)，1 万条就是 1 亿次点积（十几秒）；单主题封顶 400 条时
+        全部主题合计也只有百万级，实测几十毫秒。
+      - 结果按库版本缓存：知识库没变过，扫出来必然一样。
+    """
+    try:
+        thr = round(float(threshold), 4)
+    except (TypeError, ValueError):
+        thr = 0.90
+    thr = max(0.5, min(thr, 0.9999))
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 30
+
+    ver = version()
+    if (
+        _dup_cache["val"] is not None
+        and _dup_cache["ver"] == ver
+        and _dup_cache["thr"] == thr
+        and _dup_cache["topic"] == topic
+    ):
+        val = _dup_cache["val"]
+        return {"pairs": val["pairs"][:limit], "scanned": val["scanned"],
+                "threshold": thr, "ver": ver, "capped": val["capped"]}
+
+    dim_row = conn().execute(
+        "SELECT length(embedding)/4 dim FROM knowledge WHERE embedding IS NOT NULL LIMIT 1"
+    ).fetchone()
+    if not dim_row or not dim_row["dim"]:
+        return {"pairs": [], "scanned": 0, "threshold": thr, "ver": ver, "capped": 0}
+    dim = int(dim_row["dim"])
+    rowids, mat = _all_vectors(dim)
+    if not rowids:
+        return {"pairs": [], "scanned": 0, "threshold": thr, "ver": ver, "capped": 0}
+    pos = {rid: i for i, rid in enumerate(rowids)}
+
+    topics = [topic] if topic else list(_topic_index_all().keys())
+    pairs: list[tuple[float, int, int]] = []
+    scanned = 0
+    capped = 0
+    for t in topics:
+        rids = sorted(_topic_index_get(t))
+        if len(rids) < 2:
+            continue
+        if len(rids) > per_topic_cap:
+            rids = rids[-per_topic_cap:]  # 取最近入库的一批
+            capped += 1
+        idx = [pos[r] for r in rids if r in pos]
+        if len(idx) < 2:
+            continue
+        scanned += len(idx)
+        sub = mat[idx]
+        sim = sub @ sub.T
+        # 只看上三角：i<j 的序与「逐对比较」一致，避免重复对与自比
+        iu = np.triu_indices(len(idx), 1)
+        w = sim[iu]
+        hit = w >= thr
+        if not hit.any():
+            continue
+        for a, b, s in zip(iu[0][hit].tolist(), iu[1][hit].tolist(), w[hit].tolist()):
+            pairs.append((float(s), rowids[idx[a]], rowids[idx[b]]))
+
+    pairs.sort(key=lambda x: -x[0])
+    pairs = pairs[: 200]  # 缓存里只留前 200 对，够前端翻
+    uniq = list(dict.fromkeys(rid for _, a, b in pairs for rid in (a, b)))
+    by_rid: dict[int, dict] = {}
+    if uniq:
+        ph = ",".join("?" * len(uniq))
+        for r in conn().execute(
+            f"SELECT rowid AS _rid, id,topic,claim,detail,source_url,source_title,"
+            f"source_kind,tags,confidence,created_at FROM knowledge "
+            f"WHERE rowid IN ({ph})",
+            uniq,
+        ).fetchall():
+            rec = dict(r)
+            rec.pop("_rid", None)
+            try:
+                rec["tags"] = json.loads(rec.get("tags") or "[]")
+            except Exception:
+                rec["tags"] = []
+            by_rid[r["_rid"]] = rec
+
+    out_pairs = []
+    for s, a, b in pairs:
+        if a in by_rid and b in by_rid:
+            out_pairs.append({
+                "sim": round(s, 4),
+                "a": by_rid[a],
+                "b": by_rid[b],
+            })
+    val = {"pairs": out_pairs, "scanned": scanned, "capped": capped}
+    _dup_cache.update(ver=ver, thr=thr, topic=topic, val=val)
+    return {"pairs": out_pairs[:limit], "scanned": scanned,
+            "threshold": thr, "ver": ver, "capped": capped}
 
 
 def _attach_similar_rows(picked: list[tuple[int, float]]) -> list[dict]:
