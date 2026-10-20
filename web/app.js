@@ -55,6 +55,7 @@ const TITLES = {
   dashboard: "总览",
   learn: "自主进化",
   knowledge: "知识库",
+  analytics: "分析",
   library: "书库",
   resources: "资源获取",
   finetune: "权重进化",
@@ -70,6 +71,7 @@ function switchView(v, fromHash) {
   $$(".view").forEach((s) => s.classList.toggle("active", s.id === "view-" + v));
   $("#page-title").textContent = TITLES[v] || v;
   if (v === "knowledge") loadKnowledge();
+  if (v === "analytics") loadAnalytics();
   if (v === "library") loadLibrary();
   if (v === "resources") loadResources();
   if (v === "finetune") loadFinetune();
@@ -1485,6 +1487,287 @@ $("#btn-save-cfg").addEventListener("click", async () => {
   }
 });
 
+/* ---------------- 分析视图 ---------------- */
+/* 全部图表用纯 SVG 现画（不引第三方库，和前端「无框架」的基调一致）。
+   主题色直接用 CSS 变量，换肤也跟着变。 */
+const AN_PALETTE = [
+  "var(--accent)", "var(--green)", "var(--amber)", "var(--purple)",
+  "var(--red)", "#5ad0ff", "#ff9bd0", "#7be0a0",
+];
+
+function svgGrowth(growth) {
+  if (!growth || !growth.length) return '<div class="empty">还没有知识增长数据</div>';
+  const W = 680, H = 240, pl = 46, pr = 12, pt = 16, pb = 28;
+  const pw = W - pl - pr, ph = H - pt - pb;
+  const n = growth.length;
+  const cmax = Math.max(...growth.map((d) => d.cumulative), 1);
+  const amax = Math.max(...growth.map((d) => d.added), 1);
+  const X = (i) => pl + (n === 1 ? pw / 2 : (i / (n - 1)) * pw);
+  const Yc = (v) => pt + ph * (1 - v / cmax);
+  const Ya = (v) => pt + ph * (1 - v / amax);
+  let grid = "";
+  for (let g = 0; g <= 4; g++) {
+    const y = pt + (ph * g) / 4;
+    const val = Math.round(cmax * (1 - g / 4));
+    grid += `<line class="grid-line" x1="${pl}" y1="${y.toFixed(1)}" x2="${W - pr}" y2="${y.toFixed(1)}"/>` +
+      `<text class="axis-text" x="${pl - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end">${val}</text>`;
+  }
+  let line = "", area = "";
+  if (n > 1) {
+    const pts = growth.map((d, i) => [X(i), Yc(d.cumulative)]);
+    line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+    area = `M${pts[0][0].toFixed(1)} ${(pt + ph).toFixed(1)} ` +
+      pts.map((p) => "L" + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ") +
+      ` L${pts[pts.length - 1][0].toFixed(1)} ${(pt + ph).toFixed(1)} Z`;
+  }
+  const bw = Math.max(2, (pw / n) * 0.5);
+  let bars = "";
+  growth.forEach((d, i) => {
+    const x = X(i) - bw / 2;
+    const y = Ya(d.added);
+    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${(pt + ph - y).toFixed(1)}" rx="1.5" fill="var(--accent)" opacity="0.4"/>`;
+  });
+  const labI = n === 1 ? [0] : [0, Math.floor((n - 1) / 2), n - 1];
+  let xl = "";
+  labI.forEach((i) => {
+    xl += `<text class="axis-text" x="${X(i).toFixed(1)}" y="${H - 8}" text-anchor="middle">${esc(growth[i].day.slice(5))}</text>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}">` +
+    `<defs><linearGradient id="grad-growth" x1="0" y1="0" x2="0" y2="1">` +
+    `<stop offset="0%" stop-color="var(--green)" stop-opacity="0.35"/>` +
+    `<stop offset="100%" stop-color="var(--green)" stop-opacity="0"/></linearGradient></defs>` +
+    grid + (area ? `<path d="${area}" fill="url(#grad-growth)"/>` : "") +
+    (line ? `<path d="${line}" fill="none" stroke="var(--green)" stroke-width="2"/>` : "") +
+    bars + xl + `</svg>`;
+}
+
+function htmlTopicBars(topics) {
+  if (!topics || !topics.length) return '<div class="empty">还没有任何学习记录</div>';
+  const max = Math.max(...topics.map((t) => t.count));
+  return topics.slice(0, 12).map((t) =>
+    `<div style="margin-bottom:11px">
+      <div class="rowflex" style="justify-content:space-between;font-size:12.5px">
+        <span>${esc(t.topic)}</span>
+        <span class="mono dim">${t.count} · 可信 ${(+t.avg_conf).toFixed(2)}</span>
+      </div>
+      <div class="bar"><i style="width:${(t.count / max * 100).toFixed(1)}%"></i></div>
+    </div>`
+  ).join("");
+}
+
+function svgHist(confidence) {
+  if (!confidence || !confidence.length) return '<div class="empty">暂无数据</div>';
+  const W = 680, H = 200, pl = 40, pr = 10, pt = 14, pb = 26;
+  const pw = W - pl - pr, ph = H - pt - pb;
+  const n = confidence.length;
+  const maxn = Math.max(...confidence.map((b) => b.n), 1);
+  const bw = pw / n;
+  let s = "";
+  for (let g = 0; g <= 4; g++) {
+    const y = pt + (ph * g) / 4;
+    const val = Math.round(maxn * (1 - g / 4));
+    s += `<line class="grid-line" x1="${pl}" y1="${y.toFixed(1)}" x2="${W - pr}" y2="${y.toFixed(1)}"/>` +
+      `<text class="axis-text" x="${pl - 5}" y="${(y + 3).toFixed(1)}" text-anchor="end">${val}</text>`;
+  }
+  confidence.forEach((b, i) => {
+    const x = pl + i * bw, h = ph * (b.n / maxn), y = pt + ph - h;
+    const t = n > 1 ? i / (n - 1) : 0;
+    const col = t < 0.5 ? (t < 0.25 ? "var(--red)" : "var(--amber)") : (t < 0.75 ? "var(--green)" : "var(--accent)");
+    s += `<rect x="${(x + 1).toFixed(1)}" y="${y.toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${col}" opacity="0.82"/>`;
+  });
+  [0, Math.floor((n - 1) / 2), n - 1].forEach((i) => {
+    const x = pl + i * bw + bw / 2;
+    s += `<text class="axis-text" x="${x.toFixed(1)}" y="${H - 8}" text-anchor="middle">${(+confidence[i].lo).toFixed(1)}–${(+confidence[i].hi).toFixed(1)}</text>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}">${s}</svg>`;
+}
+
+function arcPath(cx, cy, rO, rI, a0, a1) {
+  const p = (a, r) => [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+  const [x0, y0] = p(a0, rO), [x1, y1] = p(a1, rO), [x2, y2] = p(a1, rI), [x3, y3] = p(a0, rI);
+  const large = a1 - a0 > Math.PI ? 1 : 0;
+  return `M${x0.toFixed(1)} ${y0.toFixed(1)} A${rO} ${rO} 0 ${large} 1 ${x1.toFixed(1)} ${y1.toFixed(1)} ` +
+    `L${x2.toFixed(1)} ${y2.toFixed(1)} A${rI} ${rI} 0 ${large} 0 ${x3.toFixed(1)} ${y3.toFixed(1)} Z`;
+}
+
+function svgDonut(sources) {
+  if (!sources || !sources.length) return '<div class="empty">暂无来源数据</div>';
+  const total = sources.reduce((a, b) => a + b.count, 0) || 1;
+  const cx = 110, cy = 110, rO = 80, rI = 48;
+  let s = `<svg viewBox="0 0 680 220">`;
+  let a0 = -Math.PI / 2;
+  sources.forEach((src, i) => {
+    const frac = src.count / total;
+    if (frac <= 0.0005) return;
+    const a1 = a0 + frac * Math.PI * 2 * 0.9999;
+    const col = AN_PALETTE[i % AN_PALETTE.length];
+    s += `<path d="${arcPath(cx, cy, rO, rI, a0, a1)}" fill="${col}" opacity="0.85"><title>${esc(src.kind)}: ${src.count}</title></path>`;
+    a0 = a1;
+  });
+  s += `<text x="${cx}" y="${cy - 4}" text-anchor="middle" style="fill:var(--text);font-size:22px;font-weight:600">${total}</text>`;
+  s += `<text x="${cx}" y="${cy + 14}" text-anchor="middle" class="axis-text">总条数</text>`;
+  let ly = 30;
+  sources.forEach((src, i) => {
+    const col = AN_PALETTE[i % AN_PALETTE.length];
+    const pct = ((src.count / total) * 100).toFixed(1);
+    s += `<g transform="translate(230,${ly})"><rect width="11" height="11" rx="3" fill="${col}"/>` +
+      `<text x="17" y="10" class="bar-label">${esc(src.kind)} · ${src.count} (${pct}%)</text></g>`;
+    ly += 24;
+  });
+  return s + `</svg>`;
+}
+
+function svgGraph(graph) {
+  if (!graph || !graph.nodes || !graph.nodes.length) return '<div class="empty">还没有可成网的知识点</div>';
+  const nodes = graph.nodes.map((nd) => ({ id: nd.topic, count: nd.count, label: nd.topic, x: 0, y: 0 }));
+  const idx = {};
+  nodes.forEach((n, i) => (idx[n.id] = i));
+  const edges = (graph.edges || [])
+    .map((e) => ({ a: idx[e.a], b: idx[e.b], w: e.w }))
+    .filter((e) => e.a != null && e.b != null);
+  const N = nodes.length;
+  const W = 680, H = 320, cx = W / 2, cy = H / 2;
+  nodes.forEach((n, i) => {
+    const ang = (i / N) * Math.PI * 2;
+    n.x = cx + 110 * Math.cos(ang);
+    n.y = cy + 110 * Math.sin(ang);
+  });
+  const rep = 9000, k = 220;
+  for (let it = 0; it < 240; it++) {
+    const fx = new Array(N).fill(0), fy = new Array(N).fill(0);
+    for (let i = 0; i < N; i++)
+      for (let j = i + 1; j < N; j++) {
+        let dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
+        const d2 = dx * dx + dy * dy + 0.01, d = Math.sqrt(d2);
+        const f = rep / d2;
+        fx[i] += (f * dx) / d; fy[i] += (f * dy) / d;
+        fx[j] -= (f * dx) / d; fy[j] -= (f * dy) / d;
+      }
+    edges.forEach((e) => {
+      let dx = nodes[e.b].x - nodes[e.a].x, dy = nodes[e.b].y - nodes[e.a].y;
+      const d = Math.sqrt(dx * dx + dy * dy) + 0.01;
+      const f = k * (d - 90);
+      fx[e.a] += (f * dx) / d; fy[e.a] += (f * dy) / d;
+      fx[e.b] -= (f * dx) / d; fy[e.b] -= (f * dy) / d;
+    });
+    nodes.forEach((n, i) => {
+      fx[i] += (cx - n.x) * 0.02;
+      fy[i] += (cy - n.y) * 0.02;
+      n.x += Math.max(-8, Math.min(8, fx[i] * 0.05));
+      n.y += Math.max(-8, Math.min(8, fy[i] * 0.05));
+      n.x = Math.max(42, Math.min(W - 42, n.x));
+      n.y = Math.max(28, Math.min(H - 28, n.y));
+    });
+  }
+  const maxc = Math.max(...nodes.map((n) => n.count), 1);
+  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  edges.forEach((e) => {
+    const a = nodes[e.a], b = nodes[e.b];
+    s += `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent)" stroke-width="${(0.4 + e.w * 4).toFixed(2)}" opacity="${(0.15 + e.w * 0.6).toFixed(2)}"/>`;
+  });
+  nodes.forEach((n, i) => {
+    const r = 5 + Math.sqrt(n.count / maxc) * 16;
+    const col = AN_PALETTE[i % AN_PALETTE.length];
+    s += `<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${col}" opacity="0.82" stroke="#0a0f16" stroke-width="1.5"><title>${esc(n.label)}: ${n.count}</title></circle>`;
+    if (N <= 14 || r > 11) {
+      const lab = n.label.length > 10 ? n.label.slice(0, 10) + "…" : n.label;
+      s += `<text class="node-label" x="${n.x.toFixed(1)}" y="${(n.y + r + 11).toFixed(1)}" text-anchor="middle">${esc(lab)}</text>`;
+    }
+  });
+  return s + `</svg>`;
+}
+
+function renderSearchExplain(data) {
+  if (!data || !data.hits || !data.hits.length) return '<div class="empty">没有命中任何知识点</div>';
+  const W = 680, H = 10 + data.hits.length * 30;
+  const maxScore = Math.max(...data.hits.map((h) => h.score), 0.01);
+  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  data.hits.forEach((h, i) => {
+    const y = 10 + i * 30;
+    const w = Math.max(2, (h.score / maxScore) * (W - 280));
+    s += `<rect x="0" y="${y}" width="${w.toFixed(1)}" height="14" rx="3" fill="var(--accent)" opacity="0.8"/>`;
+    s += `<text class="bar-label" x="${(w + 8).toFixed(1)}" y="${y + 11}">${esc((h.claim || "").slice(0, 30))} · ${(+h.score).toFixed(3)}</text>`;
+  });
+  return s + `</svg>`;
+}
+
+function svgSearchGraph(data) {
+  if (!data || !data.hits || !data.hits.length) return "";
+  const W = 680, H = 300, cx = W / 2, cy = H / 2;
+  const hits = data.hits;
+  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  hits.forEach((h, i) => {
+    const ang = (i / hits.length) * Math.PI * 2;
+    const R = 110;
+    h._x = cx + R * Math.cos(ang);
+    h._y = cy + R * Math.sin(ang);
+    s += `<line x1="${cx}" y1="${cy}" x2="${h._x.toFixed(1)}" y2="${h._y.toFixed(1)}" stroke="var(--green)" stroke-width="${(0.3 + h.score * 5).toFixed(2)}" opacity="0.6"/>`;
+  });
+  s += `<circle cx="${cx}" cy="${cy}" r="26" fill="var(--accent)" opacity="0.9"/>` +
+    `<text x="${cx}" y="${cy + 4}" text-anchor="middle" class="node-label" style="fill:#fff">查询</text>`;
+  hits.forEach((h) => {
+    const r = 6 + Math.min(14, h.score * 16);
+    s += `<circle cx="${h._x.toFixed(1)}" cy="${h._y.toFixed(1)}" r="${r.toFixed(1)}" fill="var(--green)" opacity="0.85"/>` +
+      `<text class="node-label" x="${h._x.toFixed(1)}" y="${(h._y + r + 12).toFixed(1)}" text-anchor="middle">${esc((h.claim || "").slice(0, 8))}…</text>`;
+  });
+  return s + `</svg>`;
+}
+
+async function loadAnalytics() {
+  let d;
+  try {
+    d = await api("/api/analytics");
+  } catch (e) {
+    toast("分析数据获取失败：" + e.message, "err");
+    return;
+  }
+  setHTML($("#an-total"), String(d.total || 0));
+  setHTML($("#an-topics-n"), String((d.topics || []).length));
+  const srcs = d.sources || [];
+  setHTML($("#an-sources-n"), String(srcs.length));
+  setHTML($("#an-sources-top"), srcs.length ? srcs[0].kind + " 最多" : "—");
+  const conf = d.confidence || [];
+  let avg = 0, totN = 0;
+  conf.forEach((b) => {
+    avg += b.n * ((b.lo + b.hi) / 2);
+    totN += b.n;
+  });
+  setHTML($("#an-conf-avg"), totN ? (avg / totN).toFixed(2) : "0");
+  setHTML($("#an-growth"), svgGrowth(d.growth));
+  setHTML(
+    $("#an-growth-range"),
+    d.growth && d.growth.length
+      ? `${d.growth[0].day} → ${d.growth[d.growth.length - 1].day}（${d.growth.length} 天）`
+      : ""
+  );
+  setHTML($("#an-topics"), htmlTopicBars(d.topics));
+  setHTML($("#an-conf"), svgHist(d.confidence));
+  setHTML($("#an-source"), svgDonut(d.sources));
+  setHTML($("#an-graph"), svgGraph(d.graph));
+}
+
+async function runSearchExplain() {
+  const q = $("#an-q").value.trim();
+  if (!q) {
+    toast("先输入一个查询");
+    return;
+  }
+  let d;
+  try {
+    d = await api("/api/analytics/search?q=" + encodeURIComponent(q) + "&k=8");
+  } catch (e) {
+    toast("检索失败：" + e.message, "err");
+    return;
+  }
+  setHTML($("#an-search"), renderSearchExplain(d));
+  setHTML($("#an-search-graph"), svgSearchGraph(d));
+}
+
+$("#btn-an-search")?.addEventListener("click", runSearchExplain);
+$("#an-q")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") runSearchExplain();
+});
+
 /* ---------------- 轮询 ---------------- */
 let refreshBusy = false;
 async function refreshAll() {
@@ -1496,6 +1779,7 @@ async function refreshAll() {
     paintTopbar(st);
     if (state.view === "dashboard") await loadDashboard(st);
     if (state.view === "knowledge") await loadKnowledge();
+    if (state.view === "analytics") loadAnalytics();
   } catch (_) {}
   finally { refreshBusy = false; }
 }

@@ -30,3 +30,6 @@ desktop.ini
 # 编辑器
 .vscode/
 .idea/
+
+# 基准产物（可重新生成的对照 json，体积大）
+scripts/bench/*.json

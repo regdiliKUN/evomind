@@ -378,6 +378,148 @@ def add_point(
         return pid
 
 
+def add_points_batch(
+    points: list[dict],
+    *,
+    session_id: str = "",
+    book_id: str = "",
+    dedup: bool = True,
+) -> dict:
+    """批量写入知识点：等价于逐条 add_point，但只做一次全库相似度 + 一次事务。
+
+    逐条 add_point 在导入一本 240 点的书时，每写一条都做一次「全库向量相似度」
+    （N×D 矩阵乘一次只为了比一个查询向量），还要各自 commit 一次。导 240 条就是
+    240 次全矩阵乘 + 240 次事务提交，且随库内条数 N 线性变慢。
+
+    这里把所有候选的向量摞成 Q×D 矩阵：
+      - 全库去重：sims = mat @ Q.T（一次 N×D 乘 D×Q），取每列最大值 = 该候选与库内
+        最佳匹配，>= dedup_threshold 就丢 —— 与逐条 similarity(k=1) 完全等价；
+      - 批内去重：intra = Q @ Q.T 的上三角，取 i<j 的最大值，等价于「后写的候选与前
+        面已接受的候选比」；
+      - 接受的候选一次性 INSERT（单个事务），再逐个增量追加进向量缓存。
+
+    正确性：去重阈值、向量构造方式（claim + ' ' + detail[:400]）都与 add_point 一致，
+    只是把 N 次矩阵乘压成 2 次、N 次提交压成 1 次。
+    """
+    valid: list[dict] = []
+    need_embed: list[int] = []
+    texts: list[str] = []
+    for p in points:
+        claim = (p.get("claim") or "").strip()
+        if len(claim) < 8:
+            continue
+        vec = p.get("vec")
+        if vec is None:
+            detail = (p.get("detail") or "")[:400]
+            need_embed.append(len(valid))
+            texts.append(f"{claim} {detail}")
+        else:
+            arr = np.asarray(vec, dtype=np.float32)
+            if arr.ndim != 1 or not arr.size or not np.isfinite(arr).all():
+                continue
+            if not np.isfinite(float(np.linalg.norm(arr))) or np.linalg.norm(arr) == 0:
+                continue
+        valid.append(p)
+
+    if not valid:
+        return {"added": 0, "dup": 0, "skipped": 0, "accepted": []}
+
+    # 没带向量的，批量算一次（与 add_point 内部 emb[0] 实现一致，且已被验证与
+    # 逐条结果逐位相同）
+    emb = [None] * len(valid)
+    for i, idx in enumerate(need_embed):
+        if idx < len(valid):
+            emb[idx] = None  # 占位，下面统一填充
+    if need_embed:
+        try:
+            vecs = llm.embed(texts)
+            for j, idx in enumerate(need_embed):
+                emb[idx] = vecs[j] if j < len(vecs) else None
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 组装候选向量矩阵
+    qvecs: list[np.ndarray] = []
+    keep: list[dict] = []
+    for i, p in enumerate(valid):
+        v = emb[i] if emb[i] is not None else p.get("vec")
+        if v is None:
+            continue
+        arr = np.asarray(v, dtype=np.float32)
+        if arr.ndim != 1 or not arr.size or not np.isfinite(arr).all():
+            continue
+        qvecs.append(arr)
+        keep.append(p)
+    if not qvecs:
+        return {"added": 0, "dup": 0, "skipped": len(valid), "accepted": []}
+
+    Q = _normalize(np.stack(qvecs, axis=0))  # Q×D 单位向量
+    Qq = Q.shape[0]
+    threshold = float(config.get("dedup_threshold", 0.93))
+
+    with _lock:
+        if dedup:
+            rowids, mat = _all_vectors(Q.shape[1])
+            # 全库去重：每列最大值 = 该候选与库内最佳匹配，等价 similarity(k=1)
+            existing_max = np.full(Qq, -1.0)
+            if rowids:
+                existing_max = (mat @ Q.T).max(axis=0)  # 一次 N×D @ D×Q
+            # 批内去重：用整批相似度矩阵（一次 Q×Q）做「顺序接受」，
+            # 严格复刻逐条 add_point 的语义——只跟「已接受」的候选比，
+            # 而不是跟全部候选比（否则会把「靠近会被丢弃的候选」的条目误删）。
+            intra = Q @ Q.T if Qq > 1 else np.zeros((1, 1))
+            accept = existing_max < threshold
+            accepted_idx: list[int] = []
+            for j in range(Qq):
+                if not accept[j]:
+                    continue
+                # 与前面已接受的候选比（intra 对称，取 intra[j, i]）
+                m = -1.0
+                for i in accepted_idx:
+                    v = float(intra[j, i])
+                    if v > m:
+                        m = v
+                if m >= threshold:
+                    accept[j] = False
+                else:
+                    accepted_idx.append(j)
+        else:
+            accept = np.ones(Qq, dtype=bool)
+
+        c = conn()
+        accepted_ids: list[str] = []
+        accepted_claims: list[str] = []
+        accepted_vecs: list[list[float]] = []
+        with c:
+            for i, p in enumerate(keep):
+                if not accept[i]:
+                    continue
+                c.execute(
+                    "INSERT INTO knowledge(id,topic,claim,detail,source_url,source_title,source_kind,"
+                    "tags,confidence,embedding,session_id,book_id,created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (uuid.uuid4().hex[:16], _norm_topic(p.get("topic", "")), p["claim"],
+                     p.get("detail", ""), p.get("source_url", ""), p.get("source_title", ""),
+                     p.get("source_kind", "web"),
+                     json.dumps(list(p.get("tags") or []), ensure_ascii=False),
+                     max(0.1, min(1.0, float(p.get("confidence", 0.6)))),
+                     _to_blob(qvecs[i].tolist()), session_id, book_id, time.time()),
+                )
+                accepted_ids.append(int(c.execute("SELECT last_insert_rowid()").fetchone()[0]))
+                accepted_claims.append(p["claim"])
+                accepted_vecs.append(qvecs[i].tolist())
+        # 一次性提交后，把接受的向量增量追加进缓存（顺序与 rowid 一致）
+        for rid, v in zip(accepted_ids, accepted_vecs):
+            _append_vector(rid, v)
+
+    return {
+        "added": len(accepted_ids),
+        "dup": int((~accept).sum()),
+        "skipped": 0,
+        "accepted": accepted_claims,
+    }
+
+
 # --------------------------------------------------------------------------
 # 检索
 # --------------------------------------------------------------------------

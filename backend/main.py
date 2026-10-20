@@ -191,6 +191,23 @@ def api_knowledge_delete(pid: str) -> dict:
     return {"ok": True}
 
 
+# --------------------------------------------------------------------------
+# 学习分析（增强可视化用）
+# --------------------------------------------------------------------------
+@app.get("/api/analytics")
+def api_analytics() -> dict:
+    from . import analytics
+
+    return analytics.snapshot()
+
+
+@app.get("/api/analytics/search")
+def api_analytics_search(q: str = Query(...), k: int = 8) -> dict:
+    from . import analytics
+
+    return analytics.search_explain(q, k=min(max(1, int(k)), 30))
+
+
 @app.get("/api/knowledge/search")
 def api_knowledge_search(q: str = Query(...), k: int = 8) -> list[dict]:
     return memory.search(q, k=k)

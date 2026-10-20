@@ -887,6 +887,9 @@ def import_book(
     source_url = f"file:///{str(p).replace(chr(92), '/')}"
     # LLM 调用并发：实测提炼时 GPU 利用率只有 11%，串行等于让显卡空转。
     # 入库仍留在主线程串行，避免并发写库与去重锁互等。
+    # 收集所有候选，最后一次性批量入库（见 add_points_batch）：只做一次全库相似度
+    # 去重 + 一次事务提交，替代原来「每条一次矩阵乘 + 一次 commit」。
+    all_cands: list[dict] = []
     with ThreadPoolExecutor(max_workers=2) as ex:
         for data, b in ex.map(_extract, blocks):
             done_blocks += 1
@@ -923,29 +926,29 @@ def import_book(
                 vecs = []
 
             for i, (claim, detail, conf, tags) in enumerate(cands):
-                vec = vecs[i] if i < len(vecs) else None
-                try:
-                    # book_id 随 INSERT 一起写进去，省掉原来「插入后再 UPDATE 回填
-                    # + 每点一次 commit」的多余读写（一本 240 点就是 240 次）
-                    pid = memory.add_point(
-                        topic=topic,
-                        claim=claim,
-                        detail=detail,
-                        source_url=source_url,
-                        source_title=f"《{book['title']}》 {b['chapter'][:60]}",
-                        source_kind="book",
-                        tags=tags,
-                        confidence=conf,
-                        session_id="",
-                        book_id=book_id,
-                        vec=vec,
-                        dedup=True,
-                    )
-                    if pid:
-                        total_points += 1
-                        _emit(on_event, "learn", f"＋ {claim[:70]}")
-                except Exception as e:  # noqa: BLE001
-                    _emit(on_event, "warn", f"入库失败：{str(e)[:60]}")
+                all_cands.append({
+                    "topic": topic,
+                    "claim": claim,
+                    "detail": detail,
+                    "source_url": source_url,
+                    "source_title": f"《{book['title']}》 {b['chapter'][:60]}",
+                    "source_kind": "book",
+                    "tags": tags,
+                    "confidence": conf,
+                    "vec": vecs[i] if i < len(vecs) else None,
+                })
+
+    if all_cands:
+        try:
+            res = memory.add_points_batch(all_cands, book_id=book_id)
+            total_points = res["added"]
+            for claim in res["accepted"]:
+                _emit(on_event, "learn", f"＋ {claim[:70]}")
+            if res["dup"]:
+                _emit(on_event, "info",
+                      f"候选 {len(all_cands)} 条，新增 {res['added']} 条，重复跳过 {res['dup']} 条")
+        except Exception as e:  # noqa: BLE001
+            _emit(on_event, "warn", f"批量入库失败：{str(e)[:60]}")
 
     c.execute(
         "UPDATE books SET status='done', points_count=?, imported_at=? WHERE id=?",
@@ -1182,7 +1185,9 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
             return None
 
     min_rel = float(config.get("min_relevance", 0.45))
-    total = 0
+    # 收集所有候选，最后一次性批量入库（只做一次全库相似度 + 一次事务），
+    # 替代原来逐条 add_point（每条一次矩阵乘 + 一次 commit）。
+    all_cands: list[dict] = []
     with ThreadPoolExecutor(max_workers=2) as ex:
         for data in ex.map(_extract, blocks):
             if data is None:
@@ -1210,15 +1215,22 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
             except Exception:  # noqa: BLE001
                 vecs = []
             for i, (claim, detail, conf, tags) in enumerate(cands):
-                pid = memory.add_point(
-                    topic=topic, claim=claim, detail=detail,
-                    source_url=url, source_title=title,
-                    source_kind="web", tags=tags, confidence=conf,
-                    vec=vecs[i] if i < len(vecs) else None,
-                )
-                if pid:
-                    total += 1
-                    _emit(on_event, "learn", f"＋ {claim[:70]}")
+                all_cands.append({
+                    "topic": topic, "claim": claim, "detail": detail,
+                    "source_url": url, "source_title": title,
+                    "source_kind": "web", "tags": tags, "confidence": conf,
+                    "vec": vecs[i] if i < len(vecs) else None,
+                })
+
+    total = 0
+    if all_cands:
+        try:
+            res = memory.add_points_batch(all_cands)
+            total = res["added"]
+            for claim in res["accepted"]:
+                _emit(on_event, "learn", f"＋ {claim[:70]}")
+        except Exception as e:  # noqa: BLE001
+            _emit(on_event, "warn", f"批量入库失败：{str(e)[:60]}")
     _emit(on_event, "ok", f"链接导入完成：{title[:40]}，新增 {total} 条")
     return {"ok": True, "points": total, "title": title}
 
