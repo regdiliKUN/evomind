@@ -1663,7 +1663,9 @@ function svgGraph(graph) {
   let s = `<svg viewBox="0 0 ${W} ${H}">`;
   edges.forEach((e) => {
     const a = nodes[e.a], b = nodes[e.b];
-    s += `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="var(--accent)" stroke-width="${(0.4 + e.w * 4).toFixed(2)}" opacity="${(0.15 + e.w * 0.6).toFixed(2)}"/>`;
+    // 边色按相似度分档：越近越偏绿，弱连接用中性色，一眼看出哪些方向关联最紧
+    const ecol = e.w >= 0.6 ? "var(--green)" : e.w >= 0.45 ? "var(--accent)" : "var(--border-strong)";
+    s += `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="${ecol}" stroke-width="${(0.4 + e.w * 4).toFixed(2)}" opacity="${(0.18 + e.w * 0.55).toFixed(2)}"/>`;
   });
   nodes.forEach((n, i) => {
     const r = 5 + Math.sqrt(n.count / maxc) * 16;
@@ -1749,6 +1751,33 @@ function svgSearchGraph(data) {
   return s + `</svg>`;
 }
 
+function svgSessions(sd) {
+  const items = (sd && sd.sessions) || [];
+  if (!items.length)
+    return '<div class="empty">还没有学习记录——去「资源获取」启动一轮，这里会画出每次任务的产出</div>';
+  const W = 680, labW = 150, rowH = 46, padT = 10;
+  const maxP = Math.max(...items.map((s) => s.new_points), 1);
+  const H = padT * 2 + items.length * rowH;
+  const barX = labW, barMax = W - labW - 160;
+  const colOf = (st) =>
+    st === "done" ? "var(--green)" :
+    st === "stopped" ? "var(--orange, #e0a23b)" :
+    st === "error" ? "var(--red, #e0564f)" : "var(--accent)";
+  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  items.forEach((it, i) => {
+    const y = padT + i * rowH;
+    const cy = y + rowH / 2 - 6;
+    const w = Math.max(3, (it.new_points / maxP) * barMax);
+    const col = colOf(it.status);
+    const dir = (it.direction || "?").length > 16 ? it.direction.slice(0, 16) + "…" : it.direction;
+    s += `<text class="bar-label" x="6" y="${cy + 4}" style="font-weight:600">${esc(dir)}</text>`;
+    s += `<rect x="${barX}" y="${y + 6}" width="${w.toFixed(1)}" height="22" rx="5" fill="${col}" opacity="0.85">` +
+      `<title>新增 ${it.new_points} 条 · ${it.rounds} 轮 · 读 ${it.fetched} 篇 · 耗时 ${it.duration_s}s · 单轮 ${it.per_round} 条</title></rect>`;
+    s += `<text class="axis-text" x="${(barX + w + 8).toFixed(1)}" y="${cy + 4}">${it.new_points} 条 · ${it.rounds} 轮 · 单轮 ${it.per_round}</text>`;
+  });
+  return s + `</svg>`;
+}
+
 async function loadAnalytics() {
   let d;
   try {
@@ -1780,6 +1809,14 @@ async function loadAnalytics() {
   setHTML($("#an-conf"), svgHist(d.confidence));
   setHTML($("#an-source"), svgDonut(d.sources));
   setHTML($("#an-graph"), svgGraph(d.graph));
+  // 学习历程：每次任务的产出条形
+  setHTML($("#an-sessions"), svgSessions(d.sessions));
+  setHTML(
+    $("#an-sessions-sum"),
+    d.sessions && d.sessions.total_sessions
+      ? `${d.sessions.total_sessions} 次任务 · 共新增 ${d.sessions.total_points} 条 · 合计 ${d.sessions.total_rounds} 轮`
+      : ""
+  );
   // 检索性能卡片：命中率仪表 + 平均耗时迷你折线
   loadPerf();
 }

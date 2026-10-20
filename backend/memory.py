@@ -213,6 +213,7 @@ def _invalidate() -> None:
     global _vec_cache
     with _cache_lock:
         _vec_cache = None
+    _bump_topic_index()
 
 
 def _append_vector(rowid: int, vec: list[float]) -> None:
@@ -289,9 +290,48 @@ def _normalize(m: np.ndarray) -> np.ndarray:
     return m / n
 
 
+# --------------------------------------------------------------------------
+# 主题 → rowid 索引（加速 search(topic=...) 的过滤，去掉每调用一次的 DB 查询）
+# --------------------------------------------------------------------------
+# 原来的 search(topic=...) 每次都打 `SELECT rowid FROM knowledge WHERE topic=?`，
+# 再 `mat[indices]` 把整块向量矩阵复制一遍（又违背了第三轮「矩阵给 view 不复制」
+# 的初衷）。仪表盘轮询、分析视图、按方向问答都会高频触发主题过滤检索，
+# 这些 DB 往返 + 矩阵复制纯属重复开销。
+#
+# 这里把「主题 → 该主题下 rowid 集合」常驻内存，写路径变更时整体失效（懒重建）。
+# 过滤时直接拿内存里的集合生成布尔掩码，相似度在「整块 view」上算、用掩码
+# 排除非本主题行 —— 零额外 DB 往返、零矩阵复制。
+_topic_index: dict[str, set[int]] | None = None
+_topic_index_lock = threading.Lock()
+# 压测/对照用：置 True 时 search(topic=) 退回「每次 DB 查询 + 矩阵复制」的旧路径
+_DISABLE_TOPIC_INDEX = False
+
+
+def _topic_index_get(topic: str) -> set[int]:
+    """返回该主题下的 rowid 集合（内存索引，懒构建、写后失效）。
+
+    键用库里存的主题原值，查找也用调用方传入的原值，与旧实现
+    `WHERE topic=?` 的匹配语义逐行一致，保证检索结果零偏差。
+    """
+    global _topic_index
+    with _topic_index_lock:
+        if _topic_index is None:
+            _topic_index = {}
+            for r in conn().execute("SELECT rowid, topic FROM knowledge"):
+                _topic_index.setdefault(r["topic"], set()).add(r["rowid"])
+        return _topic_index.get(topic, set())
+
+
+def _bump_topic_index() -> None:
+    """知识库变更后让主题索引失效（rowid 集合已与库不一致）。"""
+    global _topic_index
+    with _topic_index_lock:
+        _topic_index = None
+
+
 def similarity(
     vec: list[float], rowids: list[int], mat: np.ndarray, *,
-    k: int = 20, normalized: bool = False,
+    k: int = 20, normalized: bool = False, allowed_mask: np.ndarray | None = None,
 ) -> list[tuple[int, float]]:
     if not rowids or k <= 0:
         return []
@@ -299,11 +339,29 @@ def similarity(
     if q.shape[1] != mat.shape[1] or not np.isfinite(q).all() or not np.any(q):
         return []
     sims = ((mat if normalized else _normalize(mat)) @ q.T).ravel()
-    count = min(k, len(rowids))
+    if allowed_mask is not None:
+        allowed_count = int(allowed_mask.sum())
+        if allowed_count == 0:
+            return []
+        # 非本主题行压到 -1e9，使其永远排不进 top-k；窗口上限取 k 与「允许行数」的较小值，
+        # 否则当 top-k 里混着大量非主题行时会被掩码剔掉、结果不足 k 条。
+        sims = sims.copy()
+        sims[~allowed_mask] = -1e9
+        count = min(k, allowed_count)
+    else:
+        count = min(k, len(rowids))
     # 只对命中的 k 条排序，避免每次给整个知识库排序。
     candidates = np.argpartition(-sims, count - 1)[:count]
     order = candidates[np.argsort(-sims[candidates], kind="stable")]
-    return [(rowids[i], float(sims[i])) for i in order]
+    out: list[tuple[int, float]] = []
+    for i in order:
+        # 防御性兜底：理论上 -1e9 已保证 top-k 全是允许行，这里不再剔除。
+        if allowed_mask is not None and not allowed_mask[i]:
+            continue
+        out.append((rowids[i], float(sims[i])))
+        if len(out) >= k:
+            break
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -429,8 +487,9 @@ def add_point(
             rowid = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
         # 增量追加，而不是把整份缓存作废（见 _append_vector）
         _append_vector(rowid, vec)
-        # 检索结果缓存已与库不一致，整体失效
+        # 检索结果缓存 / 主题索引已与库不一致，整体失效
         _bump_search_cache()
+        _bump_topic_index()
         return pid
 
 
@@ -567,8 +626,9 @@ def add_points_batch(
         # 一次性提交后，把接受的向量增量追加进缓存（顺序与 rowid 一致）
         for rid, v in zip(accepted_ids, accepted_vecs):
             _append_vector(rid, v)
-        # 检索结果缓存已与库不一致，整体失效
+        # 检索结果缓存 / 主题索引已与库不一致，整体失效
         _bump_search_cache()
+        _bump_topic_index()
 
     return {
         "added": len(accepted_ids),
@@ -606,11 +666,25 @@ def search(
     if not rowids:
         return []
     if topic:
-        allowed = {r[0] for r in conn().execute("SELECT rowid FROM knowledge WHERE topic=?", (topic,))}
-        indices = [i for i, rid in enumerate(rowids) if rid in allowed]
-        rowids = [rowids[i] for i in indices]
-        mat = mat[indices]
-    hits = similarity(vec, rowids, mat, k=k, normalized=True)
+        if _DISABLE_TOPIC_INDEX:
+            # 旧路径：每次打 DB 查询 + 整块矩阵复制（对照用，压测时启用）
+            allowed = {r[0] for r in conn().execute(
+                "SELECT rowid FROM knowledge WHERE topic=?", (topic,))}
+            indices = [i for i, rid in enumerate(rowids) if rid in allowed]
+            rowids = [rowids[i] for i in indices]
+            mat = mat[indices]
+            if not rowids:
+                return []
+            hits = similarity(vec, rowids, mat, k=k, normalized=True)
+        else:
+            # 新路径：内存主题索引 + 布尔掩码，零 DB 往返、零矩阵复制
+            allowed = _topic_index_get(topic)
+            if not allowed:
+                return []
+            mask = np.array([rid in allowed for rid in rowids], dtype=bool)
+            hits = similarity(vec, rowids, mat, k=k, normalized=True, allowed_mask=mask)
+    else:
+        hits = similarity(vec, rowids, mat, k=k, normalized=True)
     if not hits:
         return []
     top_ids = [rid for rid, _ in hits]

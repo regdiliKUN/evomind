@@ -116,6 +116,43 @@ def topic_graph(edge_min: float = 0.32) -> dict:
     return {"nodes": stats, "edges": edges}
 
 
+def session_timeline(limit: int = 20) -> dict:
+    """学习历程：把历次学习任务（sessions）整理成时间线，供「学习历程」卡片画条形。
+
+    每条会话给出：方向、轮次、新增点数、阅读篇数、耗时、单轮效率（点数/轮）。
+    这是 EvoMind「自主进化」闭环的直接可视化——看得见「它到底学了几轮、每轮产出多少」。
+    """
+    rows = memory.list_sessions(limit)
+    items = []
+    for r in rows:
+        started = r.get("started_at") or 0
+        ended = r.get("ended_at") or 0
+        dur = max(0.0, ended - started) if ended else 0.0
+        rounds = int(r.get("rounds") or 0)
+        pts = int(r.get("new_points") or 0)
+        items.append(
+            {
+                "id": r.get("id"),
+                "direction": r.get("direction", ""),
+                "status": r.get("status", ""),
+                "rounds": rounds,
+                "new_points": pts,
+                "fetched": int(r.get("fetched") or 0),
+                "duration_s": int(dur),
+                "per_round": round(pts / rounds, 2) if rounds > 0 else 0.0,
+                "started_at": started,
+            }
+        )
+    # 按开始时间升序：最早的学习会话在最左/最底，符合「历程」直觉
+    items.sort(key=lambda x: x["started_at"])
+    return {
+        "sessions": items,
+        "total_sessions": len(items),
+        "total_points": sum(x["new_points"] for x in items),
+        "total_rounds": sum(x["rounds"] for x in items),
+    }
+
+
 def search_explain(query: str, k: int = 8) -> dict:
     """检索命中可视化：返回 top-k 与每条的匹配度，以及查询本身的向量。
 
@@ -157,6 +194,7 @@ def snapshot(fresh: bool = False) -> dict:
         "confidence": confidence_hist(),
         "sources": source_breakdown(),
         "graph": topic_graph(),
+        "sessions": session_timeline(),
     }
     _SNAP_CACHE["val"] = val
     _SNAP_CACHE["ts"] = now
