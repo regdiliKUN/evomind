@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>EvoMind · 自进化学习引擎</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236c8cff'/><text x='16' y='23' font-size='18' font-family='sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'>E</text></svg>" />
-<link rel="stylesheet" href="/static/style.css?v=15" />
+<link rel="stylesheet" href="/static/style.css?v=16" />
 </head>
 <body>
 <div class="app">
@@ -363,6 +363,7 @@
             <input id="lib-excludes" placeholder="排除关键词（逗号分隔）" value="成人" style="max-width:200px" />
             <button class="btn" id="btn-lib-add">添加目录</button>
           </div>
+          <div class="dirsum" id="lib-dir-summary"></div>
           <div class="list" id="lib-dir-list"><div class="empty">还没有添加目录</div></div>
         </div>
 
@@ -407,6 +408,7 @@
               <button class="btn sm" id="btn-lib-selectn">选前 N 本</button>
             </div>
           </div>
+          <div class="lib-scope" id="lib-scope" style="display:none"></div>
           <div class="list scroll-y" id="lib-book-list"><div class="empty">还没有扫描到书目</div></div>
         </div>
       </section>
@@ -617,6 +619,6 @@
     <div class="pdrawer-body" id="pt-body"></div>
   </aside>
 
-<script src="/static/app.js?v=15"></script>
+<script src="/static/app.js?v=16"></script>
 </body>
 </html>

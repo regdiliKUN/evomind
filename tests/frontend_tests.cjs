@@ -57,7 +57,7 @@ function consoleApp(fetch) {
   });
   const source = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
   vm.runInContext(
-    source + "\nglobalThis.app = {state, loadKnowledge, refreshAll, loadAnalytics, renderMilestones, loadDashboard, appendDashEvent};",
+    source + "\nglobalThis.app = {state, loadKnowledge, refreshAll, loadAnalytics, renderMilestones, loadDashboard, appendDashEvent, renderLibDirs, renderLibDirSummary};",
     ctx
   );
   return { app: ctx.app, document, nodes, es: esRef.current };
@@ -295,4 +295,60 @@ test("SSE drop falls back to polling; reconnect replay never duplicates the feed
   es.onmessage({ data: JSON.stringify({ id: 1, level: "info", msg: "事件一", ts: 1 }) });
   const shown = (document.querySelector("#dash-stream").innerHTML.match(/事件一/g) || []).length;
   assert.equal(shown, 1, "重放历史不应在总览活动流里重复");
+});
+
+test("书库目录：完成度进度条、三种状态胶囊、总览引导", () => {
+  const { app, document } = consoleApp(async () => ({ ok: true, json: async () => [] }));
+  const dirs = [
+    { id: "d0", path: "/a", label: "全部导入", book_count: 10, imported_count: 10, excludes: [] },
+    { id: "d1", path: "/b", label: "还差三本", book_count: 10, imported_count: 7, excludes: [] },
+    { id: "d2", path: "/c", label: "空目录", book_count: 0, imported_count: 0, excludes: ["*.tmp"] },
+  ];
+  app.renderLibDirs(dirs);
+
+  const html = document.querySelector("#lib-dir-list").innerHTML;
+  // 进度宽度：100% / 70% / 0%
+  assert.match(html, /width:100%/, "已全部导入应为满进度");
+  assert.match(html, /width:70%/, "7/10 应为 70%");
+  assert.match(html, /width:0%/, "空目录应为 0%");
+  // 三种状态胶囊
+  assert.match(html, /已全部导入/);
+  assert.match(html, /待导入 3 本/);
+  assert.match(html, /未扫描/);
+  // 满进度用绿色，其余用琥珀
+  assert.match(html, /class="full"/);
+  // 排除规则仍然渲染出来
+  assert.match(html, /排除 \*\.tmp/);
+
+  // 总览：数量 + 总进度 + 引导（有未扫描目录时优先提示去扫描）
+  const sum = document.querySelector("#lib-dir-summary").innerHTML;
+  assert.match(sum, /3 个目录 · 20 本 · 已导入 17 本（85%）/);
+  assert.match(sum, /1 个目录还没扫描过/);
+});
+
+test("书库目录：下钻选中态与范围失效保护", () => {
+  const { app, document } = consoleApp(async () => ({ ok: true, json: async () => [] }));
+  const dirs = [
+    { id: "d0", path: "/a", label: "甲", book_count: 2, imported_count: 1, excludes: [] },
+    { id: "d1", path: "/b", label: "乙", book_count: 2, imported_count: 2, excludes: [] },
+  ];
+  app.state.libDir = "d1";
+  app.renderLibDirs(dirs);
+  assert.match(
+    document.querySelector("#lib-dir-list").innerHTML,
+    /lib-dir-row active[^>]*data-dir-open="d1"/,
+    "选中目录应有 active 标记"
+  );
+  assert.deepEqual(app.state.libDirs.map((d) => d.id), ["d0", "d1"]);
+
+  // 选中的目录被删掉后，下钻范围必须自动失效，否则会筛出一个空列表
+  app.renderLibDirs([dirs[0]]);
+  assert.equal(app.state.libDir, null, "选中目录消失后应清空下钻范围");
+});
+
+test("书库目录：无目录时给出添加引导而不是空白", () => {
+  const { app, document } = consoleApp(async () => ({ ok: true, json: async () => [] }));
+  app.renderLibDirs([]);
+  assert.match(document.querySelector("#lib-dir-summary").innerHTML, /添加一个书库目录/);
+  assert.match(document.querySelector("#lib-dir-list").innerHTML, /还没有添加目录/);
 });

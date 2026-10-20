@@ -608,3 +608,47 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 
 /* 总览「最近活动」实时徽标：绿=SSE 实时推送，琥珀=通道断开回退轮询 */
 #feed-live { transition: color .3s; }
+
+/* ---------------- 书库目录完成度（第十六轮） ---------------- */
+/* 目录总览一句话 + 总进度条：先给「还剩多少没导入」一个整体答案 */
+.dirsum { margin-bottom: 10px; }
+.dirsum .dirsum-line { font-size: 12.5px; color: var(--text-dim); margin-bottom: 6px; }
+.dirsum .dirsum-hint { font-size: 11.5px; color: var(--text-faint); margin-top: 6px; }
+
+/* 单目录进度条：细一点，不抢目录名的视觉重量 */
+.dirbar {
+  height: 5px; border-radius: 3px; background: #10161f;
+  border: 1px solid var(--border-soft); overflow: hidden; margin: 7px 0 5px;
+}
+.dirbar i {
+  display: block; height: 100%; background: var(--amber);
+  border-radius: 3px; transition: width .35s;
+}
+.dirbar i.full { background: var(--green); }
+
+/* 目录卡可点下钻：hover 给一点反馈，选中态用左侧描边标出来 */
+.lib-dir-row { cursor: pointer; transition: background .18s; }
+.lib-dir-row:hover { background: #10161f; }
+.lib-dir-row.active {
+  background: #10161f; box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* 状态小胶囊：未扫描/待导入=琥珀，全部导入=绿 */
+.chipmini {
+  font-size: 10.5px; padding: 1.5px 7px; border-radius: 999px;
+  border: 1px solid var(--border-soft); white-space: nowrap;
+}
+.chipmini.amber { color: var(--amber); border-color: rgba(229,192,123,.35); }
+.chipmini.green { color: var(--green); border-color: rgba(152,195,121,.35); }
+
+/* 书目区的「当前范围」提示条 */
+.lib-scope {
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 12px; margin-bottom: 8px;
+  background: #10161f; border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--accent); border-radius: 6px;
+  font-size: 12px;
+}
+.lib-scope .scope-chip { font-weight: 600; }
+.lib-scope .scope-n { color: var(--text-dim); }
+.lib-scope .btn { margin-left: auto; }

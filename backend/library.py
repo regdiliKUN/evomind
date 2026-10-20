@@ -105,7 +105,30 @@ CREATE INDEX IF NOT EXISTS idx_chapters_book ON book_chapters(book_id);
 """
 
 
+#: 建表建索引是「一次性」的事，但 init_db() 挂在 8 个读路径上，每次调用都会
+#: 重跑 7 条 DDL + 一条注定失败的 ALTER TABLE（靠抛异常来判断列已存在）+
+#: 一条 knowledge 建索引 + 一次 commit。列表/统计这类只读请求本该只付一次
+#: SELECT，却先付了九条语句的过路费。按库文件身份记「已建好」，之后只留
+#: 一条廉价的 SELECT 自检（库文件被换掉/删掉时表会消失，得能自动重建）。
+_INIT_DONE: dict = {"db": None}
+#: 压测/对照用：置 True 时 init_db() 退回「每次全量 DDL」的旧路径
+_DISABLE_INIT_GUARD = False
+#: 压测/对照用：置 True 时 list_dirs() 退回「每目录两条 COUNT」的 N+1 旧路径
+_DISABLE_DIRS_TALLY = False
+#: 说明：list_books() 的「COUNT + 分页」双跑曾试过用窗口函数
+#: COUNT(*) OVER () 合并成一趟，实测反而慢 3 倍多（窗口函数会强制物化
+#: 整个结果集再排序，把 ORDER BY ... LIMIT 的 top-N 优化废掉），故保留原样。
+
+
 def init_db() -> None:
+    global _INIT_DONE
+    db = str(config.DB_FILE)
+    if not _DISABLE_INIT_GUARD and _INIT_DONE["db"] == db:
+        try:
+            memory.conn().execute("SELECT 1 FROM library_dirs LIMIT 1")
+            return
+        except Exception:  # noqa: BLE001  库被换掉/删了，落到下面重建
+            _INIT_DONE["db"] = None
     c = memory.conn()
     c.executescript(SCHEMA)
     # knowledge 表补 book_id 列（老库升级用，失败说明已存在）
@@ -118,6 +141,7 @@ def init_db() -> None:
     except Exception:
         pass
     c.commit()
+    _INIT_DONE["db"] = db
 
 
 def recover_stale_states() -> dict:
@@ -209,6 +233,19 @@ def add_dir(path: str, label: str = "", excludes: list[str] | None = None) -> di
 def list_dirs() -> list[dict]:
     c = memory.conn()
     rows = c.execute("SELECT * FROM library_dirs ORDER BY created_at").fetchall()
+    # 原来每个目录都发两条 COUNT（总数 + 已导入数），30 个目录就是 61 条语句。
+    # 改成一条按 dir_id 聚合，再一次查表把结果贴回去：2 条语句搞定，且与目录数无关。
+    if _DISABLE_DIRS_TALLY:
+        tally = {}
+    else:
+        tally = {
+            r["dir_id"]: (r["n"], r["done"])
+            for r in c.execute(
+                "SELECT dir_id, COUNT(*) n,"
+                " SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) done"
+                " FROM books GROUP BY dir_id"
+            ).fetchall()
+        }
     out = []
     for r in rows:
         d = dict(r)
@@ -216,12 +253,17 @@ def list_dirs() -> list[dict]:
             d["excludes"] = json.loads(d.get("excludes") or "[]")
         except Exception:
             d["excludes"] = []
-        d["book_count"] = c.execute(
-            "SELECT COUNT(*) n FROM books WHERE dir_id=?", (d["id"],)
-        ).fetchone()["n"]
-        d["imported_count"] = c.execute(
-            "SELECT COUNT(*) n FROM books WHERE dir_id=? AND status='done'", (d["id"],)
-        ).fetchone()["n"]
+        if _DISABLE_DIRS_TALLY:
+            d["book_count"] = c.execute(
+                "SELECT COUNT(*) n FROM books WHERE dir_id=?", (d["id"],)
+            ).fetchone()["n"]
+            d["imported_count"] = c.execute(
+                "SELECT COUNT(*) n FROM books WHERE dir_id=? AND status='done'", (d["id"],)
+            ).fetchone()["n"]
+        else:
+            n, done = tally.get(d["id"], (0, 0))
+            d["book_count"] = n
+            d["imported_count"] = done
         out.append(d)
     return out
 

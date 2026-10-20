@@ -45,6 +45,8 @@ class IsolatedTest(unittest.TestCase):
         # 分析聚合按「写入版本号」缓存；每例换一个新库，必须清掉上一例的缓存，
         # 否则旧版本号会误命中（生产进程内库不会换，无需担心）
         analytics._reset_caches()
+        # 书库建表守卫按库文件身份记忆；每例换库后要让它重新建表
+        library._INIT_DONE["db"] = None
 
     def tearDown(self):
         for c in self.connections:
@@ -698,6 +700,112 @@ class TestStatsCache(IsolatedTest):
         cached = self._db_fields(memory.stats())
         self.assertEqual(recomputed, cached)
         self.assertEqual(cached["points"], 6)
+
+
+class TestLibraryReadPath(IsolatedTest):
+    """第十六轮：书库读路径去冗余。
+
+    init_db() 挂在 8 个读路径上却每次都重跑全套 DDL（还带一条靠抛异常
+    判断「列已存在」的 ALTER）；list_dirs() 每个目录两条 COUNT。
+    这两处都要在「变快」的同时保证结果一模一样，且换库后能自动重建表。
+    """
+
+    def _dirs(self, n=8, books_per_dir=5):
+        library.init_db()
+        c = memory.conn()
+        for d in range(n):
+            c.execute(
+                "INSERT OR REPLACE INTO library_dirs(id,path,label,enabled,excludes,created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (f"d{d}", f"/lib/{d}", f"目录{d}", 1, '["*.tmp"]' if d % 2 else "[]",
+                 time.time() - d * 60),
+            )
+            for b in range(books_per_dir):
+                c.execute(
+                    "INSERT OR REPLACE INTO books(id,path,title,format,size_bytes,chars,"
+                    "pages,status,points_count,dir_id,source_type,created_at,topic) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"b{d}_{b}", f"/lib/{d}/b{b}.pdf", f"书 {d}-{b}", "pdf",
+                     1000, 100, 10, "done" if b % 2 == 0 else "ready", b,
+                     f"d{d}", "dir", time.time() - b * 60, "t"),
+                )
+        c.commit()
+
+    def _sql_count(self, fn):
+        seen: list[str] = []
+        c = memory.conn()
+        c.set_trace_callback(lambda s: seen.append(s))
+        try:
+            fn()
+        finally:
+            c.set_trace_callback(None)
+        return len(seen)
+
+    def test_init_db_runs_ddl_only_once(self):
+        library.init_db()
+        first = self._sql_count(library.init_db)
+        second = self._sql_count(library.init_db)
+        self.assertEqual(second, 1, f"守卫失效，仍在重复 DDL：{second} 条")
+        self.assertLess(first, 10)  # 首轮允许建表，但不应膨胀
+
+    def test_init_db_guard_is_equivalent(self):
+        """守卫路径与全量 DDL 路径建出来的表结构必须一致。"""
+        library.init_db()
+        guarded = [r[1] for r in memory.conn().execute(
+            "SELECT * FROM library_dirs LIMIT 0").description]
+        library._INIT_DONE["db"] = None
+        library._DISABLE_INIT_GUARD = True
+        try:
+            memory.conn().executescript("DROP TABLE IF EXISTS books")
+            library.init_db()
+        finally:
+            library._DISABLE_INIT_GUARD = False
+        rebuilt = [r[1] for r in memory.conn().execute(
+            "SELECT * FROM library_dirs LIMIT 0").description]
+        self.assertEqual(guarded, rebuilt)
+
+    def test_init_db_rebuilds_when_db_replaced(self):
+        """库文件被换掉（表没了）时，守卫要能发现并重建，不能返回空壳。"""
+        library.init_db()
+        memory.conn().executescript("DROP TABLE library_dirs")
+        library.init_db()  # 不应抛异常
+        n = memory.conn().execute(
+            "SELECT COUNT(*) n FROM library_dirs").fetchone()["n"]
+        self.assertEqual(n, 0)
+
+    def test_list_dirs_matches_n_plus_one(self):
+        """聚合版与旧的每目录两条 COUNT 必须逐字段一致。"""
+        self._dirs(8, 5)
+        fast = library.list_dirs()
+        library._DISABLE_DIRS_TALLY = True
+        try:
+            slow = library.list_dirs()
+        finally:
+            library._DISABLE_DIRS_TALLY = False
+        self.assertEqual(fast, slow)
+        self.assertEqual(len(fast), 8)
+        self.assertEqual(sum(d["book_count"] for d in fast), 40)
+        self.assertEqual(sum(d["imported_count"] for d in fast), 8 * 3)
+        self.assertTrue(all(isinstance(d["excludes"], list) for d in fast))
+
+    def test_list_dirs_sql_is_constant(self):
+        """语句数不能随目录数增长（N+1 的判据）。"""
+        self._dirs(4, 2)
+        few = self._sql_count(library.list_dirs)
+        self._dirs(20, 2)
+        many = self._sql_count(library.list_dirs)
+        self.assertEqual(few, many, f"仍随目录数增长：{few} → {many}")
+        self.assertLessEqual(many, 2)
+
+    def test_books_count_still_correct(self):
+        """未改动的 list_books 双跑路径：总数与分页仍需正确（防回归）。"""
+        self._dirs(4, 5)
+        r = library.list_books(limit=3, offset=0)
+        self.assertEqual(r["total"], 20)
+        self.assertEqual(len(r["items"]), 3)
+        r2 = library.list_books(dir_id="d1", limit=100)
+        self.assertEqual(r2["total"], 5)
+        self.assertTrue(all(b["dir_id"] == "d1" for b in r2["items"]))
 
 
 if __name__ == "__main__":

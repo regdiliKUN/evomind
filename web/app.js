@@ -19,6 +19,9 @@ const state = {
   anVer: -1,
   dupVer: -1,
   pointId: null,
+  // 书库按目录下钻：null 表示「全部目录」。目录卡上的进度条点一下就筛到该目录，
+  // 让「哪个收藏夹还没导入」这件事一眼可见、一点可达。
+  libDir: null,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -1084,29 +1087,64 @@ async function loadLibrary() {
 
 function renderLibDirs(dirs) {
   const box = $("#lib-dir-list");
+  state.libDirs = dirs;
+  // 选中的目录如果被删掉了，下钻范围要一起失效，否则会筛出一个空列表
+  if (state.libDir && !dirs.some((d) => d.id === state.libDir)) state.libDir = null;
   if (!dirs.length) {
     box.innerHTML = '<div class="empty">还没有添加目录</div>';
+    renderLibDirSummary([]);
     return;
   }
   box.innerHTML = dirs
-    .map(
-      (d) => `<div class="row">
-        <div class="rowflex" style="justify-content:space-between">
-          <span style="font-size:13.5px;font-weight:600">${esc(d.label || d.path)}</span>
-          <div class="rowflex" style="gap:6px">
-            <span class="tagmini">${d.book_count} 个文件</span>
-            <button class="btn sm" data-dir-scan="${d.id}">扫描</button>
-            <button class="btn sm danger" data-dir-del="${d.id}">移除</button>
+    .map((d) => {
+      const total = d.book_count || 0;
+      const done = d.imported_count || 0;
+      const pct = total ? Math.round((done / total) * 100) : 0;
+      // 三种状态分开说：空目录要引导去扫描；有剩的要指出还差多少本
+      let chip, chipCls;
+      if (!total) {
+        chip = "未扫描";
+        chipCls = "amber";
+      } else if (done >= total) {
+        chip = "已全部导入";
+        chipCls = "green";
+      } else {
+        chip = `待导入 ${total - done} 本`;
+        chipCls = "amber";
+      }
+      const active = state.libDir === d.id;
+      return `<div class="row lib-dir-row${active ? " active" : ""}" data-dir-open="${esc(d.id)}">
+        <div class="rowflex" style="justify-content:space-between;gap:8px">
+          <span style="font-size:13.5px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(d.label || d.path)}</span>
+          <div class="rowflex" style="gap:6px;flex-shrink:0">
+            <span class="chipmini ${chipCls}">${chip}</span>
+            <button class="btn sm" data-dir-scan="${esc(d.id)}">扫描</button>
+            <button class="btn sm danger" data-dir-del="${esc(d.id)}">移除</button>
           </div>
+        </div>
+        <div class="dirbar" title="${done} / ${total} 本已导入">
+          <i style="width:${pct}%" class="${pct >= 100 ? "full" : ""}"></i>
         </div>
         <div class="meta">
           <span class="mono" style="font-size:11px">${esc(d.path)}</span>
+          <span>${done} / ${total} 本 · ${pct}%</span>
           ${(d.excludes || []).length ? `<span class="tagmini">排除 ${esc(d.excludes.join("、"))}</span>` : ""}
-          <span>已导入 ${d.imported_count} 本</span>
         </div>
-      </div>`
-    )
+      </div>`;
+    })
     .join("");
+  renderLibDirSummary(dirs);
+
+  // 点目录行 = 下钻到该目录的书目（再点一次取消）
+  $$("#lib-dir-list [data-dir-open]").forEach((row) =>
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return; // 扫描/移除按钮不触发下钻
+      const id = row.dataset.dirOpen;
+      state.libDir = state.libDir === id ? null : id;
+      renderLibDirs(dirs);
+      loadLibBooks();
+    })
+  );
 
   $$("#lib-dir-list [data-dir-scan]").forEach((b) =>
     b.addEventListener("click", () => doScan(b.dataset.dirScan))
@@ -1119,6 +1157,30 @@ function renderLibDirs(dirs) {
       loadLibrary();
     })
   );
+}
+
+/** 目录总览：把「多少目录 / 多少本 / 导入到哪一步」压成一句话 + 一条总进度。 */
+function renderLibDirSummary(dirs) {
+  const box = $("#lib-dir-summary");
+  if (!box) return;
+  const books = dirs.reduce((a, d) => a + (d.book_count || 0), 0);
+  const done = dirs.reduce((a, d) => a + (d.imported_count || 0), 0);
+  const empty = dirs.filter((d) => !(d.book_count || 0)).length;
+  if (!dirs.length) {
+    box.innerHTML =
+      '<span class="empty" style="padding:0">添加一个书库目录，点「扫描」就能发现里面的书。</span>';
+    return;
+  }
+  const pct = books ? Math.round((done / books) * 100) : 0;
+  const hint = empty
+    ? `${empty} 个目录还没扫描过，点它的「扫描」按钮开始`
+    : done < books
+      ? `还有 ${books - done} 本没导入，点目录卡筛出来批量导入`
+      : "所有目录都已导入完成";
+  box.innerHTML =
+    `<div class="dirsum-line">${dirs.length} 个目录 · ${books} 本 · 已导入 ${done} 本（${pct}%）</div>` +
+    `<div class="dirbar"><i style="width:${pct}%" class="${pct >= 100 ? "full" : ""}"></i></div>` +
+    `<div class="dirsum-hint">${esc(hint)}</div>`;
 }
 
 async function loadLibBooks() {
@@ -1134,11 +1196,39 @@ async function loadLibBooks() {
   const params = new URLSearchParams({ limit: "1000" });
   if (status) params.set("status", status);
   if (q) params.set("q", q);
+  if (state.libDir) params.set("dir_id", state.libDir);
   try {
     const r = await api("/api/library/books?" + params);
     renderLibBooks(r.items, r.total);
+    renderLibScope(r.total);
   } catch (e) {
     toast("书目加载失败：" + e.message, "err");
+  }
+}
+
+/** 书目区顶部的「当前范围」提示条：让用户随时知道自己看的是哪个目录的子集。 */
+function renderLibScope(total) {
+  const bar = $("#lib-scope");
+  if (!bar) return;
+  if (!state.libDir) {
+    bar.style.display = "none";
+    bar.innerHTML = "";
+    return;
+  }
+  const d = (state.libDirs || []).find((x) => x.id === state.libDir);
+  const label = d ? d.label || d.path : state.libDir;
+  bar.style.display = "";
+  bar.innerHTML =
+    `<span class="scope-chip">只看：${esc(label)}</span>` +
+    `<span class="scope-n">${total} 本</span>` +
+    `<button class="btn sm" id="lib-scope-clear">显示全部目录</button>`;
+  const clr = $("#lib-scope-clear");
+  if (clr) {
+    clr.addEventListener("click", () => {
+      state.libDir = null;
+      renderLibDirs(state.libDirs || []);
+      loadLibBooks();
+    });
   }
 }
 
