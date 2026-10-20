@@ -5,12 +5,21 @@ import re
 from typing import Any
 
 from bs4 import BeautifulSoup
+from lxml import html as lxml_html
 
 from . import config, httpc
 
 Doc = dict[str, Any]
 
 MAX_CHARS = 60000
+
+#: HTML→文本解析路径开关（仅用于基准 A/B）。True = 旧 BS4 包装路径，
+#: False = 纯 lxml 路径（默认）。两者共用同一个 libxml2 解析器，输出字节一致。
+_USE_BS4 = False
+
+#: 纯文本提取时整棵跳过的标签（与 BS4 get_text 的默认行为对齐：
+#: 不返回 script/style/template 内的文本，也不返回注释）。
+_SKIP_TEXT_TAGS = frozenset({"script", "style", "template", "noscript"})
 
 
 def _headers() -> dict[str, str]:
@@ -64,11 +73,44 @@ def _github_readme(url: str) -> str:
 def _html_to_text(html: str) -> str:
     if not html:
         return ""
+    if _USE_BS4:
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            return _clean(soup.get_text("\n", strip=True))
+        except Exception:
+            return _clean(re.sub(r"<[^>]+>", " ", html))
+    # 纯 lxml 路径：BS4 只是 libxml2 外面的一层 Python 包装，包装本身要慢
+    # 一倍以上。这里直接走 lxml.html，按文档序遍历文本节点，
+    # 跳过 script/style/template/noscript 子树与注释——与 BS4 get_text
+    # 的默认行为逐字节对齐（两者共用同一个 libxml2 解析器，树结构相同）。
     try:
-        soup = BeautifulSoup(html, "lxml")
-        return _clean(soup.get_text("\n", strip=True))
+        doc = lxml_html.fromstring(html)
     except Exception:
         return _clean(re.sub(r"<[^>]+>", " ", html))
+    # 文档序遍历：每个元素先输出 el.text，再递归子节点，最后输出 el.tail
+    # （tail 属于父级流，被跳过的 script/style/注释的 tail 同样要输出）。
+    parts: list[str] = []
+    stack: list[tuple[str, Any]] = [("node", doc)]
+    while stack:
+        kind, payload = stack.pop()
+        if kind == "text":
+            parts.append(payload)
+            continue
+        el = payload
+        if el.tail:
+            t = el.tail.strip()
+            if t:
+                stack.append(("text", t))
+        # el.tag 非 str 即注释/PI：BS4 get_text 不含其文本（无 .text 概念）
+        if not isinstance(el.tag, str) or el.tag in _SKIP_TEXT_TAGS:
+            continue
+        for child in reversed(el):
+            stack.append(("node", child))
+        if el.text:
+            t = el.text.strip()
+            if t:
+                stack.append(("text", t))
+    return _clean("\n".join(parts))
 
 
 def _stackexchange_fetch(url: str) -> Doc | None:

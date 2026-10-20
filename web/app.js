@@ -1783,23 +1783,201 @@ function svgGraph(graph) {
     });
   }
   const maxc = Math.max(...nodes.map((n) => n.count), 1);
-  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  let s = `<svg viewBox="0 0 ${W} ${H}" class="graph-svg">`;
   edges.forEach((e) => {
     const a = nodes[e.a], b = nodes[e.b];
     // 边色按相似度分档：越近越偏绿，弱连接用中性色，一眼看出哪些方向关联最紧
     const ecol = e.w >= 0.6 ? "var(--green)" : e.w >= 0.45 ? "var(--accent)" : "var(--border-strong)";
-    s += `<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="${ecol}" stroke-width="${(0.4 + e.w * 4).toFixed(2)}" opacity="${(0.18 + e.w * 0.55).toFixed(2)}"/>`;
+    s += `<line class="gedge" data-a="${e.a}" data-b="${e.b}" x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="${ecol}" stroke-width="${(0.4 + e.w * 4).toFixed(2)}" opacity="${(0.18 + e.w * 0.55).toFixed(2)}"/>`;
   });
   nodes.forEach((n, i) => {
     const r = 5 + Math.sqrt(n.count / maxc) * 16;
     const col = AN_PALETTE[i % AN_PALETTE.length];
-    s += `<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${col}" opacity="0.82" stroke="#0a0f16" stroke-width="1.5"><title>${esc(n.label)}: ${n.count}</title></circle>`;
+    s += `<g class="gnode" data-i="${i}"><circle class="gdot" cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${col}" opacity="0.82" stroke="#0a0f16" stroke-width="1.5"><title>${esc(n.label)}: ${n.count} 条知识点</title></circle>`;
     if (N <= 14 || r > 11) {
       const lab = n.label.length > 10 ? n.label.slice(0, 10) + "…" : n.label;
       s += `<text class="node-label" x="${n.x.toFixed(1)}" y="${(n.y + r + 11).toFixed(1)}" text-anchor="middle">${esc(lab)}</text>`;
     }
+    s += `</g>`;
   });
   return s + `</svg>`;
+}
+
+/* 主题语义网络：装配 + 交互（拖拽 / 悬停高亮 / 点击展开该方向知识点）。
+
+svgGraph 仍是纯渲染（可单测）；这里负责注入后绑定指针事件。
+空库时给一段引导，指回「自主进化」——而不是丢一句「暂无数据」。
+*/
+let _graphSeq = 0;
+async function mountGraph(graph) {
+  const box = $("#an-graph");
+  const detail = $("#an-graph-detail");
+  if (!box) return;
+  const mySeq = ++_graphSeq;
+  if (!graph || !graph.nodes || !graph.nodes.length) {
+    setHTML(box, `<div class="empty" style="text-align:left;line-height:1.8;padding:6px 2px">
+      <div style="font-weight:600;margin-bottom:4px">知识网络需要至少两个学习方向</div>
+      <div>去「自主进化」定一个具体的方向开始学习；学到两三个方向后回来，这里会显示它们之间的知识关联——连线越粗，两个方向的知识点越接近。</div>
+      <button class="btn primary sm" data-goto="learn" style="margin-top:10px">去定方向</button>
+    </div>`);
+    const btn = box.querySelector("[data-goto]");
+    if (btn) btn.addEventListener("click", () => switchView(btn.dataset.goto));
+    if (detail) setHTML(detail, "");
+    return;
+  }
+  setHTML(box, svgGraph(graph));
+  if (detail) setHTML(detail, "悬停一个方向看它的关联，点一下看这个方向最近学到的知识");
+  bindGraphInteractions(box, graph, mySeq, detail);
+}
+
+function bindGraphInteractions(box, graph, mySeq, detail) {
+  const svg = box.querySelector("svg.graph-svg");
+  if (!svg) return;
+  const nodes = Array.from(svg.querySelectorAll("g.gnode"));
+  const edges = Array.from(svg.querySelectorAll("line.gedge"));
+  const N = nodes.length;
+  const adj = Array.from({ length: N }, () => new Set());
+  edges.forEach((el) => {
+    const a = +el.dataset.a, b = +el.dataset.b;
+    if (a < N && b < N) {
+      adj[a].add(b);
+      adj[b].add(a);
+    }
+  });
+
+  // 邻居集合 → 高亮：命中的一圈满不透明，其余淡出
+  function highlight(i) {
+    const keep = i == null ? null : new Set([i, ...adj[i]]);
+    nodes.forEach((g, j) => {
+      const on = keep == null || keep.has(j);
+      g.style.opacity = on ? "1" : "0.14";
+    });
+    edges.forEach((el) => {
+      const a = +el.dataset.a, b = +el.dataset.b;
+      const on = keep == null || (i != null && (a === i || b === i));
+      el.style.opacity = on ? "0.95" : "0.05";
+    });
+  }
+
+  function toLocal(evt) {
+    const pt = svg.createSVGPoint();
+    pt.x = evt.clientX;
+    pt.y = evt.clientY;
+    const m = svg.getScreenCTM();
+    return m ? pt.matrixTransform(m.inverse()) : { x: 0, y: 0 };
+  }
+
+  // 拖拽某个节点时，同步更新它和所有关联边的端点
+  function moveNode(i, x, y) {
+    const g = nodes[i];
+    const dot = g.querySelector("circle.gdot");
+    const label = g.querySelector("text.node-label");
+    const r = dot ? +dot.getAttribute("r") : 8;
+    if (dot) {
+      dot.setAttribute("cx", x.toFixed(1));
+      dot.setAttribute("cy", y.toFixed(1));
+    }
+    if (label) {
+      label.setAttribute("x", x.toFixed(1));
+      label.setAttribute("y", (y + r + 11).toFixed(1));
+    }
+    edges.forEach((el) => {
+      const a = +el.dataset.a, b = +el.dataset.b;
+      if (a === i) {
+        el.setAttribute("x1", x.toFixed(1));
+        el.setAttribute("y1", y.toFixed(1));
+      } else if (b === i) {
+        el.setAttribute("x2", x.toFixed(1));
+        el.setAttribute("y2", y.toFixed(1));
+      }
+    });
+  }
+
+  nodes.forEach((g, i) => {
+    const dot = g.querySelector("circle.gdot");
+    if (!dot) return;
+    dot.style.cursor = "pointer";
+    let sx = 0, sy = 0, moved = 0, dragging = false;
+    dot.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      dragging = true;
+      moved = 0;
+      const p = toLocal(e);
+      sx = p.x;
+      sy = p.y;
+      dot.setPointerCapture(e.pointerId);
+      highlight(i);
+    });
+    dot.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      const p = toLocal(e);
+      const dx = p.x - sx, dy = p.y - sy;
+      moved = Math.max(moved, Math.hypot(dx, dy));
+      const cx = +dot.getAttribute("cx"), cy = +dot.getAttribute("cy");
+      moveNode(i, cx + dx, cy + dy);
+      sx = p.x;
+      sy = p.y;
+    });
+    dot.addEventListener("pointerup", (e) => {
+      if (!dragging) return;
+      dragging = false;
+      dot.releasePointerCapture(e.pointerId);
+      if (moved < 4) showTopic(i); // 位移很小才算点击
+    });
+    dot.addEventListener("pointercancel", () => {
+      dragging = false;
+      highlight(null);
+    });
+    g.addEventListener("mouseenter", () => {
+      if (detail && mySeq === _graphSeq) {
+        const nb = [...adj[i]];
+        const t = g.querySelector("title");
+        const label = t ? t.textContent.split(":")[0] : `方向 ${i + 1}`;
+        setHTML(
+          detail,
+          nb.length
+            ? `${esc(label)}：与 ${nb.map((j) => esc(graph.nodes[j].topic)).join("、")} 关联`
+            : `${esc(label)}：暂无关联方向（学得越深，连线越多）`
+        );
+      }
+      highlight(i);
+    });
+    g.addEventListener("mouseleave", () => highlight(null));
+  });
+
+  // 点击节点：拉该方向最近的知识点，就地展开
+  async function showTopic(i) {
+    if (!detail || mySeq !== _graphSeq) return;
+    const topic = graph.nodes[i].topic;
+    setHTML(detail, `正在加载「${esc(topic)}」的知识点…`);
+    let data;
+    try {
+      data = await api(`/api/knowledge?topic=${encodeURIComponent(topic)}&limit=8`);
+    } catch (e) {
+      setHTML(detail, `加载失败：${esc(e.message || "网络错误")}`);
+      return;
+    }
+    if (mySeq !== _graphSeq) return; // 已被新一轮渲染取代
+    const items = (data && data.items) || [];
+    if (!items.length) {
+      setHTML(detail, `「${esc(topic)}」还没有知识点`);
+      return;
+    }
+    const rows = items
+      .map(
+        (p) =>
+          `<div style="display:flex;gap:8px;align-items:baseline;padding:2px 0">
+            <span style="color:var(--accent);flex:0 0 auto">·</span>
+            <span style="flex:1">${esc((p.claim || "").slice(0, 60))}</span>
+            <span class="dim" style="flex:0 0 auto;font-size:11px">${p.confidence ? p.confidence.toFixed(2) : ""}</span>
+          </div>`
+      )
+      .join("");
+    setHTML(
+      detail,
+      `<div style="font-weight:600;margin:2px 0 4px">「${esc(topic)}」最近 ${items.length} 条</div>${rows}`
+    );
+  }
 }
 
 function svgGauge(rate, label) {
@@ -2009,7 +2187,7 @@ async function loadAnalytics() {
   setHTML($("#an-topics"), htmlTopicBars(d.topics));
   setHTML($("#an-conf"), svgHist(d.confidence));
   setHTML($("#an-source"), svgDonut(d.sources));
-  setHTML($("#an-graph"), svgGraph(d.graph));
+  mountGraph(d.graph);
   // 学习历程：每次任务的产出条形
   setHTML($("#an-sessions"), svgSessions(d.sessions));
   setHTML(
