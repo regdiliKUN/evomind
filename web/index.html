@@ -597,6 +597,30 @@
             <button class="btn primary" id="btn-save-cfg" style="margin-top:6px">保存设置</button>
           </div>
         </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">数据备份与恢复<span class="tag">一键导出</span></div>
+          <div class="field-row" style="grid-template-columns:1fr auto;align-items:end">
+            <label class="field"><span>备份备注（可选，如「升级前」）</span><input id="bak-label" placeholder="留空则只按时间命名" /></label>
+            <button class="btn primary" id="btn-bak-export">一键备份</button>
+          </div>
+          <div class="hint" style="margin-top:-4px">
+            把整个知识库（<code>knowledge.db</code>：知识点 / 书 / 章节 / OCR 结果）连同当前配置打成一个 zip，
+            存在 <code>data/backups/</code>，最多保留最近 <span id="bak-keep">10</span> 份。
+            下载后另存到别处（移动硬盘 / 网盘），新机器或新实例都能用它恢复。
+          </div>
+          <div class="sep"></div>
+          <div id="bak-list"><div class="empty">还没有备份。点上面的「一键备份」即可生成第一份。</div></div>
+          <div class="sep"></div>
+          <div class="field-row" style="grid-template-columns:1fr auto;align-items:end">
+            <label class="field"><span>从备份文件恢复（.zip）</span><input id="bak-file" type="file" accept=".zip" /></label>
+            <button class="btn danger" id="btn-bak-restore">恢复</button>
+          </div>
+          <div class="hint" style="margin-top:-4px">
+            恢复会用备份里的知识库<b>覆盖当前知识库</b>；当前库会先自动另存一份（备注 pre-restore）再替换，全程可回退。
+            学习 / 导入 / OCR / 持续自学进行中会被拒绝，请先停止。
+          </div>
+        </div>
       </section>
     </div>
   </main>

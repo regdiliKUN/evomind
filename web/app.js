@@ -90,7 +90,7 @@ function switchView(v, fromHash) {
   if (v === "resources") loadResources();
   if (v === "finetune") loadFinetune();
   if (v === "dashboard") { loadDashboard(null, true); refreshSuggestions(true); refreshHealth(true); }
-  if (v === "settings") fillSettings();
+  if (v === "settings") { fillSettings(); loadBackups(); }
   if (v === "learn") loadAuto();
   if (pid) openPoint(decodeURIComponent(pid));
 }
@@ -3371,6 +3371,127 @@ async function runSearchExplain() {
 $("#btn-an-search")?.addEventListener("click", runSearchExplain);
 $("#an-q")?.addEventListener("keydown", (e) => {
   if (e.key === "Enter") runSearchExplain();
+});
+
+/* ---------------- 数据备份 / 恢复 ---------------- */
+const fmtSize = (b) => {
+  b = Number(b) || 0;
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return (i === 0 ? b.toFixed(0) : b.toFixed(1)) + " " + u[i];
+};
+
+async function loadBackups() {
+  const box = $("#bak-list");
+  if (!box) return;
+  try {
+    const d = await api("/api/backups");
+    if ($("#bak-keep")) $("#bak-keep").textContent = d.keep;
+    paintBackups(d.items || []);
+  } catch (e) {
+    box.innerHTML = '<div class="empty">读取备份列表失败：' + esc(e.message) + "</div>";
+  }
+}
+
+function paintBackups(items) {
+  const box = $("#bak-list");
+  if (!box) return;
+  if (!items.length) {
+    box.innerHTML = '<div class="empty">还没有备份。点上面的「一键备份」即可生成第一份。</div>';
+    return;
+  }
+  box.innerHTML = items
+    .map((b) => {
+      const t = b.created_iso
+        ? esc(b.created_iso.replace("T", " "))
+        : esc(new Date(b.created_at * 1000).toLocaleString());
+      const c = b.counts || {};
+      const meta = [
+        fmtSize(b.size),
+        "知识点 " + (c.knowledge ?? "—"),
+        "书 " + (c.books ?? "—"),
+        "OCR " + (c.ocr_pages ?? "—"),
+      ].join(" · ");
+      const tag = b.label ? `<span class="tag">${esc(b.label)}</span> ` : "";
+      return `<div class="bak-row">
+        <div class="bak-info">
+          <div class="bak-name">${tag}${esc(b.name)}</div>
+          <div class="bak-meta">${t} · ${esc(meta)}</div>
+        </div>
+        <a class="btn sm" href="/api/backups/download/${encodeURIComponent(b.name)}" download="${esc(b.name)}">下载</a>
+        <button class="btn sm danger" data-bak-del="${esc(b.name)}">删除</button>
+      </div>`;
+    })
+    .join("");
+}
+
+$("#btn-bak-export")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const label = ($("#bak-label").value || "").trim();
+  btn.disabled = true;
+  btn.textContent = "打包中…";
+  try {
+    const r = await api("/api/backups/export", { method: "POST", body: { label } });
+    toast(`已备份 ${r.name}（${fmtSize(r.size)}）`, "ok");
+    $("#bak-label").value = "";
+    loadBackups();
+  } catch (err) {
+    toast("备份失败：" + err.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "一键备份";
+  }
+});
+
+$("#btn-bak-restore")?.addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  const file = $("#bak-file").files && $("#bak-file").files[0];
+  if (!file) {
+    toast("先选择一个备份 zip 文件");
+    return;
+  }
+  if (
+    !confirm(
+      `确定用「${file.name}」覆盖当前知识库吗？\n\n当前库会先自动另存一份（备注 pre-restore）再替换。`
+    )
+  )
+    return;
+  btn.disabled = true;
+  btn.textContent = "恢复中…";
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("confirm", "true");
+    const r = await fetch("/api/backups/restore", { method: "POST", body: fd });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || "HTTP " + r.status);
+    toast(
+      `恢复完成：知识点 ${d.counts?.knowledge ?? "—"} 条 · 书 ${d.counts?.books ?? "—"} 本（旧库已存为 ${d.pre_backup}）`,
+      "ok"
+    );
+    $("#bak-file").value = "";
+    loadBackups();
+  } catch (err) {
+    toast("恢复失败：" + err.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "恢复";
+  }
+});
+
+/* 删除备份（事件委托，列表是动态渲染的） */
+document.addEventListener("click", (e) => {
+  const del = e.target.closest("[data-bak-del]");
+  if (!del) return;
+  const name = del.dataset.bakDel;
+  if (!confirm(`确定删除备份 ${name} 吗？`)) return;
+  api("/api/backups/" + encodeURIComponent(name), { method: "DELETE" })
+    .then(() => {
+      toast("已删除 " + name, "ok");
+      loadBackups();
+    })
+    .catch((err) => toast("删除失败：" + err.message, "err"));
 });
 
 /* ---------------- 轮询 ---------------- */

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import queue
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -12,7 +14,7 @@ from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, downloader, evolve, finetune, library, llm, memory, ocr, scheduler
+from . import backup, config, downloader, evolve, finetune, library, llm, memory, ocr, scheduler
 
 app = FastAPI(title="EvoMind", version="1.0.0")
 
@@ -391,6 +393,72 @@ def api_ft_export(body: dict = Body(...)) -> dict:
         body.get("merged_dir", ""),
         on_event=lambda lv, m, p: evolve.bus.publish({"level": lv, "msg": m, **p}),
     )
+
+
+# --------------------------------------------------------------------------
+# 数据备份 / 恢复
+# --------------------------------------------------------------------------
+@app.get("/api/backups")
+def api_backups() -> dict:
+    return {"items": backup.list_backups(), "keep": backup.KEEP_LATEST}
+
+
+@app.post("/api/backups/export")
+def api_backup_export(body: dict = Body(default={})) -> dict:
+    label = ((body or {}).get("label") or "").strip()
+    try:
+        return backup.export_backup(label)
+    except FileNotFoundError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"备份失败：{e}") from e
+
+
+@app.get("/api/backups/download/{name}")
+def api_backup_download(name: str) -> FileResponse:
+    try:
+        p = backup.backup_path(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    if not p.exists():
+        raise HTTPException(404, "备份不存在")
+    return FileResponse(p, filename=name, media_type="application/zip")
+
+
+@app.delete("/api/backups/{name}")
+def api_backup_delete(name: str) -> dict:
+    try:
+        backup.delete_backup(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e)) from e
+    return {"ok": True}
+
+
+@app.post("/api/backups/restore")
+async def api_backup_restore(
+    file: UploadFile = File(...), confirm: bool = Body(False)
+) -> dict:
+    # 先落临时文件再走校验，不把几十上百 MB 的 zip 读进内存
+    staging = Path(tempfile.mkdtemp(prefix="evomind-restore-upload-",
+                                   dir=str(config.DATA)))
+    try:
+        src = staging / "upload.zip"
+        with open(src, "wb") as f:
+            shutil.copyfileobj(file.file, f, length=1024 * 1024)
+        if not src.stat().st_size:
+            raise HTTPException(400, "上传的文件是空的")
+        try:
+            return backup.restore_backup(src, confirm=confirm)
+        except FileNotFoundError as e:
+            raise HTTPException(400, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------

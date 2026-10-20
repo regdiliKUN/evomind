@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import traceback
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -634,6 +635,149 @@ def test_perf():
 
 
 # ==========================================================================
+# 7. 备份 / 恢复（临时目录 + 临时库，不碰用户数据）
+# ==========================================================================
+def test_backup():
+    from backend import backup, config
+
+    tmp = Path(tempfile.mkdtemp(prefix="evo_bak_"))
+    try:
+        kdir = tmp / "knowledge"
+        kdir.mkdir(parents=True, exist_ok=True)
+        db = kdir / "knowledge.db"
+
+        def make_db(n_points: int, tag: str) -> None:
+            """造一个只含最小表结构的测试库。"""
+            c = sqlite3.connect(str(db))
+            c.executescript(
+                "CREATE TABLE IF NOT EXISTS knowledge(id TEXT PRIMARY KEY, topic TEXT, claim TEXT);"
+                "CREATE TABLE IF NOT EXISTS books(id TEXT PRIMARY KEY, title TEXT);"
+                "CREATE TABLE IF NOT EXISTS book_chapters(id INTEGER PRIMARY KEY, book_id TEXT);"
+                "CREATE TABLE IF NOT EXISTS ocr_pages(id INTEGER PRIMARY KEY, book_id TEXT);"
+            )
+            c.execute("DELETE FROM knowledge")
+            for i in range(n_points):
+                c.execute("INSERT INTO knowledge VALUES(?,?,?)",
+                          (f"{tag}-{i}", "t", f"{tag} 备份测试知识点第 {i} 条内容"))
+            c.commit()
+            c.close()
+
+        with patch.multiple(config, DATA=tmp, KNOWLEDGE=kdir, DB_FILE=db,
+                            CONFIG_FILE=tmp / "config.json", _cache=None):
+            make_db(5, "a")
+
+            def initially_empty():
+                assert backup.list_backups() == [], "初始应为空"
+                return "空目录返回空列表"
+
+            def export_creates_zip():
+                r = backup.export_backup("测试标签")
+                p = backup.backup_path(r["name"])
+                assert p.exists() and p.stat().st_size == r["size"]
+                with zipfile.ZipFile(p) as zf:
+                    names = set(zf.namelist())
+                need = {backup.DB_MEMBER, backup.CONFIG_MEMBER,
+                        backup.MANIFEST_MEMBER, backup.README_MEMBER}
+                assert need <= names, f"缺少成员：{need - names}"
+                assert backup.DB_MEMBER + "-wal" not in names, "快照不应带 -wal 边车"
+                assert r["counts"]["knowledge"] == 5, r["counts"]
+                return r["name"]
+
+            def list_reads_manifest():
+                items = backup.list_backups()
+                assert items and items[0]["label"] == "测试标签", items
+                assert items[0]["counts"]["knowledge"] == 5, items[0]["counts"]
+                assert items[0]["size"] > 0
+                return f"{len(items)} 份"
+
+            def bad_names_rejected():
+                for bad in ("../knowledge.db", "knowledge.db", "x.zip", "", ".."):
+                    try:
+                        backup.backup_path(bad)
+                    except ValueError:
+                        continue
+                    raise AssertionError(f"非法名没被拒：{bad!r}")
+                return "路径逃逸已拦截"
+
+            def validate_ok():
+                items = backup.list_backups()
+                info = backup.validate_backup(backup.backup_path(items[0]["name"]))
+                assert info["counts"]["knowledge"] == 5, info["counts"]
+                assert info["size"] > 0
+                return "快照完整"
+
+            def restore_needs_confirm():
+                items = backup.list_backups()
+                # 让异常自然抛出：case(expect_error=True) 会把它记为「已优雅拒绝」
+                backup.restore_backup(backup.backup_path(items[0]["name"]), confirm=False)
+                raise AssertionError("未确认竟然恢复了")
+
+            def restore_refused_when_busy():
+                items = backup.list_backups()
+                with patch.object(backup, "busy_reason", return_value="测试占用"):
+                    backup.restore_backup(backup.backup_path(items[0]["name"]), confirm=True)
+                raise AssertionError("有任务在跑竟然恢复了")
+
+            def restore_swaps_data():
+                items = backup.list_backups()
+                src = backup.backup_path(items[0]["name"])
+                make_db(3, "b")  # 当前库改成 3 条
+                r = backup.restore_backup(src, confirm=True)
+                assert r["counts"]["knowledge"] == 5, r["counts"]
+                c = sqlite3.connect(str(db))
+                n = c.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
+                c.close()
+                assert n == 5, f"恢复后应为 5 条，实际 {n}"
+                # 当前库被替换前自动留了兜底
+                assert backup.backup_path(r["pre_backup"]).exists(), "缺少 pre-restore 兜底"
+                assert r["pre_backup"].endswith("pre-restore.zip"), r["pre_backup"]
+                return f"已恢复 5 条，兜底 {r['pre_backup']}"
+
+            def reject_broken_zip():
+                bad = tmp / "broken.zip"
+                with zipfile.ZipFile(bad, "w") as zf:
+                    zf.writestr("just-a-note.txt", "不是备份")
+                backup.validate_backup(bad)  # 应抛 ValueError
+                raise AssertionError("坏 zip 竟然通过了校验")
+
+            def prune_keeps_latest():
+                with patch.object(backup, "KEEP_LATEST", 2):
+                    for i in range(4):
+                        backup.export_backup(f"p{i}")
+                names = [x["name"] for x in backup.list_backups()]
+                assert len(names) == 2, f"应保留 2 份，实际 {len(names)}：{names}"
+                return f"保留 {len(names)} 份"
+
+            def delete_backup():
+                items = backup.list_backups()
+                backup.delete_backup(items[0]["name"])
+                left = backup.list_backups()
+                assert all(x["name"] != items[0]["name"] for x in left)
+                return f"剩余 {len(left)} 份"
+
+            def delete_twice_404():
+                items = backup.list_backups()
+                backup.delete_backup(items[0]["name"])
+                backup.delete_backup(items[0]["name"])  # 应抛 FileNotFoundError
+                raise AssertionError("重复删除没报错")
+
+            case("备份", "初始列表为空", initially_empty)
+            case("备份", "导出生成完整 zip", export_creates_zip)
+            case("备份", "列表读回清单信息", list_reads_manifest)
+            case("备份", "非法文件名被拒", bad_names_rejected)
+            case("备份", "备份校验通过", validate_ok)
+            case("备份", "未确认拒绝恢复", restore_needs_confirm, expect_error=True)
+            case("备份", "任务占用拒绝恢复", restore_refused_when_busy, expect_error=True)
+            case("备份", "恢复覆盖并留兜底", restore_swaps_data)
+            case("备份", "坏 zip 被拒", reject_broken_zip, expect_error=True)
+            case("备份", "超量自动裁剪", prune_keeps_latest)
+            case("备份", "删除备份", delete_backup)
+            case("备份", "重复删除报错", delete_twice_404, expect_error=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ==========================================================================
 # 主流程
 # ==========================================================================
 def _run_suite() -> int:
@@ -647,6 +791,7 @@ def _run_suite() -> int:
         ("检索/OCR 纯函数", test_search_pure),
         ("书库", test_library),
         ("下载", test_downloader),
+        ("备份", test_backup),
         ("网络", test_network),
         ("性能", test_perf),
     ]
