@@ -1252,7 +1252,9 @@ function renderLibBooks(items, total) {
     .map((b) => {
       const [txt, color] = BOOK_STATUS[b.status] || [b.status, "var(--text-dim)"];
       // skipped（扫描版）也要能选：全选后可以批量 OCR
-      const canPick = ["pending", "ready", "skipped"].includes(b.status);
+      // done 也放开勾选：导入中途被打断的书恢复成 done 后，得能继续导入；
+      // 重新导入有语义去重兜底，不会堆重复知识点
+      const canPick = ["pending", "ready", "skipped", "done"].includes(b.status);
       const size = b.size_bytes
         ? (b.size_bytes / 1024 / 1024).toFixed(1) + "MB"
         : "";
@@ -2838,10 +2840,14 @@ function drawGraph(w, h, graph) {
     );
     if (!box) return;
     placed.push({ ...box, w: tw, h: th });
-    labels.push({ i, x: box.x + tw / 2, y: box.y + th - 4, text: raw });
+    labels.push({ i, x: box.x + tw / 2, y: box.y + th - 4, bx: box.x, by: box.y, tw, th, text: raw });
   });
+  /* 标签衬底：原来用 3px 深色描边（paint-order:stroke）当衬底，可 10.5px 的
+     中文字形笔画只有 1px 左右，描边有一半压在字形内侧，字被糊成一片。
+     改成深色底板 + 浅色字：小字号也清清楚楚，还不挑背景。 */
   labels.forEach((l) => {
-    s += `<text class="node-label" data-i="${l.i}" x="${l.x.toFixed(1)}" y="${l.y.toFixed(1)}" text-anchor="middle" style="paint-order:stroke;stroke:#080b11;stroke-width:3px;stroke-linejoin:round">${esc(l.text)}</text>`;
+    s += `<rect class="node-label-bg" data-i="${l.i}" x="${l.bx.toFixed(1)}" y="${l.by.toFixed(1)}" width="${l.tw.toFixed(1)}" height="${l.th}" rx="4"/>`;
+    s += `<text class="node-label" data-i="${l.i}" x="${l.x.toFixed(1)}" y="${l.y.toFixed(1)}" text-anchor="middle">${esc(l.text)}</text>`;
   });
   return s + `</svg>`;
 }
@@ -2922,9 +2928,15 @@ function bindGraphInteractions(box, graph, mySeq, detail) {
     // 标签已经拆成独立元素（为了做避让），按 data-i 找回来跟着走
     const svg = g.ownerSVGElement;
     const lab = svg && svg.querySelector(`text.node-label[data-i="${i}"]`);
+    const labBg = svg && svg.querySelector(`rect.node-label-bg[data-i="${i}"]`);
     if (lab) {
       lab.setAttribute("x", x.toFixed(1));
       lab.setAttribute("y", (y + (+dot.getAttribute("r")) + 14).toFixed(1));
+    }
+    if (labBg) {
+      const bw = +labBg.getAttribute("width") || 0;
+      labBg.setAttribute("x", (x - bw / 2).toFixed(1));
+      labBg.setAttribute("y", (y + (+dot.getAttribute("r")) + 4).toFixed(1));
     }
     edges.forEach((el) => {
       const a = +el.dataset.a, b = +el.dataset.b;

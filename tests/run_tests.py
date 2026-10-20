@@ -472,9 +472,47 @@ def test_library():
             r = library.recover_stale_states()
             assert r["importing"] >= 1, f"没识别出僵尸状态：{r}"
             d = library.book_detail(b["id"])
-            # 已经解析出正文的应回到 ready（可重新导入），而不是永远卡住
-            assert d["status"] == "ready", f"恢复后状态应为 ready，实际 {d['status']}"
-            return f"恢复 {r['importing']} 本 → {d['status']}"
+            n_pts = d.get("points_count") or 0
+            # --fast 下没跑过导入（0 条知识）→ ready；完整模式下导入过 → done
+            expect = "done" if n_pts > 0 else "ready"
+            assert d["status"] == expect, f"恢复后应为 {expect}，实际 {d['status']}"
+            return f"恢复 {r['importing']} 本 → {d['status']}（{n_pts} 条知识）"
+
+        def recover_interrupted_with_points():
+            # 中断前已提炼出知识点：必须恢复成 done，否则「已导入」显示 0，
+            # 用户会以为书都白导入了（6952 条书来源知识点其实都在）
+            b = [x for x in library.list_books(dir_id=did, limit=50)["items"]
+                 if x["title"] == "正常书"][0]
+            c = memory.conn()
+            c.execute("DELETE FROM knowledge WHERE book_id=?", (b["id"],))
+            c.execute(
+                "INSERT INTO knowledge(id,topic,claim,book_id) VALUES(?,?,?,?)",
+                (f"__resume_{b['id'][:8]}", "恢复测试", "这是一条用于测试中断恢复的知识点内容", b["id"]),
+            )
+            c.execute("UPDATE books SET status='importing', points_count=0 WHERE id=?",
+                      (b["id"],))
+            c.commit()
+            r = library.recover_stale_states()
+            d = library.book_detail(b["id"])
+            assert d["status"] == "done", f"应恢复为 done，实际 {d['status']}"
+            assert d["points_count"] == 1, f"points_count 应回填 1，实际 {d['points_count']}"
+            assert r.get("resumed_done", 0) >= 1, f"应报告 resumed_done：{r}"
+            return f"done + {d['points_count']} 条"
+
+        def reparse_keeps_done():
+            # 已导入的书重新解析只刷新正文，不能把 done 打回 ready
+            b = [x for x in library.list_books(dir_id=did, limit=50)["items"]
+                 if x["title"] == "正常书"][0]
+            c = memory.conn()
+            c.execute("UPDATE books SET status='done', points_count=3 WHERE id=?",
+                      (b["id"],))
+            c.commit()
+            r = library.parse_book(b["id"])
+            assert r["ok"], r
+            d = library.book_detail(b["id"])
+            assert d["status"] == "done", f"重新解析后应仍为 done，实际 {d['status']}"
+            assert d["chars"] > 0, "重新解析后正文字数应刷新"
+            return f"{d['status']}（{d['chars']} 字）"
 
         case("书库", "添加目录", add_dir)
         did = holder.get("id", "")
@@ -496,6 +534,8 @@ def test_library():
         case("书库", "GBK 编码回退", encoding_fallback)
         case("书库", "删除书目", delete_book)
         case("书库", "导入中断状态恢复", recover_interrupted_import)
+        case("书库", "中断已有点恢复为已导入", recover_interrupted_with_points)
+        case("书库", "重新解析不降级已导入", reparse_keeps_done)
     finally:
         # 清掉测试产生的书目记录与目录配置
         try:

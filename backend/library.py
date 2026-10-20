@@ -152,8 +152,9 @@ def recover_stale_states() -> dict:
     提供勾选框，于是它既不能继续也不能重来，用户只能去手改数据库。
 
     启动时没有任务在跑，此时仍处于 importing / parsing 的一定是孤儿：
-      - 已经解析出正文的 → ready（可重新导入，语义去重会挡住重复条目）
-      - 从没解析过的     → pending
+      - 中断前已经提炼出知识点的 → done（事实上的部分导入，「已导入」要算它）
+      - 解析出正文但没提炼的     → ready（可重新导入，语义去重会挡住重复条目）
+      - 从没解析过的             → pending
     """
     if _task["running"]:
         return {"importing": 0, "parsing": 0}
@@ -169,11 +170,22 @@ def recover_stale_states() -> dict:
             " ELSE 'pending' END WHERE status='importing'"
         )
         # 中断前已入库的条目按 book_id 回填，否则界面显示「0 条知识」
+        resumed_done = 0
         for bid in stale:
             n = c.execute(
                 "SELECT COUNT(*) n FROM knowledge WHERE book_id=?", (bid,)
             ).fetchone()["n"]
             c.execute("UPDATE books SET points_count=? WHERE id=?", (n, bid))
+            if n > 0:
+                # 中断前已经提炼出知识点：这本书事实上已导入（至少部分），
+                # 恢复成 done，「已导入 / 目录完成度」才包含它；想补剩下的
+                # 章节可以在书库重新导入（语义去重会挡住重复条目）。
+                c.execute(
+                    "UPDATE books SET status='done', imported_at=?"
+                    " WHERE id=? AND status!='done'",
+                    (time.time(), bid),
+                )
+                resumed_done += 1
 
     n_par = c.execute(
         "UPDATE books SET status='pending' WHERE status='parsing'"
@@ -181,11 +193,11 @@ def recover_stale_states() -> dict:
     c.commit()
 
     if stale:
-        memory.log_event(
-            "warn",
-            f"上次退出时有 {len(stale)} 本书停在导入中，已恢复为可重新导入",
-        )
-    return {"importing": len(stale), "parsing": n_par}
+        msg = f"上次退出时有 {len(stale)} 本书停在导入中，已恢复为可重新导入"
+        if resumed_done:
+            msg += f"；其中 {resumed_done} 本中断前已提炼出知识点，恢复为已导入"
+        memory.log_event("warn", msg)
+    return {"importing": len(stale), "parsing": n_par, "resumed_done": resumed_done}
 
 
 def _emit(on_event: Event | None, level: str, msg: str, **payload) -> None:
@@ -751,15 +763,20 @@ def parse_book(book_id: str, on_event: Event | None = None) -> dict:
         return {"ok": False, "msg": str(e)}
 
     if res.get("unsupported"):
-        c.execute("UPDATE books SET status='skipped', skip_reason=? WHERE id=?",
-                  (res["unsupported"], book_id))
+        c.execute(
+            "UPDATE books SET status=CASE WHEN COALESCE(points_count,0)>0"
+            " THEN 'done' ELSE 'skipped' END, skip_reason=? WHERE id=?",
+            (res["unsupported"], book_id),
+        )
         c.commit()
         return {"ok": False, "msg": res["unsupported"]}
 
     if res.get("scanned"):
         reason = f"扫描版 PDF（{res['text_ratio']} 字/页），无文字层，需 OCR"
         c.execute(
-            "UPDATE books SET status='skipped', skip_reason=?, pages=?, chars=?, text_ratio=? WHERE id=?",
+            "UPDATE books SET status=CASE WHEN COALESCE(points_count,0)>0"
+            " THEN 'done' ELSE 'skipped' END,"
+            " skip_reason=?, pages=?, chars=?, text_ratio=? WHERE id=?",
             (reason, res["pages"], res["chars"], res["text_ratio"], book_id),
         )
         c.commit()
@@ -767,8 +784,11 @@ def parse_book(book_id: str, on_event: Event | None = None) -> dict:
 
     text = res["text"].strip()
     if len(text) < 200:
-        c.execute("UPDATE books SET status='skipped', skip_reason='提取到的正文过少' WHERE id=?",
-                  (book_id,))
+        c.execute(
+            "UPDATE books SET status=CASE WHEN COALESCE(points_count,0)>0"
+            " THEN 'done' ELSE 'skipped' END, skip_reason='提取到的正文过少' WHERE id=?",
+            (book_id,),
+        )
         c.commit()
         return {"ok": False, "msg": "提取到的正文过少"}
 
@@ -783,8 +803,12 @@ def parse_book(book_id: str, on_event: Event | None = None) -> dict:
             (book_id, i, ch["title"][:120], len(ch["text"])),
         )
     title = res.get("title") or book["title"] or p.stem
+    # 已经提炼出知识点的书，重新解析只是刷新正文——不能把 done 打回 ready，
+    # 否则「已导入」计数会莫名归零（导入中途被杀后恢复就走这条路径）。
     c.execute(
-        "UPDATE books SET status='ready', title=?, chars=?, pages=?, text_ratio=? WHERE id=?",
+        "UPDATE books SET status=CASE WHEN COALESCE(points_count,0)>0"
+        " THEN 'done' ELSE 'ready' END,"
+        " title=?, chars=?, pages=?, text_ratio=? WHERE id=?",
         (title, len(text), res.get("pages", 0), res.get("text_ratio", 0), book_id),
     )
     c.commit()
