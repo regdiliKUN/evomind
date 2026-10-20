@@ -172,6 +172,10 @@ def update(patch: dict[str, Any]) -> dict[str, Any]:
         cfg = load()
         cfg.update(clean)
         save(cfg)
+        # 代理 / ollama_url / UA 可能已变：共享 HTTP 客户端拿着旧设置，重建之
+        from . import httpc
+
+        httpc.reset()
         return dict(_cache)
 
 

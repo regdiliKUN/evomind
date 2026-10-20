@@ -314,6 +314,52 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 .toast.err { border-left-color: var(--red); }
 @keyframes toastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 
+/* ---------------- 新手上路引导浮层 ---------------- */
+.modal-mask {
+  position: fixed; inset: 0; z-index: 120;
+  background: rgba(4, 7, 12, 0.72); backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center;
+  animation: fadeIn .2s ease;
+}
+.modal-mask[hidden] { display: none; }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+.modal {
+  width: min(520px, calc(100vw - 40px));
+  background: linear-gradient(180deg, var(--panel), #0d131c);
+  border: 1px solid var(--border); border-radius: 14px;
+  padding: 22px 24px 20px; box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6);
+  animation: modalIn .25s cubic-bezier(.2, .9, .3, 1.2);
+}
+@keyframes modalIn { from { opacity: 0; transform: translateY(14px) scale(.97); } to { opacity: 1; transform: none; } }
+.modal-head { display: flex; gap: 13px; align-items: center; margin-bottom: 18px; }
+.modal-title { font-size: 15.5px; font-weight: 700; }
+.ob-step { min-height: 132px; }
+.ob-ico {
+  width: 40px; height: 40px; border-radius: 11px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 19px; background: var(--accent-soft); color: #8fb6ff;
+  border: 1px solid rgba(77, 141, 255, 0.25);
+}
+.ob-title { font-size: 14px; font-weight: 650; margin-bottom: 5px; }
+.ob-desc { font-size: 12.6px; color: var(--text-dim); line-height: 1.75; }
+.ob-action { margin-top: 12px; }
+.ob-dots { display: flex; gap: 7px; justify-content: center; margin-top: 18px; }
+.ob-dots i {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--border);
+  transition: all .25s ease; cursor: pointer;
+}
+.ob-dots i.on { background: var(--accent); width: 20px; border-radius: 4px; }
+.pill-btn {
+  cursor: pointer; font-family: inherit; width: 100%; text-align: left;
+  color: var(--text-faint); transition: color .15s ease;
+}
+.pill-btn:hover { color: var(--text); background: #141c28; }
+/* 下一步建议的级别色点 */
+.ns-level { width: 8px; height: 8px; border-radius: 50%; flex: none; margin-top: 6px; }
+.ns-level.act { background: var(--accent); box-shadow: 0 0 7px var(--accent); }
+.ns-level.warn { background: var(--orange, #e0a23b); box-shadow: 0 0 7px var(--orange, #e0a23b); }
+.ns-level.info { background: var(--text-faint); }
+
 .hint { font-size: 11.8px; color: var(--text-faint); line-height: 1.65; margin-top: 8px; }
 .sep { height: 1px; background: var(--border-soft); margin: 16px 0; }
 .rowflex { display: flex; align-items: center; gap: 10px; }

@@ -11,6 +11,7 @@ const state = {
   chatBusy: false,
   knowledgeQuery: "",
   knowledgeRequest: 0,
+  suggestions: null,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -75,13 +76,34 @@ function switchView(v, fromHash) {
   if (v === "library") loadLibrary();
   if (v === "resources") loadResources();
   if (v === "finetune") loadFinetune();
-  if (v === "dashboard") loadDashboard(null, true);
+  if (v === "dashboard") { loadDashboard(null, true); refreshSuggestions(true); }
   if (v === "settings") fillSettings();
   if (v === "learn") loadAuto();
 }
 
 $$(".nav-item").forEach((n) => n.addEventListener("click", () => switchView(n.dataset.view)));
 window.addEventListener("hashchange", () => switchView(location.hash.slice(1), true));
+
+/* 引导浮层：按钮接线 + 首次自动弹出 + 侧栏手动入口 */
+$("#ob-next").addEventListener("click", () => {
+  if (obStep >= OB_STEPS.length - 1) {
+    closeOnboarding();
+    return;
+  }
+  obStep += 1;
+  renderOnboarding();
+});
+$("#ob-prev").addEventListener("click", () => {
+  if (obStep > 0) {
+    obStep -= 1;
+    renderOnboarding();
+  }
+});
+$("#ob-skip").addEventListener("click", closeOnboarding);
+$("#btn-guide").addEventListener("click", openOnboarding);
+$("#onboarding").addEventListener("click", (e) => {
+  if (e.target === $("#onboarding")) closeOnboarding(); // 点遮罩关闭
+});
 
 /* ---------------- 事件流 ---------------- */
 const STAGE_TEXT = {
@@ -248,43 +270,144 @@ async function syncDashEvents(force) {
   dashEvtId = fresh[fresh.length - 1].id || dashEvtId;
 }
 
-function renderNextSteps(st) {
+/* 本地启发式兜底：后端 /api/analytics/suggestions 拉不到时，
+   至少按规模给出和以前一致的引导（弱于后端版：看不到久未学/薄弱方向等）。 */
+function localNextSteps(st) {
   const s = st.stats;
   const items = [];
-  const add = (icon, title, desc, view, btn) =>
-    items.push({ icon, title, desc, view, btn });
+  const add = (level, icon, title, desc, view, btn) =>
+    items.push({ level, icon, title, detail: desc, view, btn });
 
-  // 规模提醒放最前面：这是性能问题，比「继续学」更该先处理
   if (s.scale_warn) {
-    add("!", "知识库规模提醒", s.scale_warn, "knowledge", "去整理");
+    add("warn", "!", "知识库规模提醒", s.scale_warn, "knowledge", "去整理");
   }
 
   if (s.points === 0) {
-    add("◐", "先让它学一个方向", "去「自主进化」填一个具体方向，点开始。3 轮约 10 分钟就有第一批知识。", "learn", "去学习");
+    add("act", "◐", "先让它学一个方向", "去「自主进化」填一个具体方向，点开始。3 轮约 10 分钟就有第一批知识。", "learn", "去学习");
   } else if (s.points < 30) {
-    add("◑", "知识还比较薄", `目前 ${s.points} 条，建议再跑几轮加深，或换个角度补盲区。`, "learn", "继续学");
+    add("act", "◑", "知识还比较薄", `目前 ${s.points} 条，建议再跑几轮加深，或换个角度补盲区。`, "learn", "继续学");
   } else if (s.points < 120) {
-    add("◕", "可以检验一下学得怎么样", "去「检验所学」问几个真问题。答不上来的地方，就是下一步该补的方向。", "chat", "去提问");
+    add("act", "◕", "可以检验一下学得怎么样", "去「检验所学」问几个真问题。答不上来的地方，就是下一步该补的方向。", "chat", "去提问");
   } else {
-    add("●", "素材够了，可以试试权重进化", `已积累 ${s.points} 条知识。去「权重进化」把它们压进模型参数，得到真正「学会」的版本。`, "finetune", "去微调");
+    add("act", "●", "素材够了，可以试试权重进化", `已积累 ${s.points} 条知识。去「权重进化」把它们压进模型参数，得到真正「学会」的版本。`, "finetune", "去微调");
   }
 
   if (!st.finetune.ready) {
-    add("⚙", "微调环境还没装", "想用权重层进化，需要先装 PyTorch 等依赖（约 3GB，装一次）。", "finetune", "去安装");
+    add("info", "⚙", "微调环境还没装", "想用权重层进化，需要先装 PyTorch 等依赖（约 3GB，装一次）。", "finetune", "去安装");
   }
   if (s.resources === 0 && st.config.auto_download) {
-    add("⤓", "还没有自主下载过资源", "学习时它会自动扫描对口的模型和数据集，预算内自己下。也可以手动指定。", "resources", "看看");
+    add("info", "⤓", "还没有自主下载过资源", "学习时它会自动扫描对口的模型和数据集，预算内自己下。也可以手动指定。", "resources", "看看");
   }
-  add("✎", "随时可以问它", "它只用学过的知识回答并标出处，不会拿模型记忆糊弄你。", "chat", "去问");
+  add("info", "✎", "随时可以问它", "它只用学过的知识回答并标出处，不会拿模型记忆糊弄你。", "chat", "去问");
+  return items.slice(0, 3);
+}
+
+/* ---------------- 学习建议（引导） ---------------- */
+let lastSuggFetch = 0;
+async function refreshSuggestions(force = false) {
+  // 建议按知识库现状生成，没必要 6 秒刷一次；30 秒 + 切回总览时刷新足够
+  const now = Date.now();
+  if (!force && now - lastSuggFetch < 30000) return;
+  lastSuggFetch = now;
+  try {
+    const d = await api("/api/analytics/suggestions");
+    state.suggestions = (d && d.items) || [];
+    if (state.view === "dashboard" && state.status) renderNextSteps(state.status);
+  } catch (_) {}
+}
+
+/* ---------------- 新手上路引导 ---------------- */
+const OB_STEPS = [
+  {
+    icon: "◐",
+    title: "第一步 · 定一个具体方向",
+    desc: "方向越具体，学得越深。「光固化 3D 打印的收缩补偿模型」就比「3D 打印」好得多。去「自主进化」填好方向，预设里也有现成的可以点。",
+    action: { view: "learn", btn: "去填方向" },
+  },
+  {
+    icon: "▶",
+    title: "第二步 · 开始进化学习",
+    desc: "点「开始进化学习」。每一轮它都会自己诊断缺口 → 多源检索 → 阅读 → 提炼入库，约 2-4 分钟。选 3 轮快速摸底，十分钟后总览就有数据了。",
+    action: { view: "learn", btn: "去开始" },
+  },
+  {
+    icon: "❖",
+    title: "第三步 · 看它学得怎么样",
+    desc: "「分析」页有增长曲线、方向分布、可信度直方图、学习活跃度热力图和主题语义网络；「检验所学」可以拿真问题考它——答不上来的地方就是下一步该补的。",
+    action: { view: "analytics", btn: "去看分析" },
+  },
+];
+let obStep = 0;
+const OB_KEY = "evomind.onboarded.v1";
+
+function renderOnboarding() {
+  const s = OB_STEPS[obStep];
+  setHTML(
+    $("#ob-step"),
+    `<div style="display:flex;gap:14px;align-items:flex-start">
+      <div class="ob-ico">${s.icon}</div>
+      <div style="flex:1">
+        <div class="ob-title">${esc(s.title)}</div>
+        <div class="ob-desc">${esc(s.desc)}</div>
+        <div class="ob-action"><button class="btn sm" data-ob-action="${s.action.view}">${esc(s.action.btn)} →</button></div>
+      </div>
+    </div>`
+  );
+  setHTML(
+    $("#ob-dots"),
+    OB_STEPS.map((_, i) => `<i class="${i === obStep ? "on" : ""}" data-ob-dot="${i}"></i>`).join("")
+  );
+  $$("#ob-step [data-ob-action]").forEach((b) =>
+    b.addEventListener("click", () => {
+      closeOnboarding();
+      switchView(b.dataset.obAction);
+    })
+  );
+  $$("#ob-dots [data-ob-dot]").forEach((d) =>
+    d.addEventListener("click", () => {
+      obStep = Number(d.dataset.obDot);
+      renderOnboarding();
+    })
+  );
+  $("#ob-prev").disabled = obStep === 0;
+  $("#ob-next").textContent = obStep === OB_STEPS.length - 1 ? "开始使用" : "下一步";
+}
+
+function openOnboarding() {
+  obStep = 0;
+  renderOnboarding();
+  $("#onboarding").hidden = false;
+}
+
+function closeOnboarding() {
+  try { localStorage.setItem(OB_KEY, "1"); } catch (_) {}
+  $("#onboarding").hidden = true;
+}
+
+function maybeShowOnboarding() {
+  try {
+    if (localStorage.getItem(OB_KEY)) return;
+  } catch (_) {}
+  // 总览数据到位后再弹，避免一上来挡着 loading
+  setTimeout(openOnboarding, 600);
+}
+
+function renderNextSteps(st) {
+  // 后端建议（数据驱动：久未学/薄弱方向/低可信度/信源单一/规模引导）优先，
+  // 拉取失败才退回本地启发式
+  const items =
+    state.suggestions && state.suggestions.length
+      ? state.suggestions
+      : localNextSteps(st);
 
   const html = items
     .slice(0, 3)
     .map(
-      (i) => `<div class="row" style="display:flex;gap:14px;align-items:flex-start">
-        <div style="font-size:19px;opacity:.65;line-height:1.3">${i.icon}</div>
+      (i) => `<div class="row" style="display:flex;gap:12px;align-items:flex-start">
+        <span class="ns-level ${i.level || "info"}" title="${i.level === "act" ? "建议行动" : i.level === "warn" ? "需要留意" : "提示"}"></span>
         <div style="flex:1">
           <div style="font-size:13.8px;font-weight:600">${esc(i.title)}</div>
-          <div class="detail" style="margin-top:4px">${esc(i.desc)}</div>
+          <div class="detail" style="margin-top:4px">${esc(i.detail || i.desc || "")}</div>
         </div>
         <button class="btn sm" data-goto="${i.view}">${esc(i.btn)}</button>
       </div>`
@@ -1968,6 +2091,7 @@ async function refreshAll() {
     const st = await api("/api/status");
     state.status = st;
     paintTopbar(st);
+    await refreshSuggestions();
     if (state.view === "dashboard") await loadDashboard(st);
     if (state.view === "knowledge") await loadKnowledge();
     if (state.view === "analytics") loadAnalytics();
@@ -1978,3 +2102,4 @@ async function refreshAll() {
 connectSSE();
 switchView(location.hash.slice(1) || "dashboard", true);
 setInterval(refreshAll, 6000);
+maybeShowOnboarding();

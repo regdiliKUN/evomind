@@ -4,10 +4,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import httpx
 from bs4 import BeautifulSoup
 
-from . import config
+from . import config, httpc
 
 Doc = dict[str, Any]
 
@@ -22,13 +21,13 @@ def _headers() -> dict[str, str]:
     }
 
 
-def _client(timeout: float | None = None) -> httpx.Client:
-    return httpx.Client(
-        timeout=httpx.Timeout(timeout or config.get("request_timeout", 20), connect=10.0),
+def _client(timeout: float | None = None) -> "httpc.Borrowed":
+    """共享客户端（连接池复用，见 httpc）。退出 `with` 不会关闭它；超时按请求覆盖。"""
+    return httpc.borrow_client(
+        "fetch",
+        timeout=timeout or config.get("request_timeout", 20),
         headers=_headers(),
         follow_redirects=True,
-        proxy=config.get("proxy") or None,
-        trust_env=False,
     )
 
 
@@ -45,17 +44,18 @@ def _github_readme(url: str) -> str:
     if not m:
         return ""
     owner, repo = m.group(1), m.group(2)
+    c = _client(20)
     for accept in ("application/vnd.github.raw", "application/vnd.github+json"):
         try:
-            with _client(20) as c:
-                r = c.get(
-                    f"https://api.github.com/repos/{owner}/{repo}/readme",
-                    headers={"Accept": accept},
-                )
-                if r.status_code != 200:
-                    continue
-                if accept.endswith("raw"):
-                    return _clean(r.text)[:MAX_CHARS]
+            r = c.get(
+                f"https://api.github.com/repos/{owner}/{repo}/readme",
+                headers={"Accept": accept},
+                timeout=20,
+            )
+            if r.status_code != 200:
+                continue
+            if accept.endswith("raw"):
+                return _clean(r.text)[:MAX_CHARS]
         except Exception:
             continue
     return ""
@@ -80,47 +80,49 @@ def _stackexchange_fetch(url: str) -> Doc | None:
     if not m:
         return None
     site, qid = m.group(1), m.group(2)
+    c = _client(25)
     try:
-        with _client(25) as c:
-            r = c.get(
-                f"https://api.stackexchange.com/2.3/questions/{qid}",
-                params={"site": site, "filter": "withbody"},
-            )
-            if r.status_code != 200:
-                return None
-            items = (r.json() or {}).get("items") or []
-            if not items:
-                return None
-            q = items[0]
-            title = q.get("title", "")
-            parts = [f"# {title}", _html_to_text(q.get("body", ""))]
+        r = c.get(
+            f"https://api.stackexchange.com/2.3/questions/{qid}",
+            params={"site": site, "filter": "withbody"},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return None
+        items = (r.json() or {}).get("items") or []
+        if not items:
+            return None
+        q = items[0]
+        title = q.get("title", "")
+        parts = [f"# {title}", _html_to_text(q.get("body", ""))]
 
-            ra = c.get(
-                f"https://api.stackexchange.com/2.3/questions/{qid}/answers",
-                params={
-                    "site": site,
-                    "filter": "withbody",
-                    "sort": "votes",
-                    "order": "desc",
-                    "pagesize": 3,
-                },
-            )
-            if ra.status_code == 200:
-                for a in (ra.json() or {}).get("items") or []:
-                    body = _html_to_text(a.get("body", ""))
-                    if len(body) > 60:
-                        parts.append(f"## 回答（{a.get('score', 0)} 赞）\n{body}")
+        ra = c.get(
+            f"https://api.stackexchange.com/2.3/questions/{qid}/answers",
+            params={
+                "site": site,
+                "filter": "withbody",
+                "sort": "votes",
+                "order": "desc",
+                "pagesize": 3,
+            },
+            timeout=25,
+        )
+        if ra.status_code == 200:
+            for a in (ra.json() or {}).get("items") or []:
+                body = _html_to_text(a.get("body", ""))
+                if len(body) > 60:
+                    parts.append(f"## 回答（{a.get('score', 0)} 赞）\n{body}")
 
-            text = _clean("\n\n".join(p for p in parts if p))
-            if len(text) < 120:
-                return None
-            return {
-                "ok": True,
-                "url": url,
-                "title": title or url,
-                "text": text[:MAX_CHARS],
-                "error": "",
-            }
+        text = _clean("\n\n".join(p for p in parts if p))
+        if len(text) < 120:
+            return None
+        return {
+            "ok": True,
+            "url": url,
+            "title": title or url,
+            "text": text[:MAX_CHARS],
+            "error": "",
+        }
     except Exception:
         return None
 
@@ -134,34 +136,34 @@ def _discourse_fetch(url: str) -> Doc | None:
     base = url.split("?")[0].rstrip("/")
     if base.endswith(".json"):
         base = base[:-5]
+    c = _client(25)
     try:
-        with _client(25) as c:
-            r = c.get(base + ".json")
-            if r.status_code != 200:
-                return None
-            j = r.json()
-            title = j.get("title", "")
-            posts = (j.get("post_stream") or {}).get("posts") or []
-            if not posts:
-                return None
+        r = c.get(base + ".json", timeout=25)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        title = j.get("title", "")
+        posts = (j.get("post_stream") or {}).get("posts") or []
+        if not posts:
+            return None
 
-            parts = [f"# {title}"]
-            for p in posts[:6]:
-                body = _html_to_text(p.get("cooked", ""))
-                if len(body) > 80:
-                    n = p.get("post_number", "?")
-                    parts.append(f"## 楼层 {n}\n{body}")
+        parts = [f"# {title}"]
+        for p in posts[:6]:
+            body = _html_to_text(p.get("cooked", ""))
+            if len(body) > 80:
+                n = p.get("post_number", "?")
+                parts.append(f"## 楼层 {n}\n{body}")
 
-            text = _clean("\n\n".join(parts))
-            if len(text) < 120:
-                return None
-            return {
-                "ok": True,
-                "url": url,
-                "title": title or url,
-                "text": text[:MAX_CHARS],
-                "error": "",
-            }
+        text = _clean("\n\n".join(parts))
+        if len(text) < 120:
+            return None
+        return {
+            "ok": True,
+            "url": url,
+            "title": title or url,
+            "text": text[:MAX_CHARS],
+            "error": "",
+        }
     except Exception:
         return None
 
@@ -189,19 +191,19 @@ def fetch(url: str) -> Doc:
     # arXiv 摘要页
     if "arxiv.org/abs/" in url:
         try:
-            with _client() as c:
-                r = c.get(url)
-                if r.status_code == 200:
-                    soup = BeautifulSoup(r.text, "lxml")
-                    title = soup.select_one("h1.title")
-                    abst = soup.select_one("blockquote.abstract")
-                    if abst:
-                        doc.update(
-                            ok=True,
-                            title=_clean(title.get_text(" ", strip=True)) if title else url,
-                            text=_clean(abst.get_text(" ", strip=True)),
-                        )
-                        return doc
+            c = _client()
+            r = c.get(url, timeout=config.get("request_timeout", 20))
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "lxml")
+                title = soup.select_one("h1.title")
+                abst = soup.select_one("blockquote.abstract")
+                if abst:
+                    doc.update(
+                        ok=True,
+                        title=_clean(title.get_text(" ", strip=True)) if title else url,
+                        text=_clean(abst.get_text(" ", strip=True)),
+                    )
+                    return doc
         except Exception:
             pass
 
@@ -214,16 +216,16 @@ def fetch(url: str) -> Doc:
 
     # 通用抓取
     try:
-        with _client() as c:
-            r = c.get(url)
-            if r.status_code >= 400:
-                doc["error"] = f"HTTP {r.status_code}"
-                return doc
-            ctype = r.headers.get("content-type", "")
-            if "html" not in ctype and "xml" not in ctype and "text" not in ctype:
-                doc["error"] = f"非文本内容: {ctype}"
-                return doc
-            html = r.text
+        c = _client()
+        r = c.get(url, timeout=config.get("request_timeout", 20))
+        if r.status_code >= 400:
+            doc["error"] = f"HTTP {r.status_code}"
+            return doc
+        ctype = r.headers.get("content-type", "")
+        if "html" not in ctype and "xml" not in ctype and "text" not in ctype:
+            doc["error"] = f"非文本内容: {ctype}"
+            return doc
+        html = r.text
     except Exception as e:  # noqa: BLE001
         doc["error"] = str(e)[:200]
         return doc

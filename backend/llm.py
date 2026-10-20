@@ -8,7 +8,7 @@ from typing import Any, Iterable, Iterator
 
 import httpx
 
-from . import config
+from . import config, httpc
 
 
 class LLMError(RuntimeError):
@@ -19,13 +19,14 @@ def _base() -> str:
     return config.get("ollama_url", "http://127.0.0.1:11434").rstrip("/")
 
 
-def _client(timeout: float | None = None) -> httpx.Client:
-    proxy = config.get("proxy") or None
-    return httpx.Client(
-        base_url=_base(),
-        timeout=httpx.Timeout(timeout or 300.0, connect=10.0),
-        proxy=proxy,
-        trust_env=False,
+def _client(timeout: float | None = None) -> "httpc.Borrowed":
+    """共享客户端（连接池复用）。注意：退出 `with` 不会关闭它——连接要留给后续调用。
+
+    超时按请求覆盖（httpx per-request timeout），与原先「每次新建时设一次性超时」
+    等效。ollama_url / 代理变更时 config.update() 会调 httpc.reset() 重建。
+    """
+    return httpc.borrow_client(
+        "llm", base_url=_base(), timeout=timeout or 300.0
     )
 
 
@@ -68,12 +69,11 @@ def tags() -> tuple[bool, list[dict[str, Any]]]:
     if now - _tags_cache["ts"] < TAGS_TTL:
         return _tags_cache["healthy"], [dict(m) for m in _tags_cache["models"]]
     try:
-        with _client(10) as c:
-            r = c.get("/api/tags")
-            if r.status_code != 200:
-                _tags_cache.update(ts=now, healthy=False, models=[])
-                return False, []
-            models = _parse_tags(r.json())
+        r = _client().get("/api/tags", timeout=10)
+        if r.status_code != 200:
+            _tags_cache.update(ts=now, healthy=False, models=[])
+            return False, []
+        models = _parse_tags(r.json())
     except Exception:
         _tags_cache.update(ts=now, healthy=False, models=[])
         return False, []
@@ -83,18 +83,16 @@ def tags() -> tuple[bool, list[dict[str, Any]]]:
 
 def healthy() -> bool:
     try:
-        with _client(5) as c:
-            return c.get("/api/tags").status_code == 200
+        return _client().get("/api/tags", timeout=5).status_code == 200
     except Exception:
         return False
 
 
 def list_models() -> list[dict[str, Any]]:
     try:
-        with _client(10) as c:
-            r = c.get("/api/tags")
-            r.raise_for_status()
-            return _parse_tags(r.json())
+        r = _client().get("/api/tags", timeout=10)
+        r.raise_for_status()
+        return _parse_tags(r.json())
     except Exception:
         return []
 
@@ -106,21 +104,20 @@ def has_model(name: str) -> bool:
 
 def pull_model(name: str, on_progress=None) -> None:
     """拉取模型，on_progress(dict) 回调进度。"""
-    with _client(3600) as c:
-        with c.stream("POST", "/api/pull", json={"model": name, "stream": True}) as r:
-            if r.status_code != 200:
-                raise LLMError(f"拉取 {name} 失败: HTTP {r.status_code}")
-            for line in r.iter_lines():
-                if not line:
-                    continue
-                try:
-                    evt = json.loads(line)
-                except Exception:
-                    continue
-                if evt.get("error"):
-                    raise LLMError(str(evt["error"]))
-                if on_progress:
-                    on_progress(evt)
+    with _client(3600).stream("POST", "/api/pull", json={"model": name, "stream": True}, timeout=3600) as r:
+        if r.status_code != 200:
+            raise LLMError(f"拉取 {name} 失败: HTTP {r.status_code}")
+        for line in r.iter_lines():
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except Exception:
+                continue
+            if evt.get("error"):
+                raise LLMError(str(evt["error"]))
+            if on_progress:
+                on_progress(evt)
     # 模型清单变了，状态展示的缓存立刻失效（否则要等最多一个 TTL）
     _invalidate_tags()
 
@@ -183,10 +180,9 @@ def chat(
     if tools:
         payload["tools"] = tools
     try:
-        with _client(timeout) as c:
-            r = c.post("/api/chat", json=payload)
-            r.raise_for_status()
-            data = r.json()
+        r = _client(timeout).post("/api/chat", json=payload, timeout=timeout or 300.0)
+        r.raise_for_status()
+        data = r.json()
     except httpx.HTTPError as e:
         raise LLMError(f"调用模型失败：{e}") from e
     msg = data.get("message") or {}
@@ -213,10 +209,9 @@ def chat_stream(
             "num_ctx": config.get("context_num", 16384),
         },
     }
-    with _client(600) as c:
-        with c.stream("POST", "/api/chat", json=payload) as r:
-            r.raise_for_status()
-            for line in r.iter_lines():
+    with _client(600).stream("POST", "/api/chat", json=payload, timeout=600) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
                 if not line:
                     continue
                 try:
@@ -294,13 +289,13 @@ def embed(texts: Iterable[str], *, batch: int = 16) -> list[list[float]]:
     items = [t if t.strip() else " " for t in texts]
     out: list[list[float]] = []
     model = config.get("embed_model")
-    with _client(300) as c:
-        for i in range(0, len(items), batch):
-            chunk = items[i : i + batch]
-            try:
-                r = c.post("/api/embed", json={"model": model, "input": chunk})
-                r.raise_for_status()
-                out.extend(r.json().get("embeddings") or [])
-            except httpx.HTTPError as e:
-                raise LLMError(f"向量化失败（模型 {model} 是否已下载？）：{e}") from e
+    c = _client(300)
+    for i in range(0, len(items), batch):
+        chunk = items[i : i + batch]
+        try:
+            r = c.post("/api/embed", json={"model": model, "input": chunk}, timeout=300)
+            r.raise_for_status()
+            out.extend(r.json().get("embeddings") or [])
+        except httpx.HTTPError as e:
+            raise LLMError(f"向量化失败（模型 {model} 是否已下载？）：{e}") from e
     return out

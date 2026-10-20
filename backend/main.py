@@ -217,6 +217,14 @@ def api_analytics_search(q: str = Query(...), k: int = 8) -> dict:
     return analytics.search_explain(q, k=min(max(1, int(k)), 30))
 
 
+@app.get("/api/analytics/suggestions")
+def api_analytics_suggestions() -> dict:
+    """学习建议（引导）：下一步做什么，供总览「下一步建议」卡片使用。"""
+    from . import analytics
+
+    return {"items": analytics.suggestions()}
+
+
 @app.get("/api/perf")
 def api_perf() -> dict:
     """检索/聚合缓存的命中率与平均耗时，供分析视图的「检索性能」卡片展示。"""

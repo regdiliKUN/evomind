@@ -12,10 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
-import httpx
 from bs4 import BeautifulSoup
 
-from . import config
+from . import config, httpc
 
 Result = dict[str, Any]
 
@@ -27,13 +26,13 @@ def _headers() -> dict[str, str]:
     }
 
 
-def _client(timeout: float | None = None) -> httpx.Client:
-    return httpx.Client(
-        timeout=httpx.Timeout(timeout or config.get("request_timeout", 20), connect=10.0),
+def _client(timeout: float | None = None) -> "httpc.Borrowed":
+    """共享客户端（连接池复用，见 httpc）。退出 `with` 不会关闭它；超时按请求覆盖。"""
+    return httpc.borrow_client(
+        "search",
+        timeout=timeout or config.get("request_timeout", 20),
         headers=_headers(),
         follow_redirects=True,
-        proxy=config.get("proxy") or None,
-        trust_env=False,
     )
 
 
@@ -381,26 +380,24 @@ def _load_zbc_topics(max_age: float = 1800.0) -> list[dict]:
             return _zbc_cache["topics"]
 
         topics: list[dict] = []
-        with httpx.Client(
-            timeout=20, headers=_headers(), follow_redirects=True,
-            proxy=config.get("proxy") or None, trust_env=False,
-        ) as c:
-            for slug, cid, pages in _ZBC_CATEGORIES:
-                for page in range(pages):
-                    try:
-                        r = c.get(
-                            f"{ZBC_BASE}/c/{slug}/{cid}.json",
-                            params={"page": page},
-                        )
-                        if r.status_code != 200:
-                            break
-                        data = r.json()
-                        batch = data.get("topic_list", {}).get("topics", [])
-                        if not batch:
-                            break
-                        topics.extend(batch)
-                    except Exception:
+        c = _client(20)
+        for slug, cid, pages in _ZBC_CATEGORIES:
+            for page in range(pages):
+                try:
+                    r = c.get(
+                        f"{ZBC_BASE}/c/{slug}/{cid}.json",
+                        params={"page": page},
+                        timeout=20,
+                    )
+                    if r.status_code != 200:
                         break
+                    data = r.json()
+                    batch = data.get("topic_list", {}).get("topics", [])
+                    if not batch:
+                        break
+                    topics.extend(batch)
+                except Exception:
+                    break
         _zbc_cache["topics"] = topics
         _zbc_cache["ts"] = time.time()
         return topics
@@ -464,28 +461,29 @@ def search_brave(query: str, limit: int = 10) -> list[Result]:
         return []
     out: list[Result] = []
     try:
-        with httpx.Client(timeout=20, trust_env=False) as c:
-            r = c.get(
-                "https://api.search.brave.com/res/v1/web/search",
-                params={"q": query, "count": min(limit, 20)},
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Encoding": "gzip",
-                    "X-Subscription-Token": key,
-                },
+        c = _client(20)
+        r = c.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": min(limit, 20)},
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": key,
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return out
+        for it in (r.json().get("web", {}) or {}).get("results", [])[:limit]:
+            out.append(
+                {
+                    "title": it.get("title", ""),
+                    "url": it.get("url", ""),
+                    "snippet": (it.get("description") or "")[:400],
+                    "source": "brave",
+                    "kind": "web",
+                }
             )
-            if r.status_code != 200:
-                return out
-            for it in (r.json().get("web", {}) or {}).get("results", [])[:limit]:
-                out.append(
-                    {
-                        "title": it.get("title", ""),
-                        "url": it.get("url", ""),
-                        "snippet": (it.get("description") or "")[:400],
-                        "source": "brave",
-                        "kind": "web",
-                    }
-                )
     except Exception:
         pass
     return out
