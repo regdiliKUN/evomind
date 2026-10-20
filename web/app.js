@@ -1677,6 +1677,42 @@ function svgGraph(graph) {
   return s + `</svg>`;
 }
 
+function svgGauge(rate) {
+  rate = Math.max(0, Math.min(100, rate | 0));
+  const W = 150, H = 150, cx = 75, cy = 75, r = 58;
+  const C = 2 * Math.PI * r;
+  const off = C * (1 - rate / 100);
+  const col = rate >= 70 ? "var(--green)" : rate >= 40 ? "var(--accent)" : "var(--orange, #e0a23b)";
+  return `<svg viewBox="0 0 ${W} ${H}">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--border-soft)" stroke-width="12"/>
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${col}" stroke-width="12" stroke-linecap="round"
+      stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 ${cx} ${cy})"/>
+    <text x="${cx}" y="${cy - 2}" text-anchor="middle" style="font-family:var(--mono);font-size:30px;font-weight:700;fill:var(--text)">${rate}%</text>
+    <text x="${cx}" y="${cy + 20}" text-anchor="middle" class="axis-text">命中率</text>
+  </svg>`;
+}
+
+function svgSpark(arr) {
+  if (!arr || arr.length === 0) return '<div class="empty">等待采样…</div>';
+  const W = 380, H = 54, pad = 8;
+  const max = Math.max(...arr), min = Math.min(...arr);
+  const span = Math.max(max - min, 1e-6);
+  const n = arr.length;
+  const x = (i) => (n === 1 ? W / 2 : pad + (i / (n - 1)) * (W - 2 * pad));
+  const y = (v) => H - pad - ((v - min) / span) * (H - 2 * pad);
+  let line = "";
+  arr.forEach((v, i) => {
+    line += (i === 0 ? "M" : "L") + x(i).toFixed(1) + " " + y(v).toFixed(1) + " ";
+  });
+  const area = line + `L ${x(n - 1).toFixed(1)} ${H - pad} L ${x(0).toFixed(1)} ${H - pad} Z`;
+  const dots = arr.map((v, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.2" fill="var(--accent)"/>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}">
+    <path d="${area}" fill="var(--accent)" opacity="0.12"/>
+    <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2"/>
+    ${dots}
+  </svg>`;
+}
+
 function renderSearchExplain(data) {
   if (!data || !data.hits || !data.hits.length) return '<div class="empty">没有命中任何知识点</div>';
   const W = 680, H = 10 + data.hits.length * 30;
@@ -1744,6 +1780,27 @@ async function loadAnalytics() {
   setHTML($("#an-conf"), svgHist(d.confidence));
   setHTML($("#an-source"), svgDonut(d.sources));
   setHTML($("#an-graph"), svgGraph(d.graph));
+  // 检索性能卡片：命中率仪表 + 平均耗时迷你折线
+  loadPerf();
+}
+
+let _perfHistory = [];
+async function loadPerf() {
+  let p;
+  try {
+    p = await api("/api/perf");
+  } catch (_) {
+    return;
+  }
+  const rate = Math.round((p.search_cache_hit_rate || 0) * 100);
+  setHTML($("#an-perf-hit"), rate + "%");
+  setHTML($("#an-perf-ms"), (p.search_avg_ms || 0).toFixed(2) + " ms");
+  setHTML($("#an-perf-calls"), String(p.search_calls || 0));
+  setHTML($("#an-perf-gauge"), svgGauge(rate));
+  // 维护最近 20 次平均耗时的趋势
+  _perfHistory.push(p.search_avg_ms || 0);
+  if (_perfHistory.length > 20) _perfHistory.shift();
+  setHTML($("#an-perf-spark"), svgSpark(_perfHistory));
 }
 
 async function runSearchExplain() {

@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import math
+import time
+
 from typing import Any
 
 import numpy as np
@@ -135,9 +137,20 @@ def search_explain(query: str, k: int = 8) -> dict:
     }
 
 
-def snapshot() -> dict:
+# 短 TTL 缓存：分析页打开就全量聚合一次（含主题语义网络），重复打开/轮询时
+# 直接复用。知识库变更后最多 3 秒才反映，对只读展示页完全可接受，且避免了
+# 每次轮询都重算整份聚合（含向量质心 + 全连接余弦）。
+_SNAP_CACHE: dict = {"ts": 0.0, "val": None}
+_SNAP_TTL = 3.0
+
+
+def snapshot(fresh: bool = False) -> dict:
     """一次性返回分析视图所需的全部数据。"""
-    return {
+    now = time.time()
+    if not fresh and _SNAP_CACHE["val"] is not None and (now - _SNAP_CACHE["ts"]) < _SNAP_TTL:
+        return _SNAP_CACHE["val"]
+    t0 = time.perf_counter()
+    val = {
         "total": memory.count_points(),
         "growth": growth_by_day(),
         "topics": topic_stats(),
@@ -145,3 +158,15 @@ def snapshot() -> dict:
         "sources": source_breakdown(),
         "graph": topic_graph(),
     }
+    _SNAP_CACHE["val"] = val
+    _SNAP_CACHE["ts"] = now
+    with memory._perf_lock:
+        memory._perf["snapshot_calls"] += 1
+        memory._perf["snapshot_ms"] += (time.perf_counter() - t0) * 1000
+    return val
+
+
+def invalidate_snapshot() -> None:
+    """知识库变更后让聚合缓存失效。"""
+    _SNAP_CACHE["val"] = None
+    _SNAP_CACHE["ts"] = 0.0

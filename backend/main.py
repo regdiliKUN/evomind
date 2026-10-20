@@ -208,6 +208,12 @@ def api_analytics_search(q: str = Query(...), k: int = 8) -> dict:
     return analytics.search_explain(q, k=min(max(1, int(k)), 30))
 
 
+@app.get("/api/perf")
+def api_perf() -> dict:
+    """检索/聚合缓存的命中率与平均耗时，供分析视图的「检索性能」卡片展示。"""
+    return memory.perf_stats()
+
+
 @app.get("/api/knowledge/search")
 def api_knowledge_search(q: str = Query(...), k: int = 8) -> list[dict]:
     return memory.search(q, k=k)

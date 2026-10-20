@@ -217,6 +217,24 @@
           <div id="an-growth" class="chart"></div>
         </div>
 
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">检索性能<span class="tag">缓存命中率 / 平均耗时</span>
+            <span class="dim" style="margin-left:auto;font-size:11px">轮询与重复检索自动命中缓存</span>
+          </div>
+          <div class="rowflex" style="align-items:center;gap:22px;flex-wrap:wrap">
+            <div id="an-perf-gauge" class="chart" style="width:150px;height:150px;flex:0 0 auto"></div>
+            <div style="flex:1;min-width:240px">
+              <div class="rowflex" style="gap:26px;margin-bottom:10px">
+                <div><div style="font-size:12px;color:var(--text-faint)">缓存命中率</div><div id="an-perf-hit" style="font-family:var(--mono);font-size:26px;font-weight:600">0%</div></div>
+                <div><div style="font-size:12px;color:var(--text-faint)">平均检索</div><div id="an-perf-ms" style="font-family:var(--mono);font-size:26px;font-weight:600">0 ms</div></div>
+                <div><div style="font-size:12px;color:var(--text-faint)">累计检索</div><div id="an-perf-calls" style="font-family:var(--mono);font-size:26px;font-weight:600">0</div></div>
+              </div>
+              <div class="dim" style="font-size:11px;margin-bottom:4px">每次轮询平均耗时（最近 20 次采样，单位 ms）</div>
+              <div id="an-perf-spark" class="chart" style="height:54px;width:100%;max-width:380px"></div>
+            </div>
+          </div>
+        </div>
+
         <div class="grid g2" style="margin-bottom:14px">
           <div class="card">
             <div class="card-title">能力分布<span class="tag">按学习方向</span></div>

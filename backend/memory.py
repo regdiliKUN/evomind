@@ -307,6 +307,60 @@ def similarity(
 
 
 # --------------------------------------------------------------------------
+# 检索结果缓存 + 性能计数（加速仪表盘/分析视图的轮询与重复检索）
+# --------------------------------------------------------------------------
+# 仪表盘每几秒轮询一次、分析视图反复打开、同一方向反复问，都会触发大量
+# 「库没变、查询也一样」的重复检索。原实现每次都把整份向量矩阵乘一遍
+# （N×D @ D×1），库越大越亏。这里把结果按 (query, topic, k) 缓存，命中直接返回；
+# 知识库一旦变更就整体失效，保证结果永远和「冷算」一致。
+_search_cache: dict[tuple, list[dict]] = {}
+_search_cache_lock = threading.Lock()
+
+_perf = {
+    "search_calls": 0,
+    "search_hits": 0,
+    "search_ms": 0.0,
+    "snapshot_calls": 0,
+    "snapshot_ms": 0.0,
+}
+_perf_lock = threading.Lock()
+
+
+def _bump_search_cache() -> None:
+    """知识库变更后让检索结果缓存整体失效（结果已和库不一致）。"""
+    with _search_cache_lock:
+        _search_cache.clear()
+
+
+def _search_cache_get(query: str, topic: str | None, k: int) -> list[dict] | None:
+    return _search_cache.get((query, topic, k))
+
+
+def _search_cache_put(query: str, topic: str | None, k: int, value: list[dict]) -> None:
+    with _search_cache_lock:
+        if len(_search_cache) > 2000:  # 防止内存无限增长
+            _search_cache.clear()
+        _search_cache[(query, topic, k)] = value
+
+
+def perf_stats() -> dict:
+    with _perf_lock:
+        calls = _perf["search_calls"]
+        hits = _perf["search_hits"]
+        sms = _perf["search_ms"]
+        sc = _perf["snapshot_calls"]
+        sm = _perf["snapshot_ms"]
+    return {
+        "search_calls": calls,
+        "search_cache_hits": hits,
+        "search_cache_hit_rate": round(hits / calls, 4) if calls else 0.0,
+        "search_avg_ms": round(sms / calls, 3) if calls else 0.0,
+        "snapshot_calls": sc,
+        "snapshot_avg_ms": round(sm / sc, 3) if sc else 0.0,
+    }
+
+
+# --------------------------------------------------------------------------
 # 写入
 # --------------------------------------------------------------------------
 def _norm_topic(topic: str) -> str:
@@ -375,6 +429,8 @@ def add_point(
             rowid = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
         # 增量追加，而不是把整份缓存作废（见 _append_vector）
         _append_vector(rowid, vec)
+        # 检索结果缓存已与库不一致，整体失效
+        _bump_search_cache()
         return pid
 
 
@@ -511,6 +567,8 @@ def add_points_batch(
         # 一次性提交后，把接受的向量增量追加进缓存（顺序与 rowid 一致）
         for rid, v in zip(accepted_ids, accepted_vecs):
             _append_vector(rid, v)
+        # 检索结果缓存已与库不一致，整体失效
+        _bump_search_cache()
 
     return {
         "added": len(accepted_ids),
@@ -533,6 +591,15 @@ def search(
     k = max(0, min(int(k), 1000))
     if not query.strip() or k == 0:
         return []
+    t0 = time.perf_counter()
+    cacheable = vec is None  # 带了外部向量的查询不参与缓存（向量即身份，无法用 query 定位）
+    if cacheable:
+        hit = _search_cache_get(query, topic, k)
+        if hit is not None:
+            with _perf_lock:
+                _perf["search_calls"] += 1
+                _perf["search_hits"] += 1
+            return hit
     if vec is None:
         vec = llm.embed([query])[0]
     rowids, mat = _all_vectors(len(vec))
@@ -569,7 +636,13 @@ def search(
             d["tags"] = []
         out.append(d)
     out.sort(key=lambda x: -x["score"])
-    return out[:k]
+    out = out[:k]
+    if cacheable:
+        _search_cache_put(query, topic, k, out)
+    with _perf_lock:
+        _perf["search_calls"] += 1
+        _perf["search_ms"] += (time.perf_counter() - t0) * 1000
+    return out
 
 
 def keyword_search(query: str, k: int = 10) -> list[dict]:
@@ -679,6 +752,7 @@ def delete_point(pid: str) -> bool:
         with c:
             c.execute("DELETE FROM knowledge WHERE id=?", (pid,))
         _invalidate()
+        _bump_search_cache()
     return True
 
 
