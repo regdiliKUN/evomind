@@ -13,6 +13,10 @@ __pycache__/
 data/
 !data/.gitkeep
 
+# 打包产物（可用 scripts/pack.py 重新生成，不入库）
+dist/
+build/
+
 # 临时文件
 .tmpedge/
 *.log
