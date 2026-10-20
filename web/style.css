@@ -438,22 +438,154 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 .ocr-text textarea:focus { outline: none; border-color: var(--accent); }
 
 /* ---------------- 分析视图 ---------------- */
-.chart { width: 100%; }
-.chart svg { width: 100%; height: auto; display: block; overflow: visible; }
-/* 热力图自带显示尺寸（格子按数据Span自适应放大），只在不超宽时生效 */
-#an-heatmap svg { width: auto; max-width: 100%; }
+/* 图表统一按「容器实际像素」绘制：svg 的 width/height 就是真实像素尺寸，
+   不再靠 viewBox 拉伸填满卡片。旧做法会让字号、线宽、热力图格子跟着卡片
+   一起放大（1010px 宽的卡片里 10px 字被拉到 15px），不同比例的图表摆在一起
+   就会明显「格格不入」。 */
+.chart { position: relative; width: 100%; }
+.chart svg { display: block; max-width: 100%; height: auto; overflow: visible; }
 .chart text { font-family: -apple-system, "Microsoft YaHei", sans-serif; fill: var(--text-dim); }
 .chart .grid-line { stroke: var(--border-soft); stroke-width: 1; }
-.chart .axis-text { fill: var(--text-faint); font-size: 10px; }
-.chart .bar-label { fill: var(--text-dim); font-size: 11px; }
+.chart .grid-line.dash { stroke-dasharray: 3 4; }
+.chart .axis-text { fill: var(--text-faint); font-size: 10.5px; }
+.chart .axis-num { fill: var(--text-faint); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.chart .bar-label { fill: var(--text-dim); font-size: 11.5px; }
 .chart .node-label { fill: var(--text); font-size: 10.5px; }
 .chart svg.graph-svg { touch-action: none; }
 .chart svg.graph-svg .gnode { transition: opacity 0.15s ease; }
 .chart svg.graph-svg .gedge { transition: opacity 0.15s ease; }
-.legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; font-size: 11.5px; color: var(--text-dim); }
-.legend .li { display: flex; align-items: center; gap: 6px; }
-.legend .sw { width: 10px; height: 10px; border-radius: 3px; }
 .chart .tip { fill: var(--text-faint); font-size: 10px; }
+.chart .sess-row .sess-bg { fill: transparent; transition: fill .15s ease; }
+.chart .sess-row:hover .sess-bg { fill: rgba(255, 255, 255, .035); }
+
+/* 悬浮读数气泡（知识增长曲线用） */
+.chart-tip {
+  position: absolute; z-index: 6; pointer-events: none;
+  padding: 7px 10px; border-radius: 8px;
+  background: rgba(12, 17, 25, .97); border: 1px solid var(--border);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .5);
+  font-size: 11.5px; line-height: 1.55; white-space: nowrap;
+  transform: translate(-50%, -100%);
+}
+.chart-tip[hidden] { display: none; }
+.chart-tip .d { color: var(--text); font-weight: 600; margin-bottom: 3px; font-family: var(--mono); }
+.chart-tip .r { display: flex; align-items: baseline; gap: 10px; justify-content: space-between; }
+.chart-tip .r span { color: var(--text-faint); }
+.chart-tip .r b { font-family: var(--mono); font-weight: 600; color: var(--text); }
+
+/* 顶部工具条 */
+.an-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; margin-bottom: 14px;
+}
+.an-bar-l { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.an-badge {
+  font-size: 10.5px; letter-spacing: .6px; padding: 3px 9px; border-radius: 999px;
+  color: #8fb6ff; background: var(--accent-soft); border: 1px solid rgba(77, 141, 255, .22);
+}
+.an-bar .hint { margin: 0; font-size: 11.5px; }
+.an-bar-r { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+.an-range {
+  font-size: 11px; color: var(--text-dim); font-family: var(--mono);
+  padding: 4px 10px; border-radius: 999px;
+  background: #0f151e; border: 1px solid var(--border-soft);
+}
+
+.an-kpis { margin-bottom: 14px; }
+[hidden] { display: none !important; }
+
+/* 空库引导：不摊一堆空图表，只给一张卡说明数据从哪来 */
+.an-empty {
+  max-width: 620px; margin: 8vh auto 0; text-align: center;
+  padding: 34px 30px 30px; border-radius: 16px;
+  background: linear-gradient(180deg, rgba(17, 23, 33, .9), rgba(12, 17, 25, .9));
+  border: 1px solid var(--border);
+}
+.an-empty-ico {
+  width: 52px; height: 52px; margin: 0 auto 16px; border-radius: 14px;
+  display: grid; place-items: center; font-size: 22px;
+  color: #8fb6ff; background: var(--accent-soft);
+  border: 1px solid rgba(77, 141, 255, .25);
+}
+.an-empty-title { font-size: 16px; font-weight: 650; margin-bottom: 10px; }
+.an-empty-desc { font-size: 12.8px; line-height: 1.9; color: var(--text-dim); }
+.an-empty-actions { display: flex; gap: 10px; justify-content: center; margin-top: 20px; }
+.an-card { margin-bottom: 14px; }
+.an-row { margin-bottom: 14px; }
+.an-row > .card { margin-bottom: 0; }
+
+/* 卡片标题里的图例与右侧元信息 */
+.card-title .an-legend {
+  display: flex; align-items: center; gap: 14px; margin-left: auto;
+  font-size: 11px; font-weight: 400; color: var(--text-dim); letter-spacing: 0;
+}
+.card-title .an-legend .li { display: flex; align-items: center; gap: 6px; }
+.card-title .an-legend .sw { display: block; width: 14px; height: 3px; border-radius: 2px; }
+.card-title .an-legend .sw.line { background: var(--green); }
+.card-title .an-legend .sw.bar { width: 9px; height: 9px; border-radius: 2px; background: var(--accent); opacity: .5; }
+.card-title .an-legend .sw.dot { width: 7px; height: 7px; border-radius: 50%; }
+.card-title .an-meta {
+  margin-left: 12px; font-size: 11px; font-weight: 400; letter-spacing: 0;
+  color: var(--text-faint); font-family: var(--mono); white-space: nowrap;
+}
+.card-title .an-meta:last-child { margin-left: auto; }
+
+/* 学习活跃度：热力图 + 右侧四个小指标，把卡片横向填满 */
+.an-heat { display: flex; align-items: center; gap: 26px; }
+.an-heat > .chart { flex: 1 1 auto; min-width: 0; }
+/* 热力图按周铺开，列数固定；居中放，左右留白对称，比死贴左边更像一张图 */
+.an-heat > .chart { display: flex; justify-content: center; }
+.an-heat-side { flex: 0 0 232px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.an-heat-stat {
+  background: #0e141d; border: 1px solid var(--border-soft);
+  border-radius: 9px; padding: 9px 11px;
+}
+.an-heat-stat .k { font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
+.an-heat-stat .v {
+  font-family: var(--mono); font-size: 17px; font-weight: 600;
+  margin-top: 1px; letter-spacing: -.4px; font-variant-numeric: tabular-nums;
+}
+
+/* 检索性能 / 系统状态：仪表盘 + 三个数值 + 迷你图 */
+.an-row > .card { display: flex; flex-direction: column; }
+.an-row > .card > .an-kv-row { flex: 1 1 auto; }
+/* 两张卡片同高：内容在卡片里垂直居中，避免下半截空一大块 */
+.an-row > .card { display: flex; flex-direction: column; }
+.an-kv-row { display: flex; align-items: center; gap: 20px; flex: 1; }
+.an-gauge { flex: 0 0 118px; width: 118px; }
+.an-kv-main { flex: 1; min-width: 0; }
+.an-kv-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }
+.an-kv span { display: block; font-size: 10.5px; color: var(--text-faint); letter-spacing: .3px; white-space: nowrap; }
+.an-kv b {
+  display: block; font-family: var(--mono); font-size: 19px; font-weight: 600;
+  margin-top: 1px; letter-spacing: -.4px; font-variant-numeric: tabular-nums;
+}
+.an-spark-label { font-size: 10.5px; color: var(--text-faint); margin-bottom: 3px; }
+/* 高度交给 svg 自己撑（每张子图高度不同），容器只保底，不写死 */
+.an-spark { min-height: 46px; }
+.an-disk { margin-top: 12px; }
+
+/* 能力分布：两列，避免单列把右半边卡片拉得过高 */
+.an-topic-list { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 20px; }
+.an-topic-list .kb-drill { margin: 0; padding: 3px 6px; margin-left: -6px; }
+
+.an-graph-detail {
+  margin-top: 8px; min-height: 18px;
+  font-size: 12px; color: var(--text-dim); line-height: 1.65;
+}
+.an-search-row { display: flex; gap: 10px; margin-bottom: 14px; }
+.an-search-row input { flex: 1; }
+.an-search-graph { margin-top: 12px; }
+
+@media (max-width: 1180px) {
+  .an-heat { flex-direction: column; }
+  .an-heat-side { flex: 0 0 auto; width: 100%; grid-template-columns: repeat(4, 1fr); }
+}
+@media (max-width: 900px) {
+  .an-topic-list { grid-template-columns: 1fr; }
+  .an-kv-row { flex-wrap: wrap; }
+  .an-kv-grid { grid-template-columns: 1fr 1fr; }
+}
 
 /* ---------------- 知识点详情抽屉 ---------------- */
 .pdrawer-mask {

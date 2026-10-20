@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>EvoMind · 自进化学习引擎</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236c8cff'/><text x='16' y='23' font-size='18' font-family='sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'>E</text></svg>" />
-<link rel="stylesheet" href="/static/style.css?v=16" />
+<link rel="stylesheet" href="/static/style.css?v=17" />
 </head>
 <body>
 <div class="app">
@@ -208,11 +208,31 @@
 
       <!-- ---------- 分析 ---------- -->
       <section class="view" id="view-analytics">
-        <div class="rowflex" style="justify-content:space-between;align-items:center;margin-bottom:14px">
-          <div class="hint" id="an-ver" style="margin:0">数据版本 —</div>
-          <button class="btn sm" id="btn-an-refresh">刷新数据</button>
+        <div class="an-bar">
+          <div class="an-bar-l">
+            <span class="hint" id="an-ver">数据版本 —</span>
+          </div>
+          <div class="an-bar-r">
+            <span class="an-range" id="an-range-chip"></span>
+            <button class="btn sm" id="btn-an-refresh">刷新数据</button>
+          </div>
         </div>
-        <div class="grid g4" style="margin-bottom:16px">
+
+        <div class="an-empty" id="an-empty" hidden>
+          <div class="an-empty-ico">❖</div>
+          <div class="an-empty-title">还没有可分析的数据</div>
+          <div class="an-empty-desc">
+            这个页面把知识库变成图表：知识点怎么长起来的、哪几天学得多、方向之间怎么关联、检索为什么命中。<br />
+            先去「自主进化」定一个方向让它学一轮，或者到「书库」导入几本书——有数据之后，这里会自己长出来。
+          </div>
+          <div class="an-empty-actions">
+            <button class="btn primary" data-goto="learn">去定一个方向</button>
+            <button class="btn" data-goto="library">去导入书库</button>
+          </div>
+        </div>
+
+        <div id="an-body">
+        <div class="grid g4 an-kpis">
           <div class="stat">
             <div class="k">知识点总数</div>
             <div class="v" id="an-total">0</div>
@@ -235,99 +255,110 @@
           </div>
         </div>
 
-        <div class="card" style="margin-bottom:14px">
+        <div class="card an-card">
           <div class="card-title">
             知识增长曲线<span class="tag">累计 / 每日新增</span>
-            <span class="dim" style="margin-left:auto;font-size:11px" id="an-growth-range"></span>
+            <div class="an-legend">
+              <span class="li"><i class="sw line"></i>累计知识点</span>
+              <span class="li"><i class="sw bar"></i>每日新增</span>
+            </div>
+            <span class="an-meta" id="an-growth-range"></span>
           </div>
           <div id="an-growth" class="chart"></div>
         </div>
 
-        <div class="card" style="margin-bottom:14px">
-          <div class="card-title">学习活跃度<span class="tag">每日新增 · 热力图</span>
-            <span class="dim" style="margin-left:auto;font-size:11px" id="an-heat-range"></span>
+        <div class="card an-card">
+          <div class="card-title">
+            学习活跃度<span class="tag">每日新增 · 热力图</span>
+            <span class="an-meta" id="an-heat-range"></span>
           </div>
-          <div id="an-heatmap" class="chart"></div>
+          <div class="an-heat">
+            <div id="an-heatmap" class="chart"></div>
+            <div id="an-heat-side" class="an-heat-side"></div>
+          </div>
         </div>
 
-        <div class="card" style="margin-bottom:14px">
-          <div class="card-title">检索性能<span class="tag">缓存命中率 / 平均耗时</span>
-            <span class="dim" style="margin-left:auto;font-size:11px">轮询与重复检索自动命中缓存</span>
-          </div>
-          <div class="rowflex" style="align-items:center;gap:22px;flex-wrap:wrap">
-            <div id="an-perf-gauge" class="chart" style="width:150px;height:150px;flex:0 0 auto"></div>
-            <div style="flex:1;min-width:240px">
-              <div class="rowflex" style="gap:26px;margin-bottom:10px">
-                <div><div style="font-size:12px;color:var(--text-faint)">缓存命中率</div><div id="an-perf-hit" style="font-family:var(--mono);font-size:26px;font-weight:600">0%</div></div>
-                <div><div style="font-size:12px;color:var(--text-faint)">平均检索</div><div id="an-perf-ms" style="font-family:var(--mono);font-size:26px;font-weight:600">0 ms</div></div>
-                <div><div style="font-size:12px;color:var(--text-faint)">累计检索</div><div id="an-perf-calls" style="font-family:var(--mono);font-size:26px;font-weight:600">0</div></div>
+        <div class="grid g2 an-row">
+          <div class="card an-card">
+            <div class="card-title">检索性能<span class="tag">缓存命中率 / 平均耗时</span></div>
+            <div class="an-kv-row">
+              <div id="an-perf-gauge" class="chart an-gauge"></div>
+              <div class="an-kv-main">
+                <div class="an-kv-grid">
+                  <div class="an-kv"><span>缓存命中</span><b id="an-perf-hit">0</b></div>
+                  <div class="an-kv"><span>平均检索</span><b id="an-perf-ms">0 ms</b></div>
+                  <div class="an-kv"><span>累计检索</span><b id="an-perf-calls">0</b></div>
+                </div>
+                <div id="an-perf-split" class="chart an-spark"></div>
               </div>
-              <div class="dim" style="font-size:11px;margin-bottom:4px">每次轮询平均耗时（最近 20 次采样，单位 ms）</div>
-              <div id="an-perf-spark" class="chart" style="height:54px;width:100%;max-width:380px"></div>
             </div>
           </div>
-        </div>
 
-        <div class="card" style="margin-bottom:14px">
-          <div class="card-title">系统状态<span class="tag">轮询开销 · 磁盘 · 模型服务</span>
-            <span class="dim" style="margin-left:auto;font-size:11px">优化后每次轮询仅一次轻量读取</span>
-          </div>
-          <div class="rowflex" style="align-items:center;gap:22px;flex-wrap:wrap">
-            <div id="an-sys-gauge" class="chart" style="width:150px;height:150px;flex:0 0 auto"></div>
-            <div style="flex:1;min-width:240px">
-              <div class="rowflex" style="gap:26px;margin-bottom:10px">
-                <div><div style="font-size:12px;color:var(--text-faint)">状态接口均耗</div><div id="an-sys-ms" style="font-family:var(--mono);font-size:26px;font-weight:600">0 ms</div></div>
-                <div><div style="font-size:12px;color:var(--text-faint)">LLM 服务</div><div id="an-sys-llm" style="font-family:var(--mono);font-size:26px;font-weight:600">—</div></div>
-                <div><div style="font-size:12px;color:var(--text-faint)">可用模型</div><div id="an-sys-models" style="font-family:var(--mono);font-size:26px;font-weight:600">0</div></div>
+          <div class="card an-card">
+            <div class="card-title">系统状态<span class="tag">轮询开销 · 磁盘 · 模型服务</span></div>
+            <div class="an-kv-row">
+              <div id="an-sys-gauge" class="chart an-gauge"></div>
+              <div class="an-kv-main">
+                <div class="an-kv-grid">
+                  <div class="an-kv"><span>状态接口均耗</span><b id="an-sys-ms">0 ms</b></div>
+                  <div class="an-kv"><span>LLM 服务</span><b id="an-sys-llm">—</b></div>
+                  <div class="an-kv"><span>可用模型</span><b id="an-sys-models">0</b></div>
+                </div>
+                <div class="an-spark-label">每次状态轮询耗时 · 最近 20 次采样（ms）</div>
+                <div id="an-sys-spark" class="chart an-spark"></div>
               </div>
-              <div class="dim" style="font-size:11px;margin-bottom:4px">每次状态轮询耗时（最近 20 次采样，单位 ms）</div>
-              <div id="an-sys-spark" class="chart" style="height:54px;width:100%;max-width:380px"></div>
             </div>
+            <div id="an-sys-disk" class="chart an-disk"></div>
           </div>
-          <div id="an-sys-disk" class="chart" style="margin-top:8px"></div>
         </div>
 
-        <div class="card" style="margin-bottom:14px">
+        <div class="card an-card">
           <div class="card-title">
             学习历程<span class="tag">每次任务一条</span>
-            <span class="dim" style="margin-left:auto;font-size:11px" id="an-sessions-sum"></span>
+            <div class="an-legend">
+              <span class="li"><i class="sw dot" style="background:var(--green)"></i>完成</span>
+              <span class="li"><i class="sw dot" style="background:var(--amber)"></i>中止</span>
+              <span class="li"><i class="sw dot" style="background:var(--red)"></i>出错</span>
+            </div>
+            <span class="an-meta" id="an-sessions-sum"></span>
           </div>
           <div id="an-sessions" class="chart"></div>
         </div>
 
-        <div class="grid g2" style="margin-bottom:14px">
-          <div class="card">
+        <div class="grid g2 an-row">
+          <div class="card an-card">
             <div class="card-title">能力分布<span class="tag">按学习方向</span></div>
-            <div id="an-topics"><div class="empty">还没有任何学习记录</div></div>
+            <div id="an-topics" class="an-topic-list"><div class="empty">还没有任何学习记录</div></div>
           </div>
-          <div class="card">
-            <div class="card-title">可信度分布<span class="tag">直方图</span></div>
+          <div class="card an-card">
+            <div class="card-title">可信度分布<span class="tag">直方图</span><span class="an-meta" id="an-conf-meta"></span></div>
             <div id="an-conf" class="chart"></div>
           </div>
         </div>
 
-        <div class="grid g2" style="margin-bottom:14px">
-          <div class="card">
+        <div class="grid g2 an-row">
+          <div class="card an-card">
             <div class="card-title">来源构成<span class="tag">知识从哪来</span></div>
             <div id="an-source" class="chart"></div>
           </div>
-          <div class="card">
+          <div class="card an-card">
             <div class="card-title">
               主题语义网络<span class="tag">可拖拽 · 悬停看关联 · 点击看知识点</span>
             </div>
             <div id="an-graph" class="chart"></div>
-            <div id="an-graph-detail" class="detail" style="margin-top:6px;min-height:18px"></div>
+            <div id="an-graph-detail" class="detail an-graph-detail"></div>
           </div>
         </div>
 
-        <div class="card">
+        <div class="card an-card">
           <div class="card-title">检索解释<span class="tag">为什么是这些结果</span></div>
-          <div class="rowflex" style="margin-bottom:12px">
+          <div class="an-search-row">
             <input id="an-q" placeholder="输入一个查询，看它命中了哪些知识点、匹配度多少" maxlength="200" />
             <button class="btn primary" id="btn-an-search">检索并解释</button>
           </div>
           <div id="an-search" class="chart"></div>
-          <div id="an-search-graph" class="chart" style="margin-top:10px"></div>
+          <div id="an-search-graph" class="chart an-search-graph"></div>
+        </div>
         </div>
       </section>
 
@@ -619,6 +650,6 @@
     <div class="pdrawer-body" id="pt-body"></div>
   </aside>
 
-<script src="/static/app.js?v=16"></script>
+<script src="/static/app.js?v=17"></script>
 </body>
 </html>

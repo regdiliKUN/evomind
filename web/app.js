@@ -2179,98 +2179,439 @@ $("#btn-save-cfg").addEventListener("click", async () => {
 
 /* ---------------- 分析视图 ---------------- */
 /* 全部图表用纯 SVG 现画（不引第三方库，和前端「无框架」的基调一致）。
-   主题色直接用 CSS 变量，换肤也跟着变。 */
+   主题色直接用 CSS 变量，换肤也跟着变。
+
+   尺寸策略（这一版的关键改动）：
+   旧实现给每张图一个固定的 viewBox（680×240 之类），再由 CSS 的 width:100%
+   拉满卡片。卡片 1010px 宽时等于整体放大 1.49 倍——10px 的轴标签变成 15px、
+   1px 网格线变成 1.5px、热力图的 13px 格子变成 39px 色块，几张图比例各不相同，
+   摆在一起就显得「格格不入」。
+   现在改成：ResizeObserver 量出容器的真实像素宽度，按这个宽度现画，
+   svg 的 width/height 就是 1:1 的像素尺寸，字号与线宽永远是设计值；
+   卡片变宽只会多显示内容，不会把字撑大。 */
 const AN_PALETTE = [
   "var(--accent)", "var(--green)", "var(--amber)", "var(--purple)",
   "var(--red)", "#5ad0ff", "#ff9bd0", "#7be0a0",
 ];
 
-function svgGrowth(growth) {
-  if (!growth || !growth.length) return '<div class="empty">还没有知识增长数据</div>';
-  const W = 680, H = 240, pl = 46, pr = 12, pt = 16, pb = 28;
-  const pw = W - pl - pr, ph = H - pt - pb;
-  const n = growth.length;
-  const cmax = Math.max(...growth.map((d) => d.cumulative), 1);
-  const amax = Math.max(...growth.map((d) => d.added), 1);
-  const X = (i) => pl + (n === 1 ? pw / 2 : (i / (n - 1)) * pw);
-  const Yc = (v) => pt + ph * (1 - v / cmax);
-  const Ya = (v) => pt + ph * (1 - v / amax);
-  let grid = "";
-  for (let g = 0; g <= 4; g++) {
-    const y = pt + (ph * g) / 4;
-    const val = Math.round(cmax * (1 - g / 4));
-    grid += `<line class="grid-line" x1="${pl}" y1="${y.toFixed(1)}" x2="${W - pr}" y2="${y.toFixed(1)}"/>` +
-      `<text class="axis-text" x="${pl - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end">${val}</text>`;
+const _mc = (() => {
+  try {
+    const c = document.createElement("canvas");
+    return c && typeof c.getContext === "function" ? c.getContext("2d") : null;
+  } catch (_) {
+    return null;
   }
-  let line = "", area = "";
-  if (n > 1) {
-    const pts = growth.map((d, i) => [X(i), Yc(d.cumulative)]);
-    line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
-    area = `M${pts[0][0].toFixed(1)} ${(pt + ph).toFixed(1)} ` +
-      pts.map((p) => "L" + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ") +
-      ` L${pts[pts.length - 1][0].toFixed(1)} ${(pt + ph).toFixed(1)} Z`;
+})();
+
+/* 文本宽度：能用 canvas 就精确量；量不了（无 canvas 的极简 DOM / 测试桩）
+   就按字符估算——中文一个字约 1em，ASCII 约 0.55em。布局只需要个近似值。 */
+function textW(str, size = 10.5, mono = false) {
+  const s = String(str);
+  if (_mc && typeof _mc.measureText === "function") {
+    _mc.font = `${size}px ${mono ? "Consolas, ui-monospace, monospace" : '-apple-system, "Microsoft YaHei", sans-serif'}`;
+    return _mc.measureText(s).width;
   }
-  const bw = Math.max(2, (pw / n) * 0.5);
-  let bars = "";
-  growth.forEach((d, i) => {
-    const x = X(i) - bw / 2;
-    const y = Ya(d.added);
-    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${(pt + ph - y).toFixed(1)}" rx="1.5" fill="var(--accent)" opacity="0.4"/>`;
-  });
-  const labI = n === 1 ? [0] : [0, Math.floor((n - 1) / 2), n - 1];
-  let xl = "";
-  labI.forEach((i) => {
-    xl += `<text class="axis-text" x="${X(i).toFixed(1)}" y="${H - 8}" text-anchor="middle">${esc(growth[i].day.slice(5))}</text>`;
-  });
-  return `<svg viewBox="0 0 ${W} ${H}">` +
-    `<defs><linearGradient id="grad-growth" x1="0" y1="0" x2="0" y2="1">` +
-    `<stop offset="0%" stop-color="var(--green)" stop-opacity="0.35"/>` +
-    `<stop offset="100%" stop-color="var(--green)" stop-opacity="0"/></linearGradient></defs>` +
-    grid + (area ? `<path d="${area}" fill="url(#grad-growth)"/>` : "") +
-    (line ? `<path d="${line}" fill="none" stroke="var(--green)" stroke-width="2"/>` : "") +
-    bars + xl + `</svg>`;
+  let w = 0;
+  for (const ch of s) w += /[\u2e80-\u9fff\uff00-\uffef]/.test(ch) ? size : size * 0.55;
+  return w;
 }
 
+function fmtNum(v) {
+  return Number(v || 0).toLocaleString("en-US");
+}
+
+/* 轴刻度用「好看的数字」：1/2/2.5/5 × 10^n，避免出现 1776、5328 这种刻度 */
+function niceScale(v, count = 4) {
+  v = Math.max(0, Number(v) || 0);
+  if (v <= 0) return { max: 1, step: 1 };
+  const raw = v / count;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / mag;
+  const step = (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * mag;
+  return { max: Math.ceil(v / step) * step, step };
+}
+
+function fmtAxis(v) {
+  if (v >= 10000) {
+    const x = v / 10000;
+    return (Number.isInteger(x) ? x : x.toFixed(1)) + "万";
+  }
+  return String(Math.round(v));
+}
+
+function emptyChart(msg, h = 130) {
+  return `<div class="empty" style="height:${h}px;display:flex;align-items:center;justify-content:center;padding:0">${esc(msg)}</div>`;
+}
+
+/* 图表容器：SVG 直接写进 .chart 本身（重绘 = 一次 innerHTML 替换，
+   外部据此就能判断「这一轮有没有真的重建」）。悬浮气泡按需挂载。 */
+function ensureChart(el) {
+  return el;
+}
+
+/* 悬浮气泡：第一次悬停时挂上去；下一次重绘会把它连同旧 SVG 一起换掉，
+   所以这里每次都确认它还在文档里。 */
+function chartTip(el) {
+  if (!el.__tip || el.__tip.parentNode !== el) {
+    const t = document.createElement("div");
+    t.className = "chart-tip";
+    t.hidden = true;
+    el.appendChild(t);
+    el.__tip = t;
+  }
+  return el.__tip;
+}
+
+/* height 可以是数字，也可以是 () => 数字（热力图高度随格子大小走） */
+function chartFrame(el, height, draw) {
+  if (!el) return;
+  el.__draw = draw;
+  el.__h = height;
+  if (!el.__ro && typeof ResizeObserver === "function") {
+    el.__ro = new ResizeObserver(() => {
+      if (Math.round(el.clientWidth) === el.__w) return;
+      paintChart(el);
+    });
+    el.__ro.observe(el);
+  }
+  paintChart(el);
+}
+
+function paintChart(el) {
+  if (!el || !el.__draw) return;
+  /* 视图被切到别处时（display:none）容器宽度会变成 0，此时不要重绘：
+     否则图会被画成 220px 的小图，切回来还要再闪一下。
+     offsetParent === null 正是 display:none 的判据。 */
+  if (el.offsetParent === null) return;
+  const cw = Math.round(el.clientWidth) || 0;
+  const w = cw > 0 ? cw : 680; // 量不到宽度时退回设计宽度（无布局的极简 DOM）
+  el.__w = w;
+  const h = typeof el.__h === "function" ? el.__h() : el.__h;
+  let svg = "";
+  try {
+    svg = el.__draw(w, h);
+  } catch (e) {
+    svg = emptyChart("图表渲染失败：" + (e && e.message ? e.message : e), 120);
+  }
+  if (el.__tip) el.__tip.hidden = true; // 重绘会替换掉气泡，先收起
+  setHTML(el, svg);
+}
+
+/* ---------------- 知识增长曲线 ---------------- */
+function growthGeom(w, h, growth) {
+  const padR = 14, padT = 18, padB = 26;
+  const n = growth.length;
+  const cmax = Math.max(...growth.map((d) => d.cumulative), 1);
+  const sc = niceScale(cmax, 4);
+  const ticks = [];
+  for (let v = 0; v <= sc.max + sc.step * 0.001; v += sc.step) ticks.push(v);
+  const tickLabels = ticks.map(fmtAxis);
+  const padL = Math.ceil(Math.max(...tickLabels.map((t) => textW(t, 10.5))) + 12);
+  const pw = Math.max(40, w - padL - padR);
+  const ph = Math.max(40, h - padT - padB);
+  const amax = Math.max(...growth.map((d) => d.added), 1);
+  const barH = ph * 0.4;
+  const X = (i) => padL + (n === 1 ? pw / 2 : (i / (n - 1)) * pw);
+  const Y = (v) => padT + ph * (1 - Math.min(1, Math.max(0, v / sc.max)));
+  const step = n > 1 ? pw / (n - 1) : pw;
+  return { w, h, padL, padR, padT, padB, pw, ph, n, ticks, tickLabels, sc, amax, barH, X, Y, step, growth };
+}
+
+function drawGrowth(w, h, growth) {
+  if (!growth || !growth.length) return emptyChart("还没有知识增长数据", h);
+  const g = growthGeom(w, h, growth);
+  const { padL, padT, pw, ph, n, ticks, tickLabels, X, Y, step, amax, barH } = g;
+  const base = padT + ph;
+
+  let s = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="知识增长曲线">`;
+
+  // 网格 + 左侧刻度（0 线不加，避免和柱子底部叠成一条粗线）
+  ticks.forEach((v, i) => {
+    const y = Y(v);
+    if (v > 0) s += `<line class="grid-line dash" x1="${padL}" y1="${y.toFixed(1)}" x2="${(padL + pw).toFixed(1)}" y2="${y.toFixed(1)}"/>`;
+    s += `<text class="axis-num" x="${padL - 8}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${tickLabels[i]}</text>`;
+  });
+
+  // 每日新增（柱）——独立标尺，压在折线下方，不抢累计曲线的视线
+  const bw = Math.max(2, Math.min(13, step * 0.55));
+  let bars = "";
+  growth.forEach((d, i) => {
+    if (!d.added) return;
+    const bh = Math.max(1, (d.added / amax) * barH);
+    const x = X(i) - bw / 2;
+    bars += `<rect x="${x.toFixed(1)}" y="${(base - bh).toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="${Math.min(2, bw / 2).toFixed(1)}" fill="var(--accent)" opacity="0.62"/>`;
+  });
+
+  // 累计（线 + 渐变面积）
+  let line = "", area = "";
+  if (n > 1) {
+    const pts = growth.map((d, i) => [X(i), Y(d.cumulative)]);
+    line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+    area = `M${pts[0][0].toFixed(1)} ${base} ` +
+      pts.map((p) => "L" + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ") +
+      ` L${pts[pts.length - 1][0].toFixed(1)} ${base} Z`;
+  }
+  const lastX = X(n - 1), lastY = Y(growth[n - 1].cumulative);
+
+  // 横轴日期：按可用宽度决定标注密度，首尾必留
+  const maxLab = Math.max(2, Math.floor(pw / 76));
+  const stepIdx = Math.max(1, Math.ceil((n - 1) / (maxLab - 1)));
+  let xl = "";
+  for (let i = n - 1; i >= 0; i -= stepIdx) {
+    xl += `<text class="axis-num" x="${X(i).toFixed(1)}" y="${h - 7}" text-anchor="middle">${esc(growth[i].day.slice(5))}</text>`;
+  }
+
+  // 悬浮层：竖线 + 高亮点（默认隐藏，指针移动时由 JS 定位）
+  const hover = `<g class="hv" style="opacity:0">
+      <line class="hv-line" x1="0" y1="${padT}" x2="0" y2="${base}" stroke="var(--text-faint)" stroke-width="1" stroke-dasharray="3 3"/>
+      <circle class="hv-dot" cx="0" cy="0" r="4" fill="var(--green)" stroke="#0a0f16" stroke-width="2"/>
+    </g>`;
+
+  s += `<defs><linearGradient id="grad-growth" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--green)" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="var(--green)" stop-opacity="0.01"/>
+    </linearGradient></defs>`;
+  if (area) s += `<path d="${area}" fill="url(#grad-growth)"/>`;
+  s += bars; // 柱子压在面积之上，否则会被渐变吃掉一半颜色
+  if (line) s += `<path d="${line}" fill="none" stroke="var(--green)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  s += `<circle cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(1)}" r="7" fill="var(--green)" opacity="0.16"/>`;
+  s += `<circle cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(1)}" r="3.2" fill="var(--green)" stroke="#0a0f16" stroke-width="1.5"/>`;
+  s += hover + xl;
+  return s + `</svg>`;
+}
+
+function mountGrowth(el, growth) {
+  chartFrame(el, 272, (w, h) => drawGrowth(w, h, growth));
+  el.__growth = growth || [];
+  if (el.__hoverBound) return;
+  el.__hoverBound = true;
+
+  const hide = () => {
+    const svg = el.querySelector("svg");
+    const hv = svg && svg.querySelector("g.hv");
+    if (hv) hv.style.opacity = "0";
+    if (el.__tip) el.__tip.hidden = true;
+  };
+
+  el.addEventListener("pointermove", (e) => {
+    const data = el.__growth;
+    const svg = el.querySelector("svg");
+    if (!data || !data.length || !svg || !el.__w) return hide();
+    const g = growthGeom(el.__w, typeof el.__h === "number" ? el.__h : 272, data);
+    const r = svg.getBoundingClientRect();
+    const x = e.clientX - r.left;
+    if (x < g.padL - 6 || x > g.padL + g.pw + 6) return hide();
+    const i = Math.max(0, Math.min(g.n - 1, Math.round((x - g.padL) / (g.n === 1 ? 1 : g.step))));
+    const d = data[i];
+    const px = g.X(i), py = g.Y(d.cumulative);
+    const hv = svg.querySelector("g.hv");
+    if (hv) {
+      hv.style.opacity = "1";
+      const ln = hv.querySelector(".hv-line");
+      ln.setAttribute("x1", px.toFixed(1));
+      ln.setAttribute("x2", px.toFixed(1));
+      const dot = hv.querySelector(".hv-dot");
+      dot.setAttribute("cx", px.toFixed(1));
+      dot.setAttribute("cy", py.toFixed(1));
+    }
+    {
+      const tip = chartTip(el);
+      tip.hidden = false;
+      tip.innerHTML =
+        `<div class="d">${esc(d.day)}</div>` +
+        `<div class="r"><span>每日新增</span><b>${fmtNum(d.added)}</b></div>` +
+        `<div class="r"><span>累计</span><b>${fmtNum(d.cumulative)}</b></div>`;
+      // 气泡贴着点往上，左右贴边时自动收进来，不出卡片
+      const tw = tip.offsetWidth || 110;
+      const left = Math.max(tw / 2 + 2, Math.min((el.__w || 680) - tw / 2 - 2, px));
+      tip.style.left = left + "px";
+      tip.style.top = Math.max(4, py - 12) + "px";
+    }
+  });
+  el.addEventListener("pointerleave", hide);
+}
+
+/* ---------------- 学习活跃度热力图 ---------------- */
+function heatStats(growth) {
+  const added = {};
+  growth.forEach((g) => (added[g.day] = g.added || 0));
+  const days = Object.keys(added).sort();
+  if (!days.length) return null;
+  const total = days.reduce((a, k) => a + added[k], 0);
+  const active = days.filter((k) => added[k] > 0).length;
+  const max = Math.max(...days.map((k) => added[k]));
+  // 连续天数：从最后一天往回数，遇到 0 就停
+  let streak = 0;
+  for (let i = days.length - 1; i >= 0; i--) {
+    if (added[days[i]] > 0) streak++;
+    else break;
+  }
+  return {
+    active, max, total, streak,
+    avg: days.length ? total / days.length : 0,
+  };
+}
+
+function drawHeatmap(w, growth) {
+  const added = {};
+  (growth || []).forEach((g) => (added[g.day] = g.added || 0));
+  const days = (growth || []).map((g) => g.day).sort();
+  if (!days.length) return { svg: emptyChart("还没有学习记录", 150), h: 150 };
+  const first = new Date(days[0] + "T00:00:00Z");
+  const last = new Date(days[days.length - 1] + "T00:00:00Z");
+  const firstSun = new Date(first);
+  firstSun.setUTCDate(first.getUTCDate() - first.getUTCDay()); // 对齐到周日
+  const spanDays = Math.round((last - firstSun) / 86400000) + 1;
+  const spanWeeks = Math.ceil(spanDays / 7);
+  /* 至少铺 12 周，而且补出来的空白周要补在「左边」（更早的时间），
+     让有数据的日子始终贴在最右边——和日历直觉一致。
+     旧实现补在右边，2 天数据会变成「左边一格有内容、右边十一格全空」。 */
+  const weeks = Math.max(spanWeeks, 12);
+  const start = new Date(firstSun.getTime() - (weeks - spanWeeks) * 7 * 86400000);
+  const totalDays = Math.round((last - start) / 86400000) + 1;
+  const left = 26, top = 20, gap = 3;
+  const cell = Math.max(9, Math.min(28, Math.floor((w - left - 6) / weeks) - gap));
+  const W = left + weeks * (cell + gap) - gap;
+  const gridH = top + 7 * (cell + gap) - gap;
+  const H = gridH + 27; // 底部留一行给色阶图例，否则图例落在 viewBox 外被裁掉
+  const maxAdd = Math.max(...(growth || []).map((g) => g.added), 1);
+  /* 五档色阶。分档按「分位数」而不是占最大值的比例：一次集中导入的尖峰会把
+     比例压扁，让其余日子全落进同一档、整张图变成一块同色。
+     取分位数后，无论数据多偏，四档都能均匀铺开。 */
+  const HEAT = [
+    ["rgba(255,255,255,.045)", 1],
+    ["rgba(33,212,160,.16)", 1],
+    ["rgba(33,212,160,.34)", 1],
+    ["rgba(33,212,160,.56)", 1],
+    ["rgba(33,212,160,.86)", 1],
+  ];
+  const pos = (growth || []).map((g) => g.added || 0).filter((n) => n > 0).sort((a, b) => a - b);
+  const qAt = (p) => (pos.length ? pos[Math.min(pos.length - 1, Math.floor(p * (pos.length - 1)))] : 1);
+  const t1 = qAt(0.25), t2 = qAt(0.55), t3 = qAt(0.82);
+  const tierOf = (n) => (n <= 0 ? 0 : n <= t1 ? 1 : n <= t2 ? 2 : n <= t3 ? 3 : 4);
+  const styleOf = (n) => HEAT[tierOf(n)];
+  const WD = ["日", "一", "二", "三", "四", "五", "六"];
+  let s = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="学习活跃度热力图">`;
+  // 周标签：一/三/五 三档，够看又不挤
+  [1, 3, 5].forEach((d) => {
+    s += `<text class="axis-text" x="0" y="${(top + d * (cell + gap) + cell / 2 + 3.5).toFixed(1)}">${WD[d]}</text>`;
+  });
+  // 月份：某一列跨月时在顶部标一次
+  let lastMonth = -1;
+  for (let wk = 0; wk < weeks; wk++) {
+    const dt = new Date(start.getTime() + wk * 7 * 86400000);
+    const m = dt.getUTCMonth();
+    if (m !== lastMonth) {
+      lastMonth = m;
+      s += `<text class="axis-text" x="${(left + wk * (cell + gap)).toFixed(1)}" y="12">${m + 1}月</text>`;
+    }
+  }
+  // 从网格第一列开始铺（空白日也用极淡的底色占位），日历格子才是连续的
+  for (let i = 0; i < totalDays; i++) {
+    const dt = new Date(start.getTime() + i * 86400000);
+    if (dt > last) break;
+    const wd = dt.getUTCDay();
+    const wk = Math.floor(i / 7);
+    const key = dt.toISOString().slice(0, 10);
+    const n = added[key] || 0;
+    const [col, op] = styleOf(n);
+    const x = left + wk * (cell + gap);
+    const y = top + wd * (cell + gap);
+    s += `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" rx="${Math.max(2, cell / 5).toFixed(1)}" fill="${col}" opacity="${op}"><title>${key}：新增 ${n} 条</title></rect>`;
+  }
+  // 右下角色阶图例：固定 11px 的小方块，不跟着格子放大
+  const lg = 11, lgGap = 3, ly = gridH + 12;
+  const lx = W - (lg + lgGap) * 4 + lgGap + 2;
+  s += `<text class="axis-text" x="${lx - 22}" y="${ly + lg - 1.5}">少</text>`;
+  HEAT.slice(1).forEach(([col, op], i) => {
+    s += `<rect x="${(lx + i * (lg + lgGap)).toFixed(1)}" y="${ly}" width="${lg}" height="${lg}" rx="2.5" fill="${col}" opacity="${op}"/>`;
+  });
+  s += `<text class="axis-text" x="${lx + 4 * (lg + lgGap) + 3}" y="${ly + lg - 1.5}">多</text>`;
+  return { svg: s + `</svg>`, h: H };
+}
+
+function mountHeatmap(el, side, growth) {
+  chartFrame(el, () => 170, (w) => drawHeatmap(w, growth).svg);
+  // 高度随格子走：格子由宽度算出来，画完再把容器高度同步给 svg（svg 自带 height，无需额外处理）
+  const st = heatStats(growth || []);
+  if (!side) return;
+  if (!st) {
+    setHTML(side, "");
+    return;
+  }
+  const box = (k, v) => `<div class="an-heat-stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  setHTML(
+    side,
+    box("活跃天数", st.active + " 天") +
+      box("最长连续", st.streak + " 天") +
+      box("单日最高", fmtNum(st.max)) +
+      box("日均新增", st.avg.toFixed(1))
+  );
+}
+
+/* ---------------- 能力分布（HTML 条） ---------------- */
 function htmlTopicBars(topics) {
   if (!topics || !topics.length) return '<div class="empty">还没有任何学习记录</div>';
   const max = Math.max(...topics.map((t) => t.count));
   return topics.slice(0, 12).map((t) =>
     // kb-drill：点一下跳到知识库并按该方向筛选（见全局委托处理器）
     `<div class="kb-drill" data-topic="${esc(t.topic)}" title="点击在知识库中筛选该方向">
-      <div class="rowflex" style="justify-content:space-between;font-size:12.5px">
-        <span>${esc(t.topic)}</span>
-        <span class="mono dim">${t.count} · 可信 ${(+t.avg_conf).toFixed(2)}</span>
+      <div class="rowflex" style="justify-content:space-between;font-size:12.5px;gap:10px">
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.topic)}</span>
+        <span class="mono dim" style="flex:0 0 auto;font-size:11px">${t.count} · ${(+t.avg_conf).toFixed(2)}</span>
       </div>
-      <div class="bar"><i style="width:${(t.count / max * 100).toFixed(1)}%"></i></div>
+      <div class="bar" style="margin-top:6px"><i style="width:${(t.count / max * 100).toFixed(1)}%"></i></div>
     </div>`
   ).join("");
 }
 
-function svgHist(confidence) {
-  if (!confidence || !confidence.length) return '<div class="empty">暂无数据</div>';
-  const W = 680, H = 200, pl = 40, pr = 10, pt = 14, pb = 26;
-  const pw = W - pl - pr, ph = H - pt - pb;
+/* ---------------- 可信度直方图 ---------------- */
+function drawHist(w, h, confidence) {
+  if (!confidence || !confidence.length) return emptyChart("暂无数据", h);
+  const padL = 34, padR = 12, padT = 20, padB = 26;
+  const pw = Math.max(40, w - padL - padR), ph = Math.max(30, h - padT - padB);
   const n = confidence.length;
   const maxn = Math.max(...confidence.map((b) => b.n), 1);
+  const sc = niceScale(maxn, 3);
+  const base = padT + ph;
   const bw = pw / n;
-  let s = "";
-  for (let g = 0; g <= 4; g++) {
-    const y = pt + (ph * g) / 4;
-    const val = Math.round(maxn * (1 - g / 4));
-    s += `<line class="grid-line" x1="${pl}" y1="${y.toFixed(1)}" x2="${W - pr}" y2="${y.toFixed(1)}"/>` +
-      `<text class="axis-text" x="${pl - 5}" y="${(y + 3).toFixed(1)}" text-anchor="end">${val}</text>`;
+  const Y = (v) => base - (v / sc.max) * ph;
+  let s = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="可信度分布直方图">`;
+  for (let i = 0; i <= 3; i++) {
+    const v = (sc.max / 3) * i;
+    const y = Y(v);
+    if (i > 0) s += `<line class="grid-line dash" x1="${padL}" y1="${y.toFixed(1)}" x2="${(padL + pw).toFixed(1)}" y2="${y.toFixed(1)}"/>`;
+    s += `<text class="axis-num" x="${padL - 7}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${fmtAxis(v)}</text>`;
+  }
+  s += `<line x1="${padL}" y1="${base}" x2="${(padL + pw).toFixed(1)}" y2="${base}" stroke="var(--border)" stroke-width="1"/>`;
+  const gap = Math.min(6, bw * 0.22);
+  confidence.forEach((b, i) => {
+    const bh = (b.n / sc.max) * ph;
+    const x = padL + i * bw + gap / 2;
+    const t = n > 1 ? i / (n - 1) : 0;
+    const col = t < 0.25 ? "var(--red)" : t < 0.5 ? "var(--amber)" : t < 0.75 ? "var(--green)" : "var(--accent)";
+    s += `<rect x="${x.toFixed(1)}" y="${(base - bh).toFixed(1)}" width="${(bw - gap).toFixed(1)}" height="${bh.toFixed(1)}" rx="2.5" fill="${col}" opacity="0.85"><title>${(+b.lo).toFixed(1)}–${(+b.hi).toFixed(1)}：${b.n} 条</title></rect>`;
+    // 柱子太矮时数值会飘在半空，反而干扰读数——只在柱子够高时标在顶端
+    if (bw > 34 && b.n > 0 && bh >= 24) {
+      s += `<text class="axis-num" x="${(padL + i * bw + bw / 2).toFixed(1)}" y="${(base - bh - 6).toFixed(1)}" text-anchor="middle" style="fill:var(--text-dim)">${fmtAxis(b.n)}</text>`;
+    }
+  });
+  // 平均可信度参考线（数值放到卡片标题里，图上只留一条虚线，不压住柱子）
+  let sum = 0, cnt = 0;
+  confidence.forEach((b) => { sum += b.n * ((b.lo + b.hi) / 2); cnt += b.n; });
+  if (cnt > 0) {
+    const avg = sum / cnt;
+    const x = padL + Math.min(n - 0.001, Math.max(0, avg * n)) * bw;
+    s += `<line x1="${x.toFixed(1)}" y1="${(padT - 8).toFixed(1)}" x2="${x.toFixed(1)}" y2="${base.toFixed(1)}" stroke="var(--text-faint)" stroke-width="1" stroke-dasharray="3 3" opacity="0.8"/>`;
+    s += `<circle cx="${x.toFixed(1)}" cy="${(padT - 8).toFixed(1)}" r="2.5" fill="var(--text-faint)"/>`;
   }
   confidence.forEach((b, i) => {
-    const x = pl + i * bw, h = ph * (b.n / maxn), y = pt + ph - h;
-    const t = n > 1 ? i / (n - 1) : 0;
-    const col = t < 0.5 ? (t < 0.25 ? "var(--red)" : "var(--amber)") : (t < 0.75 ? "var(--green)" : "var(--accent)");
-    s += `<rect x="${(x + 1).toFixed(1)}" y="${y.toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${col}" opacity="0.82"/>`;
+    if (n > 8 && i % 2) return; // 桶多时隔一个标一次，避免文字打架
+    s += `<text class="axis-num" x="${(padL + i * bw + bw / 2).toFixed(1)}" y="${h - 8}" text-anchor="middle">${(+b.lo).toFixed(1)}</text>`;
   });
-  [0, Math.floor((n - 1) / 2), n - 1].forEach((i) => {
-    const x = pl + i * bw + bw / 2;
-    s += `<text class="axis-text" x="${x.toFixed(1)}" y="${H - 8}" text-anchor="middle">${(+confidence[i].lo).toFixed(1)}–${(+confidence[i].hi).toFixed(1)}</text>`;
-  });
-  return `<svg viewBox="0 0 ${W} ${H}">${s}</svg>`;
+  // 右端补一个 1.0，区间读起来才是闭合的 [0,1]
+  s += `<text class="axis-num" x="${(padL + pw).toFixed(1)}" y="${h - 8}" text-anchor="end">1.0</text>`;
+  return s + `</svg>`;
 }
 
 function arcPath(cx, cy, rO, rI, a0, a1) {
@@ -2281,35 +2622,51 @@ function arcPath(cx, cy, rO, rI, a0, a1) {
     `L${x2.toFixed(1)} ${y2.toFixed(1)} A${rI} ${rI} 0 ${large} 0 ${x3.toFixed(1)} ${y3.toFixed(1)} Z`;
 }
 
-function svgDonut(sources) {
-  if (!sources || !sources.length) return '<div class="empty">暂无来源数据</div>';
+/* ---------------- 来源构成（环形 + 图例） ---------------- */
+function drawDonut(w, h, sources) {
+  if (!sources || !sources.length) return emptyChart("暂无来源数据", h);
   const total = sources.reduce((a, b) => a + b.count, 0) || 1;
-  const cx = 110, cy = 110, rO = 80, rI = 48;
-  let s = `<svg viewBox="0 0 680 220">`;
+  const size = Math.max(96, Math.min(h - 28, w * 0.34, 212));
+  const cx = 14 + size / 2, cy = h / 2;
+  const rO = size / 2, rI = rO * 0.63;
+  let s = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="知识来源构成">`;
   let a0 = -Math.PI / 2;
   sources.forEach((src, i) => {
     const frac = src.count / total;
     if (frac <= 0.0005) return;
-    const a1 = a0 + frac * Math.PI * 2 * 0.9999;
+    const a1 = a0 + frac * Math.PI * 2 * 0.9995;
     const col = AN_PALETTE[i % AN_PALETTE.length];
-    s += `<path d="${arcPath(cx, cy, rO, rI, a0, a1)}" fill="${col}" opacity="0.85"><title>${esc(src.kind)}: ${src.count}</title></path>`;
+    s += `<path d="${arcPath(cx, cy, rO, rI, a0, a1)}" fill="${col}" opacity="0.88"><title>${esc(src.kind)}：${src.count} 条（${((frac) * 100).toFixed(1)}%）</title></path>`;
     a0 = a1;
   });
-  s += `<text x="${cx}" y="${cy - 4}" text-anchor="middle" style="fill:var(--text);font-size:22px;font-weight:600">${total}</text>`;
-  s += `<text x="${cx}" y="${cy + 14}" text-anchor="middle" class="axis-text">总条数</text>`;
-  let ly = 30;
+  s += `<text x="${cx}" y="${cy - 1}" text-anchor="middle" style="fill:var(--text);font-family:var(--mono);font-size:${Math.round(size * 0.17)}px;font-weight:600">${fmtNum(total)}</text>`;
+  s += `<text x="${cx}" y="${cy + Math.round(size * 0.14)}" text-anchor="middle" class="axis-text">总条数</text>`;
+
+  // 图例：颜色块 + 名称 + 条数/占比 + 细比例条
+  const lx = 14 + size + 26;
+  const lw = Math.max(80, w - lx - 10);
+  const rows = sources.length;
+  // 行距按可用高度摊开（上限 46），图例不会挤在卡片上半截
+  const rowH = Math.min(42, Math.max(24, (h - 12) / Math.max(1, rows)));
+  const startY = Math.max(6, (h - rows * rowH) / 2);
   sources.forEach((src, i) => {
     const col = AN_PALETTE[i % AN_PALETTE.length];
-    const pct = ((src.count / total) * 100).toFixed(1);
-    s += `<g transform="translate(230,${ly})"><rect width="11" height="11" rx="3" fill="${col}"/>` +
-      `<text x="17" y="10" class="bar-label">${esc(src.kind)} · ${src.count} (${pct}%)</text></g>`;
-    ly += 24;
+    const pct = (src.count / total) * 100;
+    const y = startY + i * rowH;
+    const name = src.kind.length > 14 ? src.kind.slice(0, 14) + "…" : src.kind;
+    s += `<rect x="${lx}" y="${y + 1}" width="8" height="8" rx="2" fill="${col}"/>`;
+    s += `<text class="bar-label" x="${lx + 15}" y="${y + 9}">${esc(name)}</text>`;
+    s += `<text class="axis-num" x="${lx + lw}" y="${y + 9}" text-anchor="end" style="fill:var(--text-dim)">${pct.toFixed(1)}%</text>`;
+    s += `<text class="axis-num" x="${lx + lw - 44}" y="${y + 9}" text-anchor="end">${fmtNum(src.count)}</text>`;
+    s += `<rect x="${lx}" y="${y + 15}" width="${lw}" height="5" rx="2.5" fill="var(--border-soft)"/>`;
+    s += `<rect x="${lx}" y="${y + 15}" width="${Math.max(3, (lw * pct) / 100).toFixed(1)}" height="5" rx="2.5" fill="${col}" opacity="0.85"/>`;
   });
   return s + `</svg>`;
 }
 
-function svgGraph(graph) {
-  if (!graph || !graph.nodes || !graph.nodes.length) return '<div class="empty">还没有可成网的知识点</div>';
+/* ---------------- 主题语义网络 ---------------- */
+function drawGraph(w, h, graph) {
+  if (!graph || !graph.nodes || !graph.nodes.length) return null;
   const nodes = graph.nodes.map((nd) => ({ id: nd.topic, count: nd.count, label: nd.topic, x: 0, y: 0 }));
   const idx = {};
   nodes.forEach((n, i) => (idx[n.id] = i));
@@ -2317,72 +2674,162 @@ function svgGraph(graph) {
     .map((e) => ({ a: idx[e.a], b: idx[e.b], w: e.w }))
     .filter((e) => e.a != null && e.b != null);
   const N = nodes.length;
-  const W = 680, H = 320, cx = W / 2, cy = H / 2;
+  const cx = w / 2, cy = h / 2;
   nodes.forEach((n, i) => {
-    const ang = (i / N) * Math.PI * 2;
-    n.x = cx + 110 * Math.cos(ang);
-    n.y = cy + 110 * Math.sin(ang);
+    const ang = (i / N) * Math.PI * 2 - Math.PI / 2;
+    const r0 = Math.min(w, h) * 0.3;
+    n.x = cx + r0 * Math.cos(ang);
+    n.y = cy + r0 * Math.sin(ang);
   });
-  const rep = 9000, k = 220;
-  for (let it = 0; it < 240; it++) {
-    const fx = new Array(N).fill(0), fy = new Array(N).fill(0);
+
+  /* Fruchterman-Reingold：斥力 k²/d、引力 d²/k、温度逐轮衰减。
+     旧版是「常量斥力 + 固定步长」，节点会挤成一团（截图里标签全叠在一起）。
+     k 随画布面积和节点数自适应，宽卡片自动摊开。 */
+  const k = Math.sqrt((w * h) / Math.max(1, N)) * 0.66;
+  let temp = Math.min(w, h) / 5;
+  for (let it = 0; it < 300; it++) {
+    const dx = new Array(N).fill(0), dy = new Array(N).fill(0);
     for (let i = 0; i < N; i++)
       for (let j = i + 1; j < N; j++) {
-        let dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
-        const d2 = dx * dx + dy * dy + 0.01, d = Math.sqrt(d2);
-        const f = rep / d2;
-        fx[i] += (f * dx) / d; fy[i] += (f * dy) / d;
-        fx[j] -= (f * dx) / d; fy[j] -= (f * dy) / d;
+        let vx = nodes[i].x - nodes[j].x, vy = nodes[i].y - nodes[j].y;
+        let d = Math.sqrt(vx * vx + vy * vy);
+        if (d < 0.01) { vx = 0.01 * (i - j); vy = 0.01; d = 0.01; }
+        const f = (k * k) / d;
+        dx[i] += (vx / d) * f; dy[i] += (vy / d) * f;
+        dx[j] -= (vx / d) * f; dy[j] -= (vy / d) * f;
       }
     edges.forEach((e) => {
-      let dx = nodes[e.b].x - nodes[e.a].x, dy = nodes[e.b].y - nodes[e.a].y;
-      const d = Math.sqrt(dx * dx + dy * dy) + 0.01;
-      const f = k * (d - 90);
-      fx[e.a] += (f * dx) / d; fy[e.a] += (f * dy) / d;
-      fx[e.b] -= (f * dx) / d; fy[e.b] -= (f * dy) / d;
+      const vx = nodes[e.b].x - nodes[e.a].x, vy = nodes[e.b].y - nodes[e.a].y;
+      const d = Math.max(0.01, Math.sqrt(vx * vx + vy * vy));
+      const f = (d * d) / k;
+      dx[e.a] += (vx / d) * f; dy[e.a] += (vy / d) * f;
+      dx[e.b] -= (vx / d) * f; dy[e.b] -= (vy / d) * f;
     });
     nodes.forEach((n, i) => {
-      fx[i] += (cx - n.x) * 0.02;
-      fy[i] += (cy - n.y) * 0.02;
-      n.x += Math.max(-8, Math.min(8, fx[i] * 0.05));
-      n.y += Math.max(-8, Math.min(8, fy[i] * 0.05));
-      n.x = Math.max(42, Math.min(W - 42, n.x));
-      n.y = Math.max(28, Math.min(H - 28, n.y));
+      dx[i] += (cx - n.x) * 0.12; dy[i] += (cy - n.y) * 0.12;
+      const len = Math.max(0.01, Math.hypot(dx[i], dy[i]));
+      const step = Math.min(len, temp);
+      n.x += (dx[i] / len) * step;
+      n.y += (dy[i] / len) * step;
     });
+    temp *= 0.985;
   }
+
   const maxc = Math.max(...nodes.map((n) => n.count), 1);
-  let s = `<svg viewBox="0 0 ${W} ${H}" class="graph-svg">`;
+  const rOf = (c) => 5 + Math.sqrt(c / maxc) * Math.min(17, Math.min(w, h) * 0.05);
+
+  /* 布局归一化：把整团节点等比缩放、平移到画布内。
+     只靠坐标钳制的话，力会把节点压到四条边上（截图里节点贴着卡片顶边被切掉），
+     归一化之后无论几个方向、卡片多宽，都能刚好铺满中间区域。 */
+  const padX = 74, padY = 40;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  nodes.forEach((n) => {
+    const r = rOf(n.count);
+    minX = Math.min(minX, n.x - r); maxX = Math.max(maxX, n.x + r);
+    minY = Math.min(minY, n.y - r); maxY = Math.max(maxY, n.y + r);
+  });
+  const spanX = Math.max(1, maxX - minX), spanY = Math.max(1, maxY - minY);
+  const scale = Math.min((w - padX * 2) / spanX, (h - padY * 2) / spanY, 1.45);
+  const offX = cx - ((minX + maxX) / 2) * scale;
+  const offY = cy - ((minY + maxY) / 2) * scale;
+  nodes.forEach((n) => {
+    n.x = n.x * scale + offX;
+    n.y = n.y * scale + offY;
+  });
+  /* 去重叠：力导向收敛后仍会有两个圆点叠在一起（尤其是同一簇里度数高的），
+     这里补几轮「硬推开」，保证圆点之间至少留 8px 呼吸空间。 */
+  for (let it = 0; it < 24; it++) {
+    let moved = 0;
+    for (let i = 0; i < N; i++)
+      for (let j = i + 1; j < N; j++) {
+        const ri = rOf(nodes[i].count), rj = rOf(nodes[j].count);
+        const need = ri + rj + 8;
+        let vx = nodes[j].x - nodes[i].x, vy = nodes[j].y - nodes[i].y;
+        let d = Math.sqrt(vx * vx + vy * vy);
+        if (d < 0.01) { vx = 0.01; vy = 0.01; d = 0.01; }
+        if (d >= need) continue;
+        const push = (need - d) / 2;
+        nodes[i].x -= (vx / d) * push; nodes[i].y -= (vy / d) * push;
+        nodes[j].x += (vx / d) * push; nodes[j].y += (vy / d) * push;
+        moved++;
+      }
+    if (!moved) break;
+  }
+  nodes.forEach((n) => {
+    const r = rOf(n.count);
+    n.x = Math.max(padX - 30 + r, Math.min(w - padX + 30 - r, n.x));
+    n.y = Math.max(padY - 16 + r, Math.min(h - padY + 16 - r, n.y));
+  });
+
+  let s = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" class="graph-svg" role="img" aria-label="主题语义网络">`;
   edges.forEach((e) => {
     const a = nodes[e.a], b = nodes[e.b];
-    // 边色按相似度分档：越近越偏绿，弱连接用中性色，一眼看出哪些方向关联最紧
     const ecol = e.w >= 0.6 ? "var(--green)" : e.w >= 0.45 ? "var(--accent)" : "var(--border-strong)";
-    s += `<line class="gedge" data-a="${e.a}" data-b="${e.b}" x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="${ecol}" stroke-width="${(0.4 + e.w * 4).toFixed(2)}" opacity="${(0.18 + e.w * 0.55).toFixed(2)}"/>`;
+    s += `<line class="gedge" data-a="${e.a}" data-b="${e.b}" x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="${ecol}" stroke-width="${(0.5 + e.w * 3).toFixed(2)}" opacity="${(0.18 + e.w * 0.5).toFixed(2)}"/>`;
   });
   nodes.forEach((n, i) => {
-    const r = 5 + Math.sqrt(n.count / maxc) * 16;
+    const r = rOf(n.count);
     const col = AN_PALETTE[i % AN_PALETTE.length];
-    s += `<g class="gnode" data-i="${i}"><circle class="gdot" cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${col}" opacity="0.82" stroke="#0a0f16" stroke-width="1.5"><title>${esc(n.label)}: ${n.count} 条知识点</title></circle>`;
-    if (N <= 14 || r > 11) {
-      const lab = n.label.length > 10 ? n.label.slice(0, 10) + "…" : n.label;
-      s += `<text class="node-label" x="${n.x.toFixed(1)}" y="${(n.y + r + 11).toFixed(1)}" text-anchor="middle">${esc(lab)}</text>`;
-    }
-    s += `</g>`;
+    s += `<g class="gnode" data-i="${i}"><circle class="gdot" cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${col}" opacity="0.85" stroke="#0a0f16" stroke-width="1.5"><title>${esc(n.label)}：${n.count} 条知识点</title></circle></g>`;
+  });
+
+  /* 标签排布：大节点优先，依次尝试「下 / 上 / 右 / 左」四个方位，
+     同时避开其他标签和其他节点——旧版只看标签之间是否重叠，
+     结果标签常常压住隔壁的圆点。 */
+  const placed = [];
+  const hitBox = (a, b) => !(a.x + a.w < b.x || a.x > b.x + b.w || a.y + a.h < b.y || a.y > b.y + b.h);
+  const hitNode = (box, self) =>
+    nodes.some((n, j) => {
+      if (j === self) return false;
+      const r = rOf(n.count) + 2;
+      const px = Math.max(box.x, Math.min(n.x, box.x + box.w));
+      const py = Math.max(box.y, Math.min(n.y, box.y + box.h));
+      return (px - n.x) ** 2 + (py - n.y) ** 2 < r * r;
+    });
+  const order = nodes.map((n, i) => i).sort((a, b) => nodes[b].count - nodes[a].count);
+  const labels = [];
+  order.forEach((i) => {
+    const n = nodes[i];
+    const r = rOf(n.count);
+    const raw = n.label.length > 9 ? n.label.slice(0, 9) + "…" : n.label;
+    const tw = textW(raw, 10.5) + 8;
+    const th = 14;
+    const tries = [
+      { x: n.x - tw / 2, y: n.y + r + 4 },
+      { x: n.x - tw / 2, y: n.y - r - th - 2 },
+      { x: n.x + r + 6, y: n.y - th / 2 },
+      { x: n.x - r - tw - 6, y: n.y - th / 2 },
+    ];
+    const box = tries.find(
+      (b) =>
+        b.x >= 0 && b.y >= 0 && b.x + tw <= w && b.y + th <= h &&
+        !placed.some((p) => hitBox({ ...b, w: tw, h: th }, p)) &&
+        !hitNode({ ...b, w: tw, h: th }, i)
+    );
+    if (!box) return;
+    placed.push({ ...box, w: tw, h: th });
+    labels.push({ i, x: box.x + tw / 2, y: box.y + th - 4, text: raw });
+  });
+  labels.forEach((l) => {
+    s += `<text class="node-label" data-i="${l.i}" x="${l.x.toFixed(1)}" y="${l.y.toFixed(1)}" text-anchor="middle" style="paint-order:stroke;stroke:#080b11;stroke-width:3px;stroke-linejoin:round">${esc(l.text)}</text>`;
   });
   return s + `</svg>`;
 }
-
 /* 主题语义网络：装配 + 交互（拖拽 / 悬停高亮 / 点击展开该方向知识点）。
 
-svgGraph 仍是纯渲染（可单测）；这里负责注入后绑定指针事件。
+drawGraph 仍是纯渲染（可单测）；这里负责注入后绑定指针事件。
 空库时给一段引导，指回「自主进化」——而不是丢一句「暂无数据」。
 */
 let _graphSeq = 0;
+let _graphData = null;
+
 async function mountGraph(graph) {
   const box = $("#an-graph");
   const detail = $("#an-graph-detail");
   if (!box) return;
   const mySeq = ++_graphSeq;
   if (!graph || !graph.nodes || !graph.nodes.length) {
+    _graphData = null;
     setHTML(box, `<div class="empty" style="text-align:left;line-height:1.8;padding:6px 2px">
       <div style="font-weight:600;margin-bottom:4px">知识网络需要至少两个学习方向</div>
       <div>去「自主进化」定一个具体的方向开始学习；学到两三个方向后回来，这里会显示它们之间的知识关联——连线越粗，两个方向的知识点越接近。</div>
@@ -2391,7 +2838,9 @@ async function mountGraph(graph) {
     if (detail) setHTML(detail, "");
     return;
   }
-  setHTML(box, svgGraph(graph));
+  _graphData = graph;
+  const draw = (w, h) => drawGraph(w, h, graph) || emptyChart("暂无数据", h);
+  chartFrame(box, 286, draw);
   if (detail) setHTML(detail, "悬停一个方向看它的关联，点一下看这个方向最近学到的知识");
   bindGraphInteractions(box, graph, mySeq, detail);
 }
@@ -2437,15 +2886,15 @@ function bindGraphInteractions(box, graph, mySeq, detail) {
   function moveNode(i, x, y) {
     const g = nodes[i];
     const dot = g.querySelector("circle.gdot");
-    const label = g.querySelector("text.node-label");
-    const r = dot ? +dot.getAttribute("r") : 8;
-    if (dot) {
-      dot.setAttribute("cx", x.toFixed(1));
-      dot.setAttribute("cy", y.toFixed(1));
-    }
-    if (label) {
-      label.setAttribute("x", x.toFixed(1));
-      label.setAttribute("y", (y + r + 11).toFixed(1));
+    if (!dot) return;
+    dot.setAttribute("cx", x.toFixed(1));
+    dot.setAttribute("cy", y.toFixed(1));
+    // 标签已经拆成独立元素（为了做避让），按 data-i 找回来跟着走
+    const svg = g.ownerSVGElement;
+    const lab = svg && svg.querySelector(`text.node-label[data-i="${i}"]`);
+    if (lab) {
+      lab.setAttribute("x", x.toFixed(1));
+      lab.setAttribute("y", (y + (+dot.getAttribute("r")) + 14).toFixed(1));
     }
     edges.forEach((el) => {
       const a = +el.dataset.a, b = +el.dataset.b;
@@ -2498,7 +2947,7 @@ function bindGraphInteractions(box, graph, mySeq, detail) {
       if (detail && mySeq === _graphSeq) {
         const nb = [...adj[i]];
         const t = g.querySelector("title");
-        const label = t ? t.textContent.split(":")[0] : `方向 ${i + 1}`;
+        const label = t ? t.textContent.split("：")[0] : `方向 ${i + 1}`;
         setHTML(
           detail,
           nb.length
@@ -2546,181 +2995,205 @@ function bindGraphInteractions(box, graph, mySeq, detail) {
   }
 }
 
-function svgGauge(rate, label) {
-  rate = Math.max(0, Math.min(100, rate | 0));
-  const W = 150, H = 150, cx = 75, cy = 75, r = 58;
+/* ---------------- 仪表盘 / 迷你折线 / 磁盘 ---------------- */
+function drawGauge(size, rate, label) {
+  rate = Math.max(0, Math.min(100, Math.round(rate) || 0));
+  const cx = size / 2, cy = size / 2;
+  const sw = Math.max(8, Math.round(size * 0.085));
+  const r = size / 2 - sw / 2 - 3;
   const C = 2 * Math.PI * r;
   const off = C * (1 - rate / 100);
-  const col = rate >= 70 ? "var(--green)" : rate >= 40 ? "var(--accent)" : "var(--orange, #e0a23b)";
-  return `<svg viewBox="0 0 ${W} ${H}">
-    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--border-soft)" stroke-width="12"/>
-    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${col}" stroke-width="12" stroke-linecap="round"
+  const col = rate >= 70 ? "var(--green)" : rate >= 40 ? "var(--accent)" : "var(--amber)";
+  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--border-soft)" stroke-width="${sw}"/>
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${col}" stroke-width="${sw}" stroke-linecap="round"
       stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 ${cx} ${cy})"/>
-    <text x="${cx}" y="${cy - 2}" text-anchor="middle" style="font-family:var(--mono);font-size:30px;font-weight:700;fill:var(--text)">${rate}%</text>
-    <text x="${cx}" y="${cy + 20}" text-anchor="middle" class="axis-text">${esc(label || "命中率")}</text>
+    <text x="${cx}" y="${cy + 2}" text-anchor="middle" style="font-family:var(--mono);font-size:${Math.round(size * 0.2)}px;font-weight:700;fill:var(--text)">${rate}%</text>
+    <text x="${cx}" y="${cy + Math.round(size * 0.19)}" text-anchor="middle" class="axis-text">${esc(label || "命中率")}</text>
   </svg>`;
 }
 
-function svgDiskBar(d) {
-  if (!d) return '<div class="empty">等待状态数据…</div>';
-  const used = +(d.used_gb || 0), budget = +(d.budget_gb || 0), free = +(d.free_gb || 0);
-  const models = d.models || 0, datasets = d.datasets || 0;
-  // 分母取预算；预算未配置(0)时退化为已用量，避免除零
-  const denom = budget > 0 ? budget : Math.max(used, 1);
-  const W = 680, H = 66, pad = 4, barW = W - 190, bh = 16;
-  const pctReal = (used / denom) * 100;
-  // 预算用尽后再涨就会侵占磁盘剩余空间，>90% 转橙、100% 转红
-  const col = pctReal >= 100 ? "var(--red, #d9534f)" : pctReal >= 90 ? "var(--orange, #e0a23b)" : "var(--green)";
-  const wUsed = (Math.max(0, Math.min(100, pctReal)) / 100) * barW;
-  return `<svg viewBox="0 0 ${W} ${H}">
-    <text x="0" y="12" class="axis-text">磁盘预算占用（模型 + 数据集）</text>
-    <rect x="0" y="${pad + 14}" width="${barW}" height="${bh}" rx="4" fill="var(--border-soft)"/>
-    <rect x="0" y="${pad + 14}" width="${wUsed.toFixed(1)}" height="${bh}" rx="4" fill="${col}"/>
-    <text x="${barW + 10}" y="${pad + 26}" style="font-family:var(--mono);font-size:13px;fill:var(--text)">${used} / ${budget} GB</text>
-    <text x="0" y="${pad + 46}" class="axis-text">已用 ${pctReal.toFixed(1)}% · 磁盘剩余 ${free} GB · 模型 ${models} 个 · 数据集 ${datasets} 个</text>
-  </svg>`;
-}
-
-function svgSpark(arr) {
-  if (!arr || arr.length === 0) return '<div class="empty">等待采样…</div>';
-  const W = 380, H = 54, pad = 8;
+function drawSpark(w, h, arr) {
+  if (!arr || arr.length === 0) return emptyChart("等待采样…", h);
+  const padX = 3, padY = 8;
   const max = Math.max(...arr), min = Math.min(...arr);
   const span = Math.max(max - min, 1e-6);
   const n = arr.length;
-  const x = (i) => (n === 1 ? W / 2 : pad + (i / (n - 1)) * (W - 2 * pad));
-  const y = (v) => H - pad - ((v - min) / span) * (H - 2 * pad);
+  const x = (i) => (n === 1 ? w / 2 : padX + (i / (n - 1)) * (w - 2 * padX));
+  const y = (v) => h - padY - ((v - min) / span) * (h - 2 * padY);
   let line = "";
   arr.forEach((v, i) => {
     line += (i === 0 ? "M" : "L") + x(i).toFixed(1) + " " + y(v).toFixed(1) + " ";
   });
-  const area = line + `L ${x(n - 1).toFixed(1)} ${H - pad} L ${x(0).toFixed(1)} ${H - pad} Z`;
-  const dots = arr.map((v, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.2" fill="var(--accent)"/>`).join("");
-  return `<svg viewBox="0 0 ${W} ${H}">
-    <path d="${area}" fill="var(--accent)" opacity="0.12"/>
-    <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2"/>
-    ${dots}
+  const area = line + `L ${x(n - 1).toFixed(1)} ${h - padY} L ${x(0).toFixed(1)} ${h - padY} Z`;
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+    <defs><linearGradient id="spark-${Math.round(w)}-${arr.length}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+    </linearGradient></defs>
+    <path d="${area}" fill="url(#spark-${Math.round(w)}-${arr.length})"/>
+    <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="1.6" stroke-linejoin="round"/>
+    <circle cx="${x(n - 1).toFixed(1)}" cy="${y(arr[n - 1]).toFixed(1)}" r="2.6" fill="var(--accent)"/>
   </svg>`;
 }
 
-function renderSearchExplain(data) {
-  if (!data || !data.hits || !data.hits.length) return '<div class="empty">没有命中任何知识点</div>';
-  const W = 680, H = 10 + data.hits.length * 30;
-  const maxScore = Math.max(...data.hits.map((h) => h.score), 0.01);
-  let s = `<svg viewBox="0 0 ${W} ${H}">`;
-  data.hits.forEach((h, i) => {
-    const y = 10 + i * 30;
-    const w = Math.max(2, (h.score / maxScore) * (W - 280));
-    s += `<rect x="0" y="${y}" width="${w.toFixed(1)}" height="14" rx="3" fill="var(--accent)" opacity="0.8"/>`;
-    s += `<text class="bar-label" x="${(w + 8).toFixed(1)}" y="${y + 11}">${esc((h.claim || "").slice(0, 30))} · ${(+h.score).toFixed(3)}</text>`;
-  });
-  return s + `</svg>`;
+function drawDisk(w, h, d) {
+  if (!d) return emptyChart("等待状态数据…", h);
+  const used = +(d.used_gb || 0), budget = +(d.budget_gb || 0), free = +(d.free_gb || 0);
+  const models = d.models || 0, datasets = d.datasets || 0;
+  // 分母取预算；预算未配置(0)时退化为已用量，避免除零
+  const denom = budget > 0 ? budget : Math.max(used, 1);
+  const pct = Math.max(0, (used / denom) * 100);
+  const col = pct >= 100 ? "var(--red)" : pct >= 90 ? "var(--amber)" : "var(--green)";
+  const bh = 6;
+  const y = 26;
+  const wUsed = (Math.min(100, pct) / 100) * w;
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+    <text class="axis-text" x="0" y="10">磁盘预算占用（模型 + 数据集）</text>
+    <text class="axis-num" x="${w}" y="10" text-anchor="end" style="fill:var(--text-dim)">${used} / ${budget || "—"} GB · ${pct.toFixed(1)}%</text>
+    <rect x="0" y="${y}" width="${w}" height="${bh}" rx="3" fill="var(--border-soft)"/>
+    <rect x="0" y="${y}" width="${Math.max(2, wUsed).toFixed(1)}" height="${bh}" rx="3" fill="${col}"/>
+    <text class="axis-text" x="0" y="${y + bh + 15}">磁盘剩余 ${free} GB · 模型 ${models} 个 · 数据集 ${datasets} 个</text>
+  </svg>`;
 }
 
-function svgSearchGraph(data) {
-  if (!data || !data.hits || !data.hits.length) return "";
-  const W = 680, H = 300, cx = W / 2, cy = H / 2;
-  const hits = data.hits;
-  let s = `<svg viewBox="0 0 ${W} ${H}">`;
-  hits.forEach((h, i) => {
-    const ang = (i / hits.length) * Math.PI * 2;
-    const R = 110;
-    h._x = cx + R * Math.cos(ang);
-    h._y = cy + R * Math.sin(ang);
-    s += `<line x1="${cx}" y1="${cy}" x2="${h._x.toFixed(1)}" y2="${h._y.toFixed(1)}" stroke="var(--green)" stroke-width="${(0.3 + h.score * 5).toFixed(2)}" opacity="0.6"/>`;
-  });
-  s += `<circle cx="${cx}" cy="${cy}" r="26" fill="var(--accent)" opacity="0.9"/>` +
-    `<text x="${cx}" y="${cy + 4}" text-anchor="middle" class="node-label" style="fill:#fff">查询</text>`;
-  hits.forEach((h) => {
-    const r = 6 + Math.min(14, h.score * 16);
-    s += `<circle cx="${h._x.toFixed(1)}" cy="${h._y.toFixed(1)}" r="${r.toFixed(1)}" fill="var(--green)" opacity="0.85"/>` +
-      `<text class="node-label" x="${h._x.toFixed(1)}" y="${(h._y + r + 12).toFixed(1)}" text-anchor="middle">${esc((h.claim || "").slice(0, 8))}…</text>`;
-  });
-  return s + `</svg>`;
-}
-
-function svgHeatmap(growth) {
-  if (!growth || !growth.length) return '<div class="empty">还没有学习记录</div>';
-  const added = {};
-  growth.forEach((g) => (added[g.day] = g.added));
-  const days = growth.map((g) => g.day).sort();
-  const first = new Date(days[0] + "T00:00:00Z");
-  const last = new Date(days[days.length - 1] + "T00:00:00Z");
-  // 对齐到起点所在周的周日，做成 GitHub 贡献式日历格
-  const start = new Date(first);
-  start.setUTCDate(first.getUTCDate() - first.getUTCDay());
-  const maxAdd = Math.max(...growth.map((g) => g.added), 1);
-  const cell = 13, gap = 3, left = 20, top = 18;
-  const totalDays = Math.round((last - start) / 86400000) + 1;
-  const weeks = Math.ceil(totalDays / 7);
-  const W = left + weeks * (cell + gap) + 6;
-  const H = top + 7 * (cell + gap) + 4;
-  const styleOf = (n) => {
-    if (n <= 0) return ["var(--border-soft)", 0.5];
-    const r = n / maxAdd;
-    if (r > 0.66) return ["var(--green)", 0.95];
-    if (r > 0.33) return ["var(--accent)", 0.72];
-    return ["var(--accent)", 0.45];
-  };
-  const WD = ["日", "一", "二", "三", "四", "五", "六"];
-  // 自适应显示尺寸：viewBox 的自然宽度随数据跨度变（几周 ≈60px，一年 ≈860px）。
-  // 卡片是 .chart（svg width:100%），不指定宽高时窄 viewBox 会被拉满整卡——
-  // 格子变成几百像素的色块（截图评审时抓到的真实渲染 bug）。
-  // 这里按「目标宽约 640px」放大（1~3 倍），数据多时保持原尺寸；
-  // 配合 CSS 的 max-width:100%，超宽自然缩小，比例始终正确。
-  const k = Math.max(1, Math.min(3, 640 / W));
-  let s = `<svg viewBox="0 0 ${W} ${H}" width="${Math.round(W * k)}" height="${Math.round(H * k)}">`;
-  for (let d = 1; d < 7; d += 2)
-    s += `<text class="axis-text" x="0" y="${top + d * (cell + gap) + cell - 3}">${WD[d]}</text>`;
-  // 月份标签：某一周列跨入新月份时在顶部标注
-  let lastMonth = -1;
-  for (let wk = 0; wk < weeks; wk++) {
-    const dt = new Date(start.getTime() + wk * 7 * 86400000);
-    const m = dt.getUTCMonth();
-    if (m !== lastMonth) {
-      lastMonth = m;
-      s += `<text class="axis-text" x="${left + wk * (cell + gap)}" y="11">${m + 1}月</text>`;
-    }
-  }
-  for (let i = 0; i < totalDays; i++) {
-    const dt = new Date(start.getTime() + i * 86400000);
-    if (dt > last) break;
-    const wd = dt.getUTCDay();
-    const wk = Math.floor(i / 7);
-    const key = dt.toISOString().slice(0, 10);
-    const n = added[key] || 0;
-    const [col, op] = styleOf(n);
-    const x = left + wk * (cell + gap);
-    const y = top + wd * (cell + gap);
-    s += `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2.5" fill="${col}" opacity="${op}"><title>${key}：新增 ${n} 条</title></rect>`;
-  }
-  return s + `</svg>`;
-}
-
-function svgSessions(sd) {
+/* ---------------- 学习历程 ---------------- */
+function drawSessions(w, sd) {
   const items = (sd && sd.sessions) || [];
   if (!items.length)
-    return '<div class="empty">还没有学习记录——去「资源获取」启动一轮，这里会画出每次任务的产出</div>';
-  const W = 680, labW = 150, rowH = 46, padT = 10;
-  const maxP = Math.max(...items.map((s) => s.new_points), 1);
-  const H = padT * 2 + items.length * rowH;
-  const barX = labW, barMax = W - labW - 160;
+    return { svg: emptyChart("还没有学习记录——去「资源获取」启动一轮，这里会画出每次任务的产出", 150), h: 150 };
+  const list = items.slice(-8);
+  const rowH = 38;
+  const padT = 6;
+  const H = padT * 2 + list.length * rowH;
+  const labW = Math.max(96, Math.min(200, w * 0.24));
+  const cntW = 54;   // 「84 条」列
+  const metaW = 122; // 「6 轮 · 单轮 14」列
+  const barX = labW + 14;
+  const barMax = Math.max(30, w - barX - cntW - metaW - 6);
+  const maxP = Math.max(...list.map((s) => s.new_points), 1);
   const colOf = (st) =>
     st === "done" ? "var(--green)" :
-    st === "stopped" ? "var(--orange, #e0a23b)" :
-    st === "error" ? "var(--red, #e0564f)" : "var(--accent)";
-  let s = `<svg viewBox="0 0 ${W} ${H}">`;
-  items.forEach((it, i) => {
+    st === "stopped" ? "var(--amber)" :
+    st === "error" ? "var(--red)" : "var(--accent)";
+  const fit = (txt, max) => {
+    if (textW(txt, 11.5) <= max) return txt;
+    let t = txt;
+    while (t.length > 1 && textW(t + "…", 11.5) > max) t = t.slice(0, -1);
+    return t + "…";
+  };
+  let s = `<svg width="${w}" height="${H}" viewBox="0 0 ${w} ${H}" role="img" aria-label="每次学习任务的产出">`;
+  list.forEach((it, i) => {
     const y = padT + i * rowH;
-    const cy = y + rowH / 2 - 6;
-    const w = Math.max(3, (it.new_points / maxP) * barMax);
+    const cy = y + rowH / 2;
+    const wBar = Math.max(3, (it.new_points / maxP) * barMax);
     const col = colOf(it.status);
-    const dir = (it.direction || "?").length > 16 ? it.direction.slice(0, 16) + "…" : it.direction;
-    s += `<text class="bar-label" x="6" y="${cy + 4}" style="font-weight:600">${esc(dir)}</text>`;
-    s += `<rect x="${barX}" y="${y + 6}" width="${w.toFixed(1)}" height="22" rx="5" fill="${col}" opacity="0.85">` +
-      `<title>新增 ${it.new_points} 条 · ${it.rounds} 轮 · 读 ${it.fetched} 篇 · 耗时 ${it.duration_s}s · 单轮 ${it.per_round} 条</title></rect>`;
-    s += `<text class="axis-text" x="${(barX + w + 8).toFixed(1)}" y="${cy + 4}">${it.new_points} 条 · ${it.rounds} 轮 · 单轮 ${it.per_round}</text>`;
+    s += `<g class="sess-row">`;
+    s += `<rect class="sess-bg" x="-8" y="${y + 1}" width="${w + 16}" height="${rowH - 4}" rx="7"/>`;
+    s += `<circle cx="4" cy="${cy}" r="3" fill="${col}"/>`;
+    s += `<text class="bar-label" x="14" y="${cy + 4}">${esc(fit(it.direction || "未命名方向", labW - 18))}</text>`;
+    // 轨道压到几乎看不见：它只用来暗示「满格有多长」，不该比数据条更抢眼
+    s += `<rect x="${barX}" y="${cy - 6}" width="${barMax}" height="12" rx="6" fill="#0b1119"/>`;
+    s += `<rect x="${barX}" y="${cy - 6}" width="${wBar.toFixed(1)}" height="12" rx="6" fill="${col}" opacity="0.9"><title>新增 ${it.new_points} 条 · ${it.rounds} 轮 · 读 ${it.fetched} 篇 · 耗时 ${it.duration_s}s · 单轮 ${it.per_round} 条</title></rect>`;
+    // 数值列左对齐到固定位置，扫一眼能纵向比较
+    s += `<text class="axis-num" x="${(barX + barMax + 10).toFixed(1)}" y="${cy + 4}" style="fill:var(--text-dim)">${it.new_points} 条</text>`;
+    s += `<text class="axis-num" x="${w - 2}" y="${cy + 4}" text-anchor="end">${it.rounds} 轮 · 单轮 ${it.per_round}</text>`;
+    s += `</g>`;
+  });
+  return { svg: s + `</svg>`, h: H };
+}
+
+/* 缓存命中构成：一条 100% 堆叠条（命中 / 未命中）。
+   检索平均耗时的迷你折线要攒够 20 次采样才有形状，刚打开分析页只有 1 个点，
+   画出来是个孤零零的圆点——换成这条「命中 vs 未命中」，第一帧就有信息量。 */
+function drawHitSplit(w, h, p) {
+  const calls = p.search_calls || 0;
+  const hits = p.search_cache_hits || 0;
+  const miss = Math.max(0, calls - hits);
+  const rate = calls ? hits / calls : 0;
+  const barH = 10, y = 30;
+  const wHit = Math.max(0, Math.min(1, rate)) * w;
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+    <circle cx="4" cy="8" r="3.5" fill="var(--green)"/>
+    <text class="axis-text" x="13" y="11.5">缓存命中 ${fmtNum(hits)} 次</text>
+    <text class="axis-text" x="${w}" y="11.5" text-anchor="end">未命中 ${fmtNum(miss)} 次</text>
+    <rect x="0" y="${y}" width="${w}" height="${barH}" rx="${barH / 2}" fill="var(--border-soft)"/>
+    <rect x="0" y="${y}" width="${wHit.toFixed(1)}" height="${barH}" rx="${barH / 2}" fill="var(--green)" opacity="0.85"/>
+    <text class="axis-text" x="0" y="${y + barH + 16}">重复检索与轮询直接复用上次结果，不重复计算</text>
+  </svg>`;
+}
+
+/* ---------------- 检索解释 ---------------- */
+function drawSearchExplain(w, data) {
+  if (!data || !data.hits || !data.hits.length)
+    return { svg: emptyChart("输入一个问题，看它命中了哪些知识点、每条匹配度多少", 84), h: 84 };
+  const hits = data.hits;
+  const rowH = 44;
+  const H = hits.length * rowH + 2;
+  const rankW = 22;
+  const scoreW = 48;
+  const barMax = Math.max(40, w - rankW - scoreW - 8);
+  const maxScore = Math.max(...hits.map((h) => h.score), 0.01);
+  const fit = (txt, max) => {
+    if (textW(txt, 11.5) <= max) return txt;
+    let t = txt;
+    while (t.length > 1 && textW(t + "…", 11.5) > max) t = t.slice(0, -1);
+    return t + "…";
+  };
+  let s = `<svg width="${w}" height="${H}" viewBox="0 0 ${w} ${H}" role="img" aria-label="检索命中列表">`;
+  hits.forEach((h, i) => {
+    const y = i * rowH;
+    const bw = Math.max(4, (h.score / maxScore) * barMax);
+    // 名次 + 命中文本 + 匹配条 + 分数，四列对齐，扫一眼就知道谁最相关
+    s += `<text class="axis-num" x="0" y="${y + 13}" style="fill:var(--text-faint)">${i + 1}</text>`;
+    s += `<text class="bar-label" x="${rankW}" y="${y + 13}">${esc(fit(h.claim || "", barMax - 4))}</text>`;
+    s += `<rect x="${rankW}" y="${y + 20}" width="${barMax}" height="4" rx="2" fill="var(--border-soft)" opacity="0.55"/>`;
+    s += `<rect x="${rankW}" y="${y + 20}" width="${bw.toFixed(1)}" height="4" rx="2" fill="var(--accent)" opacity="0.9"/>`;
+    s += `<text class="axis-num" x="${w}" y="${y + 13}" text-anchor="end" style="fill:var(--text);font-size:11.5px">${(+h.score).toFixed(3)}</text>`;
+  });
+  return { svg: s + `</svg>`, h: H };
+}
+
+function drawSearchGraph(w, h, data) {
+  if (!data || !data.hits || !data.hits.length) return emptyChart("命中关系会画在这里", 60);
+  const hits = data.hits;
+  const cx = w / 2, cy = h / 2;
+  /* 椭圆布局：卡片是宽扁的，用正圆会让两边空出一大片；
+     rx/ry 分开取，宽卡片也能撑满。 */
+  const rx = Math.max(70, Math.min(w * 0.3, 300));
+  const ry = Math.max(56, Math.min(h * 0.34, 104));
+  let s = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">`;
+  const pts = hits.map((h2, i) => {
+    const ang = (i / hits.length) * Math.PI * 2 - Math.PI / 2;
+    return { x: cx + rx * Math.cos(ang), y: cy + ry * Math.sin(ang), ang, h: h2 };
+  });
+  pts.forEach((p) => {
+    s += `<line x1="${cx}" y1="${cy}" x2="${p.x.toFixed(1)}" y2="${p.y.toFixed(1)}" stroke="var(--green)" stroke-width="${(0.4 + p.h.score * 3).toFixed(2)}" opacity="0.4"/>`;
+  });
+  s += `<circle cx="${cx}" cy="${cy}" r="24" fill="var(--accent)" opacity="0.92"/>` +
+    `<text x="${cx}" y="${cy + 4}" text-anchor="middle" style="fill:#fff;font-size:11px">查询</text>`;
+  pts.forEach((p) => {
+    const r = 6 + Math.min(13, p.h.score * 15);
+    s += `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${r.toFixed(1)}" fill="var(--green)" opacity="0.85"><title>${esc(p.h.claim || "")}</title></circle>`;
+    // 标签沿半径向外放，右半边左对齐、左半边右对齐，既不压连线也不会互相叠
+    const right = Math.cos(p.ang) >= 0;
+    const lx = p.x + (right ? r + 8 : -r - 8);
+    const room = right ? w - lx - 4 : lx - 4;
+    const lab = fitText(p.h.claim || "", room, 10.5);
+    if (lab) {
+      s += `<text class="node-label" x="${lx.toFixed(1)}" y="${(p.y + 3.5).toFixed(1)}" text-anchor="${right ? "start" : "end"}" style="paint-order:stroke;stroke:#080b11;stroke-width:3px;stroke-linejoin:round">${esc(lab)}</text>`;
+    }
   });
   return s + `</svg>`;
+}
+
+/* 按像素宽度截断（比按字数截断靠谱：中英文混排宽度差一倍） */
+function fitText(txt, maxW, size = 10.5) {
+  if (maxW < 24) return "";
+  if (textW(txt, size) <= maxW) return txt;
+  let t = txt;
+  while (t.length > 1 && textW(t + "…", size) > maxW) t = t.slice(0, -1);
+  return t.length > 1 ? t + "…" : "";
 }
 
 /* 数据版本标签：让「缓存」看得见——版本号不动就说明库没有新变化，
@@ -2748,6 +3221,19 @@ async function loadAnalytics(force = false) {
   // 才能拿去和现有内容比对，力导向图还要跑一遍布局模拟。
   if (!force && state.anVer === d.ver) return;
   state.anVer = d.ver;
+
+  /* 空库时不要把 8 张空图表摊在页面上：直接换成一张引导卡，
+     告诉用户数据从哪来、点哪里开始。 */
+  const isEmpty = !d.total;
+  const emptyEl = $("#an-empty");
+  const bodyEl = $("#an-body");
+  if (emptyEl) emptyEl.hidden = !isEmpty;
+  if (bodyEl) bodyEl.hidden = isEmpty;
+  if (isEmpty) {
+    setHTML($("#an-range-chip"), "");
+    return;
+  }
+
   setHTML($("#an-total"), String(d.total || 0));
   setHTML($("#an-topics-n"), String((d.topics || []).length));
   const srcs = d.sources || [];
@@ -2760,36 +3246,39 @@ async function loadAnalytics(force = false) {
     totN += b.n;
   });
   setHTML($("#an-conf-avg"), totN ? (avg / totN).toFixed(2) : "0");
-  setHTML($("#an-growth"), svgGrowth(d.growth));
+
+  const growth = d.growth || [];
+  mountGrowth($("#an-growth"), growth);
   setHTML(
     $("#an-growth-range"),
-    d.growth && d.growth.length
-      ? `${d.growth[0].day} → ${d.growth[d.growth.length - 1].day}（${d.growth.length} 天）`
-      : ""
+    growth.length ? `${growth[0].day} → ${growth[growth.length - 1].day}` : ""
   );
+  setHTML($("#an-range-chip"), growth.length ? `${growth.length} 天` : "");
+
   // 学习活跃度热力图（复用 growth 数据）
-  setHTML($("#an-heatmap"), svgHeatmap(d.growth));
-  setHTML(
-    $("#an-heat-range"),
-    d.growth && d.growth.length ? `近 ${d.growth.length} 天有学习记录` : ""
-  );
+  mountHeatmap($("#an-heatmap"), $("#an-heat-side"), growth);
+  setHTML($("#an-heat-range"), growth.length ? `近 ${growth.length} 天` : "");
+
   setHTML($("#an-topics"), htmlTopicBars(d.topics));
-  setHTML($("#an-conf"), svgHist(d.confidence));
-  setHTML($("#an-source"), svgDonut(d.sources));
+  chartFrame($("#an-conf"), 240, (w, h) => drawHist(w, h, conf));
+  setHTML($("#an-conf-meta"), totN ? `均值 ${(avg / totN).toFixed(2)} · ${fmtNum(totN)} 条` : "");
+  chartFrame($("#an-source"), 320, (w, h) => drawDonut(w, h, srcs));
   mountGraph(d.graph);
+
   // 学习历程：每次任务的产出条形
-  setHTML($("#an-sessions"), svgSessions(d.sessions));
+  const sd = d.sessions || {};
+  const nSess = (sd.sessions || []).length;
+  chartFrame($("#an-sessions"), () => 0, (w) => drawSessions(w, sd).svg);
   setHTML(
     $("#an-sessions-sum"),
-    d.sessions && d.sessions.total_sessions
-      ? `${d.sessions.total_sessions} 次任务 · 共新增 ${d.sessions.total_points} 条 · 合计 ${d.sessions.total_rounds} 轮`
+    sd.total_sessions
+      ? `${sd.total_sessions} 次任务 · 新增 ${sd.total_points} 条 · ${sd.total_rounds} 轮${nSess > 8 ? " · 仅显示最近 8 次" : ""}`
       : ""
   );
   // 检索性能卡片：命中率仪表 + 平均耗时迷你折线
   loadPerf();
 }
 
-let _perfHistory = [];
 async function loadPerf() {
   let p;
   try {
@@ -2798,16 +3287,20 @@ async function loadPerf() {
     return;
   }
   const rate = Math.round((p.search_cache_hit_rate || 0) * 100);
-  setHTML($("#an-perf-hit"), rate + "%");
+  setHTML($("#an-perf-hit"), fmtNum(p.search_cache_hits || 0));
   setHTML($("#an-perf-ms"), (p.search_avg_ms || 0).toFixed(2) + " ms");
-  setHTML($("#an-perf-calls"), String(p.search_calls || 0));
-  setHTML($("#an-perf-gauge"), svgGauge(rate, "命中率"));
-  // 维护最近 20 次平均耗时的趋势
-  _perfHistory.push(p.search_avg_ms || 0);
-  if (_perfHistory.length > 20) _perfHistory.shift();
-  setHTML($("#an-perf-spark"), svgSpark(_perfHistory));
+  setHTML($("#an-perf-calls"), fmtNum(p.search_calls || 0));
+  const gEl = $("#an-perf-gauge");
+  if (gEl) setHTML(ensureChart(gEl), drawGauge(118, rate, "命中率"));
+  chartFrame($("#an-perf-split"), 56, (w, h) => drawHitSplit(w, h, p));
   // 系统状态卡片：状态接口自身耗时 + LLM 服务 + 磁盘预算
   // （磁盘/LLM 数据取自 refreshAll 已经拉过的 /api/status，不额外发请求）
+  if (!state.status) {
+    // 直接从 #analytics 深链进来时状态还没拉过，这里补一次，否则仪表盘会显示 0%
+    try {
+      state.status = await api("/api/status");
+    } catch (_) {}
+  }
   loadSysStatus(p);
 }
 
@@ -2819,12 +3312,13 @@ function loadSysStatus(p) {
   const statusMs = p.status_avg_ms || 0;
   setHTML($("#an-sys-ms"), statusMs.toFixed(2) + " ms");
   setHTML($("#an-sys-llm"), llm.healthy ? "正常" : "离线");
-  $("#an-sys-llm").style.color = llm.healthy ? "var(--green)" : "var(--red, #d9534f)";
+  if ($("#an-sys-llm")) $("#an-sys-llm").style.color = llm.healthy ? "var(--green)" : "var(--red)";
   setHTML($("#an-sys-models"), String(models));
   const budgetPct = disk.budget_gb ? Math.round(((disk.used_gb || 0) / disk.budget_gb) * 100) : 0;
-  setHTML($("#an-sys-gauge"), svgGauge(budgetPct, "预算占用"));
-  setHTML($("#an-sys-disk"), svgDiskBar(disk));
-  setHTML($("#an-sys-spark"), svgSpark((p.status_series || []).slice(-20)));
+  const sg = $("#an-sys-gauge");
+  if (sg) setHTML(ensureChart(sg), drawGauge(118, budgetPct, "预算占用"));
+  chartFrame($("#an-sys-disk"), 52, (w, h) => drawDisk(w, h, disk));
+  chartFrame($("#an-sys-spark"), 46, (w, h) => drawSpark(w, h, (p.status_series || []).slice(-20)));
 }
 
 async function runSearchExplain() {
@@ -2840,8 +3334,8 @@ async function runSearchExplain() {
     toast("检索失败：" + e.message, "err");
     return;
   }
-  setHTML($("#an-search"), renderSearchExplain(d));
-  setHTML($("#an-search-graph"), svgSearchGraph(d));
+  chartFrame($("#an-search"), () => 0, (w) => drawSearchExplain(w, d).svg);
+  chartFrame($("#an-search-graph"), 260, (w, h) => drawSearchGraph(w, h, d));
 }
 
 $("#btn-an-search")?.addEventListener("click", runSearchExplain);
@@ -2866,7 +3360,13 @@ async function refreshAll() {
       const ver = st.stats && st.stats.ver;
       if (ver !== state.kbVer) await loadKnowledge();
     }
-    if (state.view === "analytics") loadAnalytics();
+    if (state.view === "analytics") {
+      // 分析图按版本门控重建；但性能/系统采样必须每轮都更新，
+      // 否则「缓存命中率 / 最近 20 次耗时」会一直停在第一次打开时的数值。
+      const before = state.anVer;
+      await loadAnalytics();
+      if (state.anVer === before) loadPerf();
+    }
   } catch (_) {}
   finally { refreshBusy = false; }
 }
