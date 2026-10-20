@@ -1751,6 +1751,58 @@ function svgSearchGraph(data) {
   return s + `</svg>`;
 }
 
+function svgHeatmap(growth) {
+  if (!growth || !growth.length) return '<div class="empty">还没有学习记录</div>';
+  const added = {};
+  growth.forEach((g) => (added[g.day] = g.added));
+  const days = growth.map((g) => g.day).sort();
+  const first = new Date(days[0] + "T00:00:00Z");
+  const last = new Date(days[days.length - 1] + "T00:00:00Z");
+  // 对齐到起点所在周的周日，做成 GitHub 贡献式日历格
+  const start = new Date(first);
+  start.setUTCDate(first.getUTCDate() - first.getUTCDay());
+  const maxAdd = Math.max(...growth.map((g) => g.added), 1);
+  const cell = 13, gap = 3, left = 20, top = 18;
+  const totalDays = Math.round((last - start) / 86400000) + 1;
+  const weeks = Math.ceil(totalDays / 7);
+  const W = left + weeks * (cell + gap) + 6;
+  const H = top + 7 * (cell + gap) + 4;
+  const styleOf = (n) => {
+    if (n <= 0) return ["var(--border-soft)", 0.5];
+    const r = n / maxAdd;
+    if (r > 0.66) return ["var(--green)", 0.95];
+    if (r > 0.33) return ["var(--accent)", 0.72];
+    return ["var(--accent)", 0.45];
+  };
+  const WD = ["日", "一", "二", "三", "四", "五", "六"];
+  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  for (let d = 1; d < 7; d += 2)
+    s += `<text class="axis-text" x="0" y="${top + d * (cell + gap) + cell - 3}">${WD[d]}</text>`;
+  // 月份标签：某一周列跨入新月份时在顶部标注
+  let lastMonth = -1;
+  for (let wk = 0; wk < weeks; wk++) {
+    const dt = new Date(start.getTime() + wk * 7 * 86400000);
+    const m = dt.getUTCMonth();
+    if (m !== lastMonth) {
+      lastMonth = m;
+      s += `<text class="axis-text" x="${left + wk * (cell + gap)}" y="11">${m + 1}月</text>`;
+    }
+  }
+  for (let i = 0; i < totalDays; i++) {
+    const dt = new Date(start.getTime() + i * 86400000);
+    if (dt > last) break;
+    const wd = dt.getUTCDay();
+    const wk = Math.floor(i / 7);
+    const key = dt.toISOString().slice(0, 10);
+    const n = added[key] || 0;
+    const [col, op] = styleOf(n);
+    const x = left + wk * (cell + gap);
+    const y = top + wd * (cell + gap);
+    s += `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" rx="2.5" fill="${col}" opacity="${op}"><title>${key}：新增 ${n} 条</title></rect>`;
+  }
+  return s + `</svg>`;
+}
+
 function svgSessions(sd) {
   const items = (sd && sd.sessions) || [];
   if (!items.length)
@@ -1804,6 +1856,12 @@ async function loadAnalytics() {
     d.growth && d.growth.length
       ? `${d.growth[0].day} → ${d.growth[d.growth.length - 1].day}（${d.growth.length} 天）`
       : ""
+  );
+  // 学习活跃度热力图（复用 growth 数据）
+  setHTML($("#an-heatmap"), svgHeatmap(d.growth));
+  setHTML(
+    $("#an-heat-range"),
+    d.growth && d.growth.length ? `近 ${d.growth.length} 天有学习记录` : ""
   );
   setHTML($("#an-topics"), htmlTopicBars(d.topics));
   setHTML($("#an-conf"), svgHist(d.confidence));

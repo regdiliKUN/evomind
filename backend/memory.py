@@ -605,6 +605,7 @@ def add_points_batch(
         accepted_ids: list[str] = []
         accepted_claims: list[str] = []
         accepted_vecs: list[list[float]] = []
+        accepted_points: list[dict] = []
         with c:
             for i, p in enumerate(keep):
                 if not accept[i]:
@@ -623,6 +624,7 @@ def add_points_batch(
                 accepted_ids.append(int(c.execute("SELECT last_insert_rowid()").fetchone()[0]))
                 accepted_claims.append(p["claim"])
                 accepted_vecs.append(qvecs[i].tolist())
+                accepted_points.append(p)
         # 一次性提交后，把接受的向量增量追加进缓存（顺序与 rowid 一致）
         for rid, v in zip(accepted_ids, accepted_vecs):
             _append_vector(rid, v)
@@ -635,6 +637,7 @@ def add_points_batch(
         "dup": int((~accept).sum()),
         "skipped": 0,
         "accepted": accepted_claims,
+        "accepted_points": accepted_points,
     }
 
 

@@ -570,34 +570,32 @@ class Engine:
             return out
 
         # 提炼并发度控制在 2，避免压垮本地大模型
-        dup = 0          # 被语义去重拦下的
-        candidate = 0    # 模型给出的候选总数
+        all_cands: list[dict] = []
         with ThreadPoolExecutor(max_workers=2) as ex:
             for pts in ex.map(one, docs):
                 for p in pts:
-                    candidate += 1
-                    try:
-                        pid = memory.add_point(
-                            topic=direction,
-                            claim=p["claim"],
-                            detail=p["detail"],
-                            source_url=p["source_url"],
-                            source_title=p["source_title"],
-                            source_kind=p["source_kind"],
-                            tags=p["tags"],
-                            confidence=p["confidence"],
-                            session_id=sid,
-                        )
-                        if pid:
-                            new_points.append(p)
-                            self._emit(
-                                "learn", f"＋ {p['claim'][:70]}",
-                                source=p["source_url"], topic=direction,
-                            )
-                        else:
-                            dup += 1
-                    except Exception as e:  # noqa: BLE001
-                        self._emit("warn", f"入库失败：{str(e)[:80]}")
+                    p["topic"] = direction  # 批量入库按点读 topic，需显式带上
+                    all_cands.append(p)
+        candidate = len(all_cands)
+        if not all_cands:
+            return new_points
+
+        # 一次性批量入库：替代原来「逐条 add_point」的 N 次全库矩阵乘 + N 次 commit
+        # （一轮从若干篇里抽出几十条，逐条就是几十次矩阵乘 + 几十次提交，随库线性变慢）。
+        # 等价性：去重阈值、向量构造、顺序接受语义都与逐条 add_point 一致（见第四轮 bench）。
+        try:
+            res = memory.add_points_batch(all_cands, session_id=sid)
+        except Exception as e:  # noqa: BLE001
+            self._emit("warn", f"批量入库失败：{str(e)[:80]}")
+            return new_points
+
+        new_points = res.get("accepted_points") or []
+        for p in new_points:
+            self._emit(
+                "learn", f"＋ {p['claim'][:70]}",
+                source=p.get("source_url", ""), topic=direction,
+            )
+        dup = int(res.get("dup", 0))
 
         # 0 条新知识时最容易被误认为「坏了」，把原因讲清楚
         if candidate and not new_points:
