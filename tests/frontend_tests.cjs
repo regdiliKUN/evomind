@@ -321,8 +321,11 @@ test("书库目录：完成度进度条、三种状态胶囊、总览引导", ()
   assert.match(html, /排除 \*\.tmp/);
 
   // 总览：数量 + 总进度 + 引导（有未扫描目录时优先提示去扫描）
+  // 第十七轮起百分比单独成一列（dirsum-pct），便于右对齐，所以分两处断言
   const sum = document.querySelector("#lib-dir-summary").innerHTML;
-  assert.match(sum, /3 个目录 · 20 本 · 已导入 17 本（85%）/);
+  assert.match(sum, /3 个目录 · 20 本 · 已导入 17 本/);
+  assert.match(sum, /dirsum-pct[^>]*>85%</);
+  assert.match(sum, /width:85%/);
   assert.match(sum, /1 个目录还没扫描过/);
 });
 

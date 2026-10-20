@@ -383,7 +383,10 @@ async function syncDashEvents(force) {
   if (force || dashEvtId === 0) {
     box.innerHTML = "";
     if (!evts.length) {
-      box.innerHTML = '<div class="empty">暂无活动</div>';
+      box.innerHTML = `<div class="empty" style="text-align:left;line-height:1.85;padding:10px 2px">
+        <div style="font-weight:600;margin-bottom:4px">还没有活动</div>
+        <div>去「自主进化」点一次「开始进化学习」，这里会实时滚出它检索、阅读、提炼的每一步。</div>
+      </div>`;
       return;
     }
     evts.forEach((e) => pushEvent(e, box, false));
@@ -490,13 +493,13 @@ function renderHealth(h) {
   }
   const dims = h.dims || [];
   if (!dims.length) {
-    setHTML($("#health-gauge"), svgGauge(h.score || 0, "健康度"));
+    setHTML($("#health-gauge"), drawGauge(150, h.score || 0, "健康度"));
     setHTML($("#health-level"), h.level || "—");
     setHTML(box, '<div class="empty">评分计算中…</div>');
     setHTML(weak, "");
     return;
   }
-  setHTML($("#health-gauge"), svgGauge(h.score, "健康度"));
+  setHTML($("#health-gauge"), drawGauge(150, h.score, "健康度"));
   setHTML($("#health-level"), h.level);
   setHTML(
     box,
@@ -765,13 +768,15 @@ async function loadAuto() {
 
 function paintAuto(a) {
   const btn = $("#btn-auto");
-  btn.textContent = a.enabled ? "已开启 · 点此关闭" : "开启";
+  btn.textContent = a.enabled ? "已开启 · 关闭" : "开启";
+  btn.title = a.enabled ? "点击关闭持续自学" : "开启后空闲一段时间会自动接着学";
   btn.className = "btn sm" + (a.enabled ? " primary" : "");
   const d = $("#auto-desc");
   if (a.enabled) {
+    // 状态用按钮的 primary 态表达，说明文字保持中性色，别整段变绿抢视线
     const idle = a.idle_minutes;
-    d.innerHTML = `已开启：沿用「${esc(a.direction || "上次方向")}」，空闲 ${idle} 分钟后自动学 2 轮（已自动学 ${a.runs} 次）`;
-    d.style.color = "var(--green)";
+    d.innerHTML = `沿用「${esc(a.direction || "上次方向")}」，空闲 ${idle} 分钟后自动学 2 轮 · 已自动学 ${a.runs} 次`;
+    d.style.color = "";
   } else {
     d.textContent = "开启后，学完一段空闲一会儿就自动接着学，不用一直盯着";
     d.style.color = "";
@@ -1122,12 +1127,12 @@ function renderLibDirs(dirs) {
             <button class="btn sm danger" data-dir-del="${esc(d.id)}">移除</button>
           </div>
         </div>
-        <div class="dirbar" title="${done} / ${total} 本已导入">
-          <i style="width:${pct}%" class="${pct >= 100 ? "full" : ""}"></i>
-        </div>
-        <div class="meta">
-          <span class="mono" style="font-size:11px">${esc(d.path)}</span>
-          <span>${done} / ${total} 本 · ${pct}%</span>
+        <div class="meta dir-meta">
+          <span class="mono dir-path" title="${esc(d.path)}">${esc(d.path)}</span>
+          <span class="dirbar" title="${done} / ${total} 本已导入">
+            <i style="width:${pct}%" class="${pct >= 100 ? "full" : ""}"></i>
+          </span>
+          <span class="dir-count">${done} / ${total} 本 · ${pct}%</span>
           ${(d.excludes || []).length ? `<span class="tagmini">排除 ${esc(d.excludes.join("、"))}</span>` : ""}
         </div>
       </div>`;
@@ -1178,7 +1183,10 @@ function renderLibDirSummary(dirs) {
       ? `还有 ${books - done} 本没导入，点目录卡筛出来批量导入`
       : "所有目录都已导入完成";
   box.innerHTML =
-    `<div class="dirsum-line">${dirs.length} 个目录 · ${books} 本 · 已导入 ${done} 本（${pct}%）</div>` +
+    `<div class="dirsum-head">
+       <span class="dirsum-line">${dirs.length} 个目录 · ${books} 本 · 已导入 ${done} 本</span>
+       <span class="dirsum-pct ${pct >= 100 ? "full" : ""}">${pct}%</span>
+     </div>` +
     `<div class="dirbar"><i style="width:${pct}%" class="${pct >= 100 ? "full" : ""}"></i></div>` +
     `<div class="dirsum-hint">${esc(hint)}</div>`;
 }
@@ -1878,7 +1886,10 @@ async function loadResources() {
     $("#r-used").textContent = `${d.used_gb} / ${d.budget_gb} GB`;
     $("#r-bar").style.width = Math.min(100, (d.used_gb / d.budget_gb) * 100) + "%";
     $("#r-free").textContent = d.free_gb + " GB";
-    $("#r-auto").textContent = state.cfg?.auto_download ? "开启" : "关闭";
+    // state.cfg 只有打开过「设置」才有；直接用状态接口里的 config 兜底，
+    // 否则第一次进资源页永远显示「关闭」（即使设置里是开着的）
+    const cfg = state.cfg || state.status?.config || {};
+    $("#r-auto").textContent = cfg.auto_download ? "开启" : "关闭";
 
     const box = $("#res-list");
     if (!r.items.length) {
@@ -1990,8 +2001,12 @@ function pollFinetune() {
       const pct = Math.round((st.progress || 0) * 100);
       const bar = $("#ft-bar");
       if (bar) bar.style.width = pct + "%";
+      // 进度条只在跑的时候出现：平时常驻一条 0% 的空槽，看起来像分割线
+      const pw = $("#ft-progress");
+      if (pw) pw.hidden = !st.running;
       if (st.running && st.stage) $("#ft-ds").textContent = st.stage;
       if (!st.running) {
+        if (pw) pw.hidden = true;
         clearInterval(ftPollTimer);
         ftPollTimer = null;
         $("#btn-ft-dataset").disabled = false;
@@ -2024,6 +2039,8 @@ $("#btn-ft-dataset").addEventListener("click", async () => {
     if (!r.ok) return toast(r.msg || "启动失败", "err");
     $("#btn-ft-dataset").disabled = true;
     $("#ft-ds").textContent = "准备中…";
+    const pw = $("#ft-progress");
+    if (pw) pw.hidden = false;
     toast("已开始生成训练集，进度见上方进度条");
     pollFinetune();
   } catch (e) {
@@ -2055,6 +2072,10 @@ async function askChat() {
   state.chatBusy = true;
   $("#chat-q").value = "";
   const log = $("#chat-log");
+
+  // 第一句发出后示例提问就收起，避免占着对话区
+  const hints = $("#chat-hints");
+  if (hints) hints.hidden = true;
 
   const u = document.createElement("div");
   u.className = "msg user";
@@ -2095,6 +2116,15 @@ async function askChat() {
 }
 
 $("#btn-chat").addEventListener("click", askChat);
+document.addEventListener("click", (e) => {
+  const ask = e.target.closest("[data-ask]");
+  if (!ask) return;
+  const q = $("#chat-q");
+  if (!q) return;
+  q.value = ask.dataset.ask || "";
+  q.focus();
+});
+
 $("#chat-q").addEventListener("keydown", (e) => {
   if (e.key === "Enter") askChat();
 });
@@ -3373,5 +3403,9 @@ async function refreshAll() {
 
 connectSSE();
 switchView(location.hash.slice(1) || "dashboard", true);
+// 首帧就把顶栏指标拉齐：只靠 6 秒轮询的话，深链直接进「分析」「书库」时
+// 顶栏会空着显示 0，看起来像库是空的。放到下一个宏任务，让当前视图自己的
+// 请求先发出去，别和它抢带宽。
+setTimeout(refreshAll, 0);
 setInterval(refreshAll, 6000);
 maybeShowOnboarding();

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>EvoMind · 自进化学习引擎</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236c8cff'/><text x='16' y='23' font-size='18' font-family='sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'>E</text></svg>" />
-<link rel="stylesheet" href="/static/style.css?v=17" />
+<link rel="stylesheet" href="/static/style.css?v=18" />
 </head>
 <body>
 <div class="app">
@@ -145,14 +145,14 @@
 
             <div class="sep"></div>
 
-            <div class="rowflex" style="justify-content:space-between;align-items:flex-start">
-              <div style="flex:1">
-                <div style="font-size:13px;font-weight:600">持续自学</div>
-                <div class="hint" style="margin:3px 0 0" id="auto-desc">
-                  开启后，学完一段空闲一会儿就自动接着学，不用一直盯着
-                </div>
+            <div class="auto-box">
+              <div class="auto-head">
+                <span class="auto-title">持续自学</span>
+                <button class="btn sm" id="btn-auto">开启</button>
               </div>
-              <button class="btn sm" id="btn-auto">开启</button>
+              <div class="auto-desc" id="auto-desc">
+                开启后，学完一段空闲一会儿就自动接着学，不用一直盯着
+              </div>
             </div>
 
             <div class="hint">
@@ -184,7 +184,16 @@
               </div>
             </div>
             <div class="stream" id="learn-stream">
-              <div class="empty"><div class="big">◐</div>设定方向后点击「开始进化学习」</div>
+              <div class="stream-empty">
+                <div class="se-ico">◐</div>
+                <div class="se-title">还没有开始这一轮</div>
+                <div class="se-desc">开始后，这里会实时滚出它的每一步：检索了什么、读了哪几篇、提炼出几条结论。</div>
+                <ol class="se-steps">
+                  <li><b>1</b><span>左边填一个具体方向（越具体学得越深）</span></li>
+                  <li><b>2</b><span>选迭代轮数，一轮大约 2–4 分钟</span></li>
+                  <li><b>3</b><span>点「开始进化学习」，流会自己长出来</span></li>
+                </ol>
+              </div>
             </div>
           </div>
         </div>
@@ -500,10 +509,12 @@
 
           <div class="card">
             <div class="card-title">知识固化流程</div>
-            <div class="kv"><span class="k">① 导出数据集</span><span class="v" id="ft-ds">未生成</span></div>
-            <div class="kv"><span class="k">② LoRA 训练</span><span class="v" id="ft-train">未开始</span></div>
-            <div class="kv"><span class="k">③ 合并权重</span><span class="v" id="ft-merge">—</span></div>
-            <div class="bar"><i id="ft-bar" style="width:0%"></i></div>
+            <div class="ft-steps">
+              <div class="ft-step"><b>1</b><span class="t">导出数据集</span><span class="v" id="ft-ds">未生成</span></div>
+              <div class="ft-step"><b>2</b><span class="t">LoRA 训练</span><span class="v" id="ft-train">未开始</span></div>
+              <div class="ft-step"><b>3</b><span class="t">合并权重</span><span class="v" id="ft-merge">—</span></div>
+            </div>
+            <div class="ft-progress" id="ft-progress" hidden><div class="bar"><i id="ft-bar" style="width:0%"></i></div></div>
             <div class="rowflex" style="margin-top:14px;flex-wrap:wrap">
               <button class="btn" id="btn-ft-dataset">生成训练集</button>
               <button class="btn" id="btn-ft-train" disabled>开始微调</button>
@@ -525,6 +536,14 @@
         <div class="card chat-box">
           <div class="chat-log" id="chat-log">
             <div class="msg bot">问我任何关于已学方向的问题。我会用学到的知识回答，并标注出处。知识库里没有的，我会直接说不知道——不编。</div>
+            <div class="chat-hints" id="chat-hints">
+              <div class="ch-title">可以这样问</div>
+              <div class="ch-list">
+                <button class="chip" data-ask="HNSW 的 ef 参数调大调小分别有什么影响？">HNSW 的 ef 参数怎么调？</button>
+                <button class="chip" data-ask="Rust 的借用检查器是怎么判断生命周期冲突的？">借用检查器怎么判断冲突？</button>
+                <button class="chip" data-ask="为什么 RAG 的召回质量比模型大小更重要？">为什么召回比模型大小更重要？</button>
+              </div>
+            </div>
           </div>
           <div class="chat-input">
             <input id="chat-q" placeholder="输入问题，回车发送" maxlength="500" />
@@ -541,9 +560,11 @@
             <label class="field"><span>主推理模型</span><select id="cfg-model"></select></label>
             <div class="field-hint" id="cfg-model-hint" hidden></div>
             <label class="field"><span>向量模型</span><input id="cfg-embed" /></label>
-            <label class="field"><span>每轮检索式数量</span><input id="cfg-qpr" type="number" min="1" max="8" /></label>
-            <label class="field"><span>每轮抓取网页数</span><input id="cfg-fpr" type="number" min="1" max="20" /></label>
-            <label class="field"><span>知识点入库最低相关度</span><input id="cfg-rel" type="number" step="0.05" min="0" max="1" /></label>
+            <div class="field-row g3">
+              <label class="field"><span>每轮检索式数量</span><input id="cfg-qpr" type="number" min="1" max="8" /></label>
+              <label class="field"><span>每轮抓取网页数</span><input id="cfg-fpr" type="number" min="1" max="20" /></label>
+              <label class="field"><span>最低相关度</span><input id="cfg-rel" type="number" step="0.05" min="0" max="1" /></label>
+            </div>
             <label class="field">
               <span>Brave 搜索 API Key（可选，强烈建议填）</span>
               <input id="cfg-search-key" placeholder="留空则只用免 Key 源（质量差一些）" />
@@ -556,8 +577,10 @@
           </div>
           <div class="card">
             <div class="card-title">资源下载</div>
-            <label class="field"><span>总磁盘预算（GB）</span><input id="cfg-budget" type="number" min="10" /></label>
-            <label class="field"><span>单个模型体积上限（GB）</span><input id="cfg-maxone" type="number" min="1" /></label>
+            <div class="field-row g2">
+              <label class="field"><span>总磁盘预算（GB）</span><input id="cfg-budget" type="number" min="10" /></label>
+              <label class="field"><span>单模型体积上限（GB）</span><input id="cfg-maxone" type="number" min="1" /></label>
+            </div>
             <label class="field"><span>自动下载</span>
               <select id="cfg-auto"><option value="1">开启（预算内自主下载）</option><option value="0">关闭（只记录不下载）</option></select>
             </label>
@@ -650,6 +673,6 @@
     <div class="pdrawer-body" id="pt-body"></div>
   </aside>
 
-<script src="/static/app.js?v=17"></script>
+<script src="/static/app.js?v=18"></script>
 </body>
 </html>

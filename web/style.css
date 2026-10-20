@@ -166,6 +166,9 @@ body {
   border: 1px solid var(--border);
   font-size: 13px; font-family: inherit; cursor: pointer;
   transition: all .15s ease;
+  /* 按钮文字永远不换行：放进 flex 行里被输入框挤压时，
+     「搜索」「添加目录」曾被压成两行竖排的字 */
+  white-space: nowrap; flex: 0 0 auto;
 }
 .btn:hover:not(:disabled) { background: #1c2637; border-color: #2b3a50; transform: translateY(-1px); }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
@@ -192,6 +195,13 @@ input:focus, textarea:focus, select:focus {
 }
 textarea { resize: vertical; min-height: 80px; line-height: 1.65; }
 label.field { display: block; margin-bottom: 14px; }
+/* 短数值字段并排：三个数字各占一整行会把设置页拉得很长 */
+.field-row { display: grid; gap: 0 14px; }
+.field-row.g2 { grid-template-columns: repeat(2, 1fr); }
+.field-row.g3 { grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 1180px) {
+  .field-row.g3 { grid-template-columns: 1fr 1fr; }
+}
 label.field > span { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 7px; letter-spacing: .3px; }
 
 /* ---------------- 学习视图 ---------------- */
@@ -205,6 +215,41 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
   color: var(--text-dim); cursor: pointer; transition: all .15s;
 }
 .chip:hover { border-color: var(--accent); color: #a9c7ff; background: var(--accent-soft); }
+
+/* 持续自学：标题 + 状态胶囊一行，说明单独一行（原来是绿色说明被按钮挤成三行） */
+.auto-box {
+  border: 1px solid var(--border-soft); border-radius: 10px;
+  background: #0d131c; padding: 11px 13px;
+}
+.auto-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.auto-title { font-size: 13px; font-weight: 600; }
+.auto-desc { font-size: 11.8px; line-height: 1.7; color: var(--text-faint); margin-top: 6px; }
+
+/* 进化流空态：三步引导，而不是一句「等待启动」占满整块 */
+.stream-empty {
+  margin: auto; text-align: left; max-width: 380px; padding: 6px 2px;
+}
+.stream-empty .se-ico {
+  font-size: 22px; color: var(--text-faint); opacity: .6; margin-bottom: 8px;
+}
+.stream-empty .se-title { font-size: 13.5px; font-weight: 600; color: var(--text-dim); }
+.stream-empty .se-desc {
+  font-size: 12px; line-height: 1.75; color: var(--text-faint); margin-top: 6px;
+}
+.stream-empty .se-steps {
+  list-style: none; margin: 16px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 9px;
+}
+.stream-empty .se-steps li {
+  display: flex; gap: 10px; align-items: baseline;
+  font-size: 12px; color: var(--text-dim); line-height: 1.6;
+}
+.stream-empty .se-steps b {
+  flex: 0 0 18px; height: 18px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+  color: #8fb6ff; background: var(--accent-soft); border: 1px solid rgba(77,141,255,.22);
+}
 
 .progress-ring { display: flex; align-items: center; gap: 14px; }
 .ring { width: 62px; height: 62px; flex-shrink: 0; }
@@ -261,6 +306,9 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
   transition: border-color .15s;
 }
 .row:hover { border-color: var(--border); }
+/* 可点开详情的知识点行给出手型光标，不然看不出能点 */
+.row[data-pid] { cursor: pointer; }
+.row[data-pid]:hover { border-color: var(--border-strong, #2b3a50); }
 .row .claim { font-size: 13.5px; line-height: 1.55; }
 .row .detail { font-size: 12.2px; color: var(--text-dim); margin-top: 5px; line-height: 1.6; }
 .row .meta {
@@ -291,7 +339,36 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 .msg.bot .srcs a { color: #7ba7ee; text-decoration: none; display: block; margin-top: 3px; }
 .chat-input { display: flex; gap: 9px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
 
+/* 空对话时的示例提问：点一下填进输入框，不用自己憋一个问法 */
+.chat-hints { margin-top: 4px; }
+.chat-hints[hidden] { display: none; }
+.chat-hints .ch-title { font-size: 11.5px; color: var(--text-faint); margin-bottom: 8px; letter-spacing: .3px; }
+.chat-hints .ch-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.chat-hints .chip { font-size: 12px; padding: 6px 11px; }
+
 /* ---------------- 微调 ---------------- */
+/* 三步固化流程：编号 + 名称 + 状态胶囊，比三行「键—值」更像流程 */
+.ft-steps { display: flex; flex-direction: column; gap: 8px; }
+.ft-step {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 11px; border-radius: 9px;
+  background: #0d131c; border: 1px solid var(--border-soft);
+}
+.ft-step b {
+  flex: 0 0 18px; height: 18px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+  color: #8fb6ff; background: var(--accent-soft); border: 1px solid rgba(77,141,255,.22);
+}
+.ft-step .t { flex: 1; font-size: 12.8px; color: var(--text-dim); }
+.ft-step .v {
+  font-family: var(--mono); font-size: 12px; color: var(--text);
+  padding: 2px 8px; border-radius: 999px;
+  background: #131c28; border: 1px solid var(--border-soft);
+}
+.ft-progress { margin-top: 12px; }
+.ft-progress .bar { margin-top: 0; }
+
 .kv { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border-soft); font-size: 12.5px; }
 .kv:last-child { border: none; }
 .kv .k { color: var(--text-dim); }
@@ -307,8 +384,16 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 .health-gauge { flex: 0 0 150px; }
 .health-gauge svg { width: 150px; height: 150px; display: block; }
 .health-main { flex: 1; min-width: 240px; }
-.health-dim { margin-bottom: 10px; }
-.health-dim:last-child { margin-bottom: 0; }
+/* 四个维度排 2×2：原来每项都拉一条 700px 的进度条，
+   四条又长又重的横线把「健康度」这张卡压得很吵 */
+#health-dims {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 14px 26px;
+}
+@media (max-width: 980px) { #health-dims { grid-template-columns: 1fr; } }
+.health-dim { margin-bottom: 0; min-width: 0; }
+.health-dim .bar { height: 5px; margin-top: 7px; }
+.health-dim .hint { font-size: 11.2px; }
 .health-weak {
   margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-soft, #1d2634);
   font-size: 12.8px; color: var(--text-dim); line-height: 1.7;
@@ -382,6 +467,11 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 .hint { font-size: 11.8px; color: var(--text-faint); line-height: 1.65; margin-top: 8px; }
 .sep { height: 1px; background: var(--border-soft); margin: 16px 0; }
 .rowflex { display: flex; align-items: center; gap: 10px; }
+/* 行内输入框自己伸缩，别把旁边的按钮/下拉挤扁（input 默认 width:100%） */
+.rowflex > input,
+.rowflex > select { flex: 1 1 200px; min-width: 0; width: auto; }
+.rowflex > select { flex: 0 1 220px; }
+.rowflex > .btn { flex: 0 0 auto; }
 .mono { font-family: var(--mono); }
 .dim { color: var(--text-dim); }
 .scroll-y { max-height: 420px; overflow-y: auto; }
@@ -743,20 +833,41 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 
 /* ---------------- 书库目录完成度（第十六轮） ---------------- */
 /* 目录总览一句话 + 总进度条：先给「还剩多少没导入」一个整体答案 */
-.dirsum { margin-bottom: 10px; }
-.dirsum .dirsum-line { font-size: 12.5px; color: var(--text-dim); margin-bottom: 6px; }
-.dirsum .dirsum-hint { font-size: 11.5px; color: var(--text-faint); margin-top: 6px; }
+.dirsum { margin-bottom: 12px; }
+.dirsum-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; margin-bottom: 7px;
+}
+.dirsum .dirsum-line { font-size: 12.5px; color: var(--text-dim); }
+.dirsum .dirsum-pct {
+  font-family: var(--mono); font-size: 13px; font-weight: 600;
+  color: var(--amber); font-variant-numeric: tabular-nums;
+}
+.dirsum .dirsum-pct.full { color: var(--green); }
+.dirsum .dirsum-hint { font-size: 11.5px; color: var(--text-faint); margin-top: 7px; }
 
-/* 单目录进度条：细一点，不抢目录名的视觉重量 */
+/* 进度条：总进度 6px 铺满，单个目录改成 meta 行里的定宽小条，
+   否则每条都拉满整行，看起来像三条分割线 */
 .dirbar {
-  height: 5px; border-radius: 3px; background: #10161f;
-  border: 1px solid var(--border-soft); overflow: hidden; margin: 7px 0 5px;
+  height: 6px; border-radius: 3px; background: #10161f;
+  border: 1px solid var(--border-soft); overflow: hidden;
 }
 .dirbar i {
   display: block; height: 100%; background: var(--amber);
   border-radius: 3px; transition: width .35s;
 }
 .dirbar i.full { background: var(--green); }
+
+.dir-meta { gap: 10px; margin-top: 9px; }
+.dir-meta .dir-path {
+  font-size: 11px; color: var(--text-faint);
+  max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dir-meta .dirbar { width: 120px; height: 5px; flex: 0 0 120px; }
+.dir-meta .dir-count {
+  font-size: 11px; color: var(--text-dim);
+  font-variant-numeric: tabular-nums; flex: 0 0 auto;
+}
 
 /* 目录卡可点下钻：hover 给一点反馈，选中态用左侧描边标出来 */
 .lib-dir-row { cursor: pointer; transition: background .18s; }
