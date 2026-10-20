@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from backend import config, evolve, library, llm, memory
+from backend import analytics, config, evolve, library, llm, memory
 
 
 class IsolatedTest(unittest.TestCase):
@@ -41,6 +41,9 @@ class IsolatedTest(unittest.TestCase):
         self.db_factory = patch.object(memory.sqlite3, "connect", side_effect=connect)
         self.db_factory.start()
         memory._invalidate()
+        # 分析聚合按「写入版本号」缓存；每例换一个新库，必须清掉上一例的缓存，
+        # 否则旧版本号会误命中（生产进程内库不会换，无需担心）
+        analytics._reset_caches()
 
     def tearDown(self):
         for c in self.connections:
@@ -312,6 +315,82 @@ class ApiTests(IsolatedTest):
         for path in ("/", "/static/app.js", "/static/style.css"):
             with self.subTest(path=path):
                 self.assertEqual(self.client.get(path).status_code, 200)
+
+    def test_analytics_payload_carries_write_version(self):
+        response = self.client.get("/api/analytics")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("ver", body)
+        self.assertEqual(body["ver"], memory.version())
+
+    def test_health_endpoint_shape(self):
+        empty = self.client.get("/api/analytics/health").json()
+        self.assertTrue(empty["empty"])
+        self.assertEqual(empty["score"], 0)
+        for i in range(5):
+            self.point(i, topic="方向甲", vec=[1.0, 0.0])
+        h = self.client.get("/api/analytics/health").json()
+        self.assertFalse(h["empty"])
+        self.assertEqual(len(h["dims"]), 4)
+        self.assertTrue(0 <= h["score"] <= 100)
+
+
+class AnalyticsCacheTests(IsolatedTest):
+    """第十一轮：写入版本号 + 版本键聚合缓存。"""
+
+    def test_write_version_increments_on_add_and_delete(self):
+        v = memory.version()
+        pid = self.point(vec=[1., 0.])
+        self.assertEqual(memory.version(), v + 1)
+        memory.delete_point(pid)
+        self.assertEqual(memory.version(), v + 2)
+
+    def test_snapshot_cache_hit_only_without_writes(self):
+        v0 = memory.version()
+        s1 = analytics.snapshot()
+        self.assertEqual(s1["ver"], v0)
+        self.assertIs(analytics.snapshot(), s1)  # 没写过：直接复用
+        self.point(vec=[1., 0.])
+        s2 = analytics.snapshot()
+        self.assertIsNot(s1, s2)  # 写过：必须重算
+        self.assertEqual(s2["ver"], v0 + 1)
+        self.assertEqual(s2["total"], s1["total"] + 1)
+        # 缓存路径与强制重算路径必须一致（接线正确性）
+        self.assertEqual(analytics.snapshot(fresh=True), s2)
+
+    def test_topic_graph_cache_keyed_by_version(self):
+        for i in range(6):
+            self.point(i, topic=f"方向{i % 3}", vec=[float(i + 1), 1.0])
+        g1 = analytics.topic_graph()
+        self.assertIs(analytics.topic_graph(), g1)
+        self.assertEqual(len(g1["nodes"]), 3)
+        self.point(99, topic="方向新", vec=[0.5, 0.5])
+        g2 = analytics.topic_graph()
+        self.assertIsNot(g1, g2)
+        self.assertEqual(len(g2["nodes"]), 4)
+        # edge_min 是缓存键的一部分：不同阈值各算各的
+        self.assertIsNot(analytics.topic_graph(edge_min=0.9), g2)
+
+    def test_health_empty_and_populated(self):
+        h = analytics.health()
+        self.assertTrue(h["empty"])
+        self.assertEqual(h["score"], 0)
+        self.assertIsNone(h["weakest"])
+        for i in range(5):
+            self.point(i, topic="方向甲", vec=[1.0, 0.0])
+        h = analytics.health()
+        self.assertFalse(h["empty"])
+        self.assertEqual([d["key"] for d in h["dims"]],
+                         ["scale", "confidence", "sources", "freshness"])
+        self.assertIn(h["weakest"]["key"], {d["key"] for d in h["dims"]})
+        self.assertTrue(0 <= h["score"] <= 100)
+        self.assertIn(h["level"], ("待补强", "起步", "良好", "优秀"))
+
+    def test_stats_carries_write_version(self):
+        self.assertIn("ver", memory.stats())
+        v = memory.stats()["ver"]
+        self.point(vec=[1., 0.])
+        self.assertEqual(memory.stats()["ver"], v + 1)
 
 
 if __name__ == "__main__":

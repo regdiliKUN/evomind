@@ -225,6 +225,14 @@ def api_analytics_suggestions() -> dict:
     return {"items": analytics.suggestions()}
 
 
+@app.get("/api/analytics/health")
+def api_analytics_health() -> dict:
+    """知识库健康度：总分 + 四个维度短板 + 最薄弱项，供总览健康度卡片使用。"""
+    from . import analytics
+
+    return analytics.health()
+
+
 @app.get("/api/perf")
 def api_perf() -> dict:
     """检索/聚合缓存的命中率与平均耗时，供分析视图的「检索性能」卡片展示。"""

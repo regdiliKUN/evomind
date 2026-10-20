@@ -12,6 +12,11 @@ const state = {
   knowledgeQuery: "",
   knowledgeRequest: 0,
   suggestions: null,
+  // 写入版本号（来自 /api/status 的 stats.ver）：库没变过就跳过整轮
+  // 重新拉取 + 重渲染。知识库列表尤其需要——裸 innerHTML 重建会抹掉
+  // 用户正在选的文字、把滚动位置弹回顶部。
+  kbVer: -1,
+  anVer: -1,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -76,13 +81,35 @@ function switchView(v, fromHash) {
   if (v === "library") loadLibrary();
   if (v === "resources") loadResources();
   if (v === "finetune") loadFinetune();
-  if (v === "dashboard") { loadDashboard(null, true); refreshSuggestions(true); }
+  if (v === "dashboard") { loadDashboard(null, true); refreshSuggestions(true); refreshHealth(true); }
   if (v === "settings") fillSettings();
   if (v === "learn") loadAuto();
 }
 
 $$(".nav-item").forEach((n) => n.addEventListener("click", () => switchView(n.dataset.view)));
 window.addEventListener("hashchange", () => switchView(location.hash.slice(1), true));
+
+/* 全局委托：所有 [data-goto] 跳转按钮（下一步建议 / 健康度 / 网络空态）——
+   动态渲染的内容不必逐个重新绑定。 */
+document.addEventListener("click", (e) => {
+  const goto = e.target.closest("[data-goto]");
+  if (goto) {
+    switchView(goto.dataset.goto);
+    return;
+  }
+  // 分析页方向分布条 → 下钻知识库并按该方向筛选（跨视图联动）
+  const drill = e.target.closest(".kb-drill");
+  if (drill) {
+    const t = drill.dataset.topic || "";
+    const sel = $("#kb-topic");
+    if (t && sel && !Array.from(sel.options).some((o) => o.value === t)) {
+      sel.insertAdjacentHTML("beforeend", `<option value="${esc(t)}">${esc(t)}</option>`);
+    }
+    if (sel) sel.value = t;
+    switchView("knowledge");
+    loadKnowledge();
+  }
+});
 
 /* 引导浮层：按钮接线 + 首次自动弹出 + 侧栏手动入口 */
 $("#ob-next").addEventListener("click", () => {
@@ -316,6 +343,72 @@ async function refreshSuggestions(force = false) {
   } catch (_) {}
 }
 
+/* ---------------- 知识库健康度（总览卡片） ---------------- */
+let lastHealthFetch = 0;
+async function refreshHealth(force = false) {
+  // 健康度是纯算术（服务端随聚合缓存一起命中），但没必要 6 秒刷一次；15 秒足够
+  const now = Date.now();
+  if (!force && now - lastHealthFetch < 15000) return;
+  lastHealthFetch = now;
+  let h;
+  try {
+    h = await api("/api/analytics/health");
+  } catch (_) {
+    return;
+  }
+  try {
+    renderHealth(h);
+  } catch (_) {}
+}
+
+function renderHealth(h) {
+  const box = $("#health-dims");
+  const weak = $("#health-weak");
+  if (!box || !weak) return;
+  if (!h || h.empty) {
+    setHTML($("#health-gauge"), "");
+    setHTML($("#health-level"), "空库");
+    setHTML(box, `<div class="empty" style="text-align:left;line-height:1.8;padding:2px 2px 8px">
+      <div style="font-weight:600;margin-bottom:4px">知识库还是空的，健康度无从谈起</div>
+      <div>去「自主进化」定一个具体方向，学几轮之后这里会给出一整套评分：规模、可信度、信源多样性、学习新鲜度——哪项最低，就说明下一步该补什么。</div>
+    </div>`);
+    setHTML(weak, `<button class="btn primary sm" data-goto="learn">去定方向 →</button>`);
+    return;
+  }
+  const dims = h.dims || [];
+  if (!dims.length) {
+    setHTML($("#health-gauge"), svgGauge(h.score || 0, "健康度"));
+    setHTML($("#health-level"), h.level || "—");
+    setHTML(box, '<div class="empty">评分计算中…</div>');
+    setHTML(weak, "");
+    return;
+  }
+  setHTML($("#health-gauge"), svgGauge(h.score, "健康度"));
+  setHTML($("#health-level"), h.level);
+  setHTML(
+    box,
+    h.dims
+      .map((d) => {
+        const col = d.score >= 70 ? "var(--green)" : d.score >= 40 ? "var(--accent)" : "var(--orange, #e0a23b)";
+        return `<div class="health-dim">
+          <div class="rowflex" style="justify-content:space-between;font-size:12.5px">
+            <span>${esc(d.label)}</span>
+            <span class="mono dim">${d.score}</span>
+          </div>
+          <div class="bar"><i style="width:${d.score}%;background:${col}"></i></div>
+          <div class="hint" style="margin:2px 0 0">${esc(d.detail)}</div>
+        </div>`;
+      })
+      .join("")
+  );
+  const w = h.weakest || {};
+  setHTML(
+    weak,
+    `最薄弱：<b>${esc(w.label || "—")}</b>（${w.score ?? 0} 分）· ${esc(w.hint || "")}
+     <button class="btn sm" data-goto="${esc(w.view || "learn")}" style="margin-left:8px">${esc(w.btn || "去补")} →</button>`
+  );
+}
+
 /* ---------------- 新手上路引导 ---------------- */
 const OB_STEPS = [
   {
@@ -415,11 +508,7 @@ function renderNextSteps(st) {
     .join("");
 
   // 内容没变就不重建，避免按钮每 6 秒闪一下
-  if (!setHTML($("#next-steps"), html)) return;
-
-  $$("#next-steps [data-goto]").forEach((b) =>
-    b.addEventListener("click", () => switchView(b.dataset.goto))
-  );
+  setHTML($("#next-steps"), html);
 }
 
 function paintTopbar(st) {
@@ -533,20 +622,31 @@ async function loadKnowledge(q = state.knowledgeQuery) {
     const r = await api(url);
     if (request !== state.knowledgeRequest) return;
     renderKnowledge(r.items);
-    if (!q) fillTopicSelect(r.items);
+    if (!q) fillTopicSelect(r.items, topic);
+    // 记下本次渲染对应的写入版本：refreshAll 之后只在版本变化时再拉一次
+    const ver = state.status && state.status.stats && state.status.stats.ver;
+    if (ver !== undefined) state.kbVer = ver;
   } catch (e) {
     toast("知识库加载失败：" + e.message, "err");
   }
 }
 
-function fillTopicSelect(items) {
+function fillTopicSelect(items, activeTopic = "") {
   const sel = $("#kb-topic");
-  if (sel.dataset.filled === "1") return;
   const topics = [...new Set(items.map((i) => i.topic))];
   if (!topics.length) return;
-  sel.innerHTML =
+  const html =
     '<option value="">全部方向</option>' +
     topics.map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join("");
+  if (sel.dataset.filled === "1") {
+    // 已填过：仅当方向集合真的变了才重建（保留用户当前筛选）。
+    // 筛选态下 items 只有该方向一个主题，绝不能拿来重建选项，否则
+    // 下拉里就只剩当前方向、切不回去了。
+    if (activeTopic || sel.innerHTML === html) return;
+    sel.innerHTML = html;
+    return;
+  }
+  sel.innerHTML = html;
   sel.dataset.filled = "1";
 }
 
@@ -588,6 +688,9 @@ $("#kb-search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("#btn-kb-search").click();
 });
 $("#kb-topic").addEventListener("change", () => loadKnowledge());
+
+/* 分析页手动刷新：绕过版本门控强制重算+重绘（服务端也会强制重聚） */
+$("#btn-an-refresh").addEventListener("click", () => loadAnalytics(true));
 
 /* ---------------- 书库 ---------------- */
 let libSelected = new Set();
@@ -1668,7 +1771,8 @@ function htmlTopicBars(topics) {
   if (!topics || !topics.length) return '<div class="empty">还没有任何学习记录</div>';
   const max = Math.max(...topics.map((t) => t.count));
   return topics.slice(0, 12).map((t) =>
-    `<div style="margin-bottom:11px">
+    // kb-drill：点一下跳到知识库并按该方向筛选（见全局委托处理器）
+    `<div class="kb-drill" data-topic="${esc(t.topic)}" title="点击在知识库中筛选该方向">
       <div class="rowflex" style="justify-content:space-between;font-size:12.5px">
         <span>${esc(t.topic)}</span>
         <span class="mono dim">${t.count} · 可信 ${(+t.avg_conf).toFixed(2)}</span>
@@ -1820,8 +1924,6 @@ async function mountGraph(graph) {
       <div>去「自主进化」定一个具体的方向开始学习；学到两三个方向后回来，这里会显示它们之间的知识关联——连线越粗，两个方向的知识点越接近。</div>
       <button class="btn primary sm" data-goto="learn" style="margin-top:10px">去定方向</button>
     </div>`);
-    const btn = box.querySelector("[data-goto]");
-    if (btn) btn.addEventListener("click", () => switchView(btn.dataset.goto));
     if (detail) setHTML(detail, "");
     return;
   }
@@ -2096,7 +2198,13 @@ function svgHeatmap(growth) {
     return ["var(--accent)", 0.45];
   };
   const WD = ["日", "一", "二", "三", "四", "五", "六"];
-  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  // 自适应显示尺寸：viewBox 的自然宽度随数据跨度变（几周 ≈60px，一年 ≈860px）。
+  // 卡片是 .chart（svg width:100%），不指定宽高时窄 viewBox 会被拉满整卡——
+  // 格子变成几百像素的色块（截图评审时抓到的真实渲染 bug）。
+  // 这里按「目标宽约 640px」放大（1~3 倍），数据多时保持原尺寸；
+  // 配合 CSS 的 max-width:100%，超宽自然缩小，比例始终正确。
+  const k = Math.max(1, Math.min(3, 640 / W));
+  let s = `<svg viewBox="0 0 ${W} ${H}" width="${Math.round(W * k)}" height="${Math.round(H * k)}">`;
   for (let d = 1; d < 7; d += 2)
     s += `<text class="axis-text" x="0" y="${top + d * (cell + gap) + cell - 3}">${WD[d]}</text>`;
   // 月份标签：某一周列跨入新月份时在顶部标注
@@ -2151,7 +2259,18 @@ function svgSessions(sd) {
   return s + `</svg>`;
 }
 
-async function loadAnalytics() {
+/* 数据版本标签：让「缓存」看得见——版本号不动就说明库没有新变化，
+   此时服务端直接复用聚合结果，前端也不重建图表。 */
+function paintAnVer(d) {
+  const el = $("#an-ver");
+  if (!el) return;
+  const txt = `数据版本 #${d.ver} · 库无变化时 6 秒同步一次，不重复计算`;
+  if (el.dataset.v === String(d.ver)) return;
+  el.dataset.v = String(d.ver);
+  setHTML(el, txt);
+}
+
+async function loadAnalytics(force = false) {
   let d;
   try {
     d = await api("/api/analytics");
@@ -2159,6 +2278,12 @@ async function loadAnalytics() {
     toast("分析数据获取失败：" + e.message, "err");
     return;
   }
+  paintAnVer(d);
+  // 版本门控：库没变过就跳过整轮图表重建。省的不只是 DOM——7 个图表串
+  // （增长/热力图/分布/直方图/环形/历程/力导向图）每轮都要完整构建一遍
+  // 才能拿去和现有内容比对，力导向图还要跑一遍布局模拟。
+  if (!force && state.anVer === d.ver) return;
+  state.anVer = d.ver;
   setHTML($("#an-total"), String(d.total || 0));
   setHTML($("#an-topics-n"), String((d.topics || []).length));
   const srcs = d.sources || [];
@@ -2270,8 +2395,13 @@ async function refreshAll() {
     state.status = st;
     paintTopbar(st);
     await refreshSuggestions();
-    if (state.view === "dashboard") await loadDashboard(st);
-    if (state.view === "knowledge") await loadKnowledge();
+    if (state.view === "dashboard") { await loadDashboard(st); refreshHealth(); }
+    // 知识库列表按写入版本门控：版本没变过就整轮跳过（服务端此时也命中缓存），
+    // 不再每 6 秒无条件重拉 + 重建 60 行 DOM。
+    if (state.view === "knowledge") {
+      const ver = st.stats && st.stats.ver;
+      if (ver !== state.kbVer) await loadKnowledge();
+    }
     if (state.view === "analytics") loadAnalytics();
   } catch (_) {}
   finally { refreshBusy = false; }

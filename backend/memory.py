@@ -405,6 +405,33 @@ def _bump_search_cache() -> None:
         _search_cache.clear()
 
 
+# --------------------------------------------------------------------------
+# 写入版本号：知识库每发生一次写入就 +1
+# --------------------------------------------------------------------------
+# 分析聚合（snapshot / topic_graph）原来靠 3 秒 TTL 保鲜，而分析视图 6 秒才轮询一次，
+# TTL 永远等不到命中——每次轮询都全量重算（2000 条时约 12ms，随库线性增长）。
+# 这些聚合都是「库内容的确定函数」：同样的库状态算出来必然一样。所以正确的保鲜
+# 方式不是时间，而是「库变没过」：一个单调递增的写入版本号，写路径 bump，
+# 聚合按版本号缓存——没写过就永远不必重算。
+#
+# 安全网：分析侧仍保留 30s TTL。万一将来的新写入路径漏了 bump，最多陈旧 30 秒
+# 后自愈，不会像纯版本键那样永久停在旧数据上。
+_ver_lock = threading.Lock()
+_ver = 0
+
+
+def _bump_version() -> None:
+    global _ver
+    with _ver_lock:
+        _ver += 1
+
+
+def version() -> int:
+    """当前知识库写入版本号（只增不减；进程重启后从 0 重新计，缓存随进程一起清空）。"""
+    with _ver_lock:
+        return _ver
+
+
 def _search_cache_get(query: str, topic: str | None, k: int) -> list[dict] | None:
     return _search_cache.get((query, topic, k))
 
@@ -511,6 +538,7 @@ def add_point(
         # 检索结果缓存 / 主题索引已与库不一致，整体失效
         _bump_search_cache()
         _bump_topic_index()
+        _bump_version()
         return pid
 
 
@@ -652,6 +680,7 @@ def add_points_batch(
         # 检索结果缓存 / 主题索引已与库不一致，整体失效
         _bump_search_cache()
         _bump_topic_index()
+        _bump_version()
 
     return {
         "added": len(accepted_ids),
@@ -811,6 +840,9 @@ def stats() -> dict:
         "disk_gb": config.disk_usage_gb(),
         "budget_gb": config.get("disk_budget_gb"),
         "free_disk_gb": config.free_disk_gb(),
+        # 写入版本号：前端据此判断「库有没有变过」，没变就跳过整轮
+        # 重新拉取 + 重渲染（知识库列表、分析图表都不必为同样的数据重建 DOM）。
+        "ver": version(),
     }
 
 
@@ -851,6 +883,8 @@ def delete_point(pid: str) -> bool:
             c.execute("DELETE FROM knowledge WHERE id=?", (pid,))
         _invalidate()
         _bump_search_cache()
+        _bump_topic_index()
+        _bump_version()
     return True
 
 

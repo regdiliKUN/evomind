@@ -87,6 +87,17 @@
         </div>
 
         <div class="card" style="margin-top:14px">
+          <div class="card-title">知识库健康度<span class="tag" id="health-level">—</span></div>
+          <div class="health-grid">
+            <div class="health-gauge" id="health-gauge"></div>
+            <div class="health-main">
+              <div id="health-dims"><div class="empty">评分计算中…</div></div>
+              <div class="health-weak" id="health-weak"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
           <div class="card-title">下一步建议<span class="tag">自动判断</span></div>
           <div id="next-steps"></div>
         </div>
@@ -187,6 +198,10 @@
 
       <!-- ---------- 分析 ---------- -->
       <section class="view" id="view-analytics">
+        <div class="rowflex" style="justify-content:space-between;align-items:center;margin-bottom:14px">
+          <div class="hint" id="an-ver" style="margin:0">数据版本 —</div>
+          <button class="btn sm" id="btn-an-refresh">刷新数据</button>
+        </div>
         <div class="grid g4" style="margin-bottom:16px">
           <div class="stat">
             <div class="k">知识点总数</div>

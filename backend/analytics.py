@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import time
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import numpy as np
@@ -68,6 +68,26 @@ def source_breakdown() -> list[dict]:
     return [{"kind": r["k"], "count": r["n"]} for r in rows]
 
 
+# 主题语义网络的版本键缓存：图是库内容的确定函数，库没变过结果就不会变。
+# 分析视图 6 秒轮询一次，旧实现每轮都全表建 map + 质心累加 + T² 遍历（2000 条约
+# 6.5ms），而其中绝大部分轮次库根本没有变化。按 memory.version() 缓存后，
+# 没写过的轮次直接复用，写过的轮次才重算——输出与旧实现逐字段一致。
+_GRAPH_CACHE: dict = {"ver": -1, "edge_min": None, "val": None}
+# rowid → topic 的全表映射同样按版本缓存（旧实现每次调用都重扫全表建 dict）
+_TMAP_CACHE: dict = {"ver": -1, "val": None}
+
+
+def _rowid_topic_map() -> dict:
+    ver = memory.version()
+    if _TMAP_CACHE["ver"] != ver or _TMAP_CACHE["val"] is None:
+        _TMAP_CACHE["val"] = {
+            r["rowid"]: r["topic"]
+            for r in memory.conn().execute("SELECT rowid, topic FROM knowledge")
+        }
+        _TMAP_CACHE["ver"] = ver
+    return _TMAP_CACHE["val"]
+
+
 def topic_graph(edge_min: float = 0.32) -> dict:
     """主题语义网络：每个主题一个节点（用其知识点向量的质心表示），
 
@@ -75,23 +95,34 @@ def topic_graph(edge_min: float = 0.32) -> dict:
     质心来自已归一化的向量矩阵（_all_vectors 缓存的即是单位向量），
     所以质心点积就是余弦相似度，O(T²) 且 T 通常 < 40，足够快。
     """
+    ver = memory.version()
+    if (
+        _GRAPH_CACHE["val"] is not None
+        and _GRAPH_CACHE["ver"] == ver
+        and _GRAPH_CACHE["edge_min"] == edge_min
+    ):
+        return _GRAPH_CACHE["val"]
+
     stats = topic_stats()
     if len(stats) < 2:
-        return {"nodes": stats, "edges": []}
+        result = {"nodes": stats, "edges": []}
+        _GRAPH_CACHE.update(ver=ver, edge_min=edge_min, val=result)
+        return result
     # 向量维度取决于 embedding 模型（bge-m3=1024，MiniLM=384），从库里读真实值
     dim_row = memory.conn().execute(
         "SELECT length(embedding)/4 dim FROM knowledge WHERE embedding IS NOT NULL LIMIT 1"
     ).fetchone()
     if not dim_row or not dim_row["dim"]:
-        return {"nodes": stats, "edges": []}
+        result = {"nodes": stats, "edges": []}
+        _GRAPH_CACHE.update(ver=ver, edge_min=edge_min, val=result)
+        return result
     rowids, mat = memory._all_vectors(int(dim_row["dim"]))
     if not rowids or mat.shape[0] == 0:
-        return {"nodes": stats, "edges": []}
-    tmap = {
-        r["rowid"]: r["topic"]
-        for r in memory.conn().execute("SELECT rowid, topic FROM knowledge")
-    }
-    # 按主题累加质心
+        result = {"nodes": stats, "edges": []}
+        _GRAPH_CACHE.update(ver=ver, edge_min=edge_min, val=result)
+        return result
+    tmap = _rowid_topic_map()
+    # 按主题累加质心（保持「按行遍历顺序决定 topics 次序」的旧语义，保证输出一致）
     acc: dict[str, np.ndarray] = {}
     cnt: dict[str, int] = {}
     for rid, vec in zip(rowids, mat):
@@ -107,13 +138,22 @@ def topic_graph(edge_min: float = 0.32) -> dict:
     centroids = np.stack([acc[t] / cnt[t] for t in topics], axis=0)
     centroids = centroids / np.linalg.norm(centroids, axis=1, keepdims=True)
     sim = centroids @ centroids.T
+    # 边提取向量化：triu_indices 的 (i,j) 序与旧的双重循环 i<j 完全一致，
+    # 先用布尔掩码在 numpy 里筛掉不达标的 pair，再只给通过的 pair 建 dict——
+    # 旧实现是 T(T-1)/2 次 Python 迭代（40 个主题 = 780 次 float()/比较/append），
+    # 现在只剩通过的几十次。
+    # astype(float64) 不能省：旧代码是 Python float（float64）与 edge_min 比较，
+    # 直接在 float32 矩阵上比会把阈值降成 float32，阈值边缘的取值会分叉。
     edges = []
-    for i in range(len(topics)):
-        for j in range(i + 1, len(topics)):
-            w = float(sim[i, j])
-            if w >= edge_min:
-                edges.append({"a": topics[i], "b": topics[j], "w": round(w, 3)})
-    return {"nodes": stats, "edges": edges}
+    if len(topics) > 1:
+        iu = np.triu_indices(len(topics), 1)
+        w = sim[iu].astype(np.float64)
+        mask = w >= edge_min
+        for i, j, wv in zip(iu[0][mask].tolist(), iu[1][mask].tolist(), w[mask].tolist()):
+            edges.append({"a": topics[i], "b": topics[j], "w": round(wv, 3)})
+    result = {"nodes": stats, "edges": edges}
+    _GRAPH_CACHE.update(ver=ver, edge_min=edge_min, val=result)
+    return result
 
 
 def session_timeline(limit: int = 20) -> dict:
@@ -305,20 +345,30 @@ def search_explain(query: str, k: int = 8) -> dict:
     }
 
 
-# 短 TTL 缓存：分析页打开就全量聚合一次（含主题语义网络），重复打开/轮询时
-# 直接复用。知识库变更后最多 3 秒才反映，对只读展示页完全可接受，且避免了
-# 每次轮询都重算整份聚合（含向量质心 + 全连接余弦）。
-_SNAP_CACHE: dict = {"ts": 0.0, "val": None}
-_SNAP_TTL = 3.0
+# 版本键缓存 + 安全 TTL：分析视图每 6 秒轮询一次 /api/analytics，旧实现用 3s TTL，
+# 永远等不到命中——每次轮询都把整份聚合重算一遍（2000 条约 12ms，随库线性增长，
+# 每个打开分析页的标签页每小时白烧 6 秒以上）。
+# 这些聚合全是「库内容的确定函数」：库没变过，算出来必然一样。所以以
+# memory.version()（每次写入 +1）为键缓存；同时保留 30s 安全 TTL——万一将来
+# 新的写入路径漏了 _bump_version()，最多陈旧 30 秒后自愈，不会永久停在旧数据。
+_SNAP_CACHE: dict = {"ver": -1, "ts": 0.0, "val": None}
+_SNAP_TTL = 30.0
 
 
 def snapshot(fresh: bool = False) -> dict:
     """一次性返回分析视图所需的全部数据。"""
     now = time.time()
-    if not fresh and _SNAP_CACHE["val"] is not None and (now - _SNAP_CACHE["ts"]) < _SNAP_TTL:
+    ver = memory.version()
+    if (
+        not fresh
+        and _SNAP_CACHE["val"] is not None
+        and _SNAP_CACHE["ver"] == ver
+        and (now - _SNAP_CACHE["ts"]) < _SNAP_TTL
+    ):
         return _SNAP_CACHE["val"]
     t0 = time.perf_counter()
     val = {
+        "ver": ver,
         "total": memory.count_points(),
         "growth": growth_by_day(),
         "topics": topic_stats(),
@@ -329,13 +379,104 @@ def snapshot(fresh: bool = False) -> dict:
     }
     _SNAP_CACHE["val"] = val
     _SNAP_CACHE["ts"] = now
+    _SNAP_CACHE["ver"] = ver
     with memory._perf_lock:
         memory._perf["snapshot_calls"] += 1
         memory._perf["snapshot_ms"] += (time.perf_counter() - t0) * 1000
     return val
 
 
-def invalidate_snapshot() -> None:
-    """知识库变更后让聚合缓存失效。"""
-    _SNAP_CACHE["val"] = None
-    _SNAP_CACHE["ts"] = 0.0
+# --------------------------------------------------------------------------
+# 知识库健康度（新功能）
+# --------------------------------------------------------------------------
+def health() -> dict:
+    """把分散的统计收成一个总分 + 四个维度的短板，供总览「健康度」卡片使用。
+
+    纯算术：输入全部取自已按版本缓存的 snapshot 组件，不新增任何 SQL，
+    轮询时随缓存一起命中。每个维度给出 0-100 分值、一句人话详情；
+    weakest 单独拎出来，前端直接拿它做「最该补什么」的引导按钮。
+    空库时返回 empty=True，由前端给新手上路引导。
+    """
+    snap = snapshot()
+    total = int(snap.get("total") or 0)
+    ver = snap.get("ver", memory.version())
+    if total == 0:
+        return {
+            "ver": ver, "empty": True, "score": 0, "level": "空库",
+            "dims": [], "weakest": None,
+        }
+
+    topics = snap.get("topics") or []
+    conf = snap.get("confidence") or []
+    sources = snap.get("sources") or []
+    growth = snap.get("growth") or []
+
+    def clamp(x: float) -> int:
+        return int(max(0, min(100, round(x))))
+
+    # ① 规模：120 条记为「够用」（再往上不涨分，避免误导用户盲目堆量）
+    n_topics = len(topics)
+    dims = [{
+        "key": "scale", "label": "知识规模", "score": clamp(total / 120 * 100),
+        "detail": f"共 {total} 条 · {n_topics} 个方向",
+        "hint": "规模还不够，多跑几轮或补新方向" if total < 120 else "规模够用了，重质不重量",
+        "view": "learn", "btn": "去学习" if total < 120 else "去补充",
+    }]
+
+    # ② 可信度：直方图是精确分桶计数，加权桶心中点即精确平均
+    tot_n = sum(b["n"] for b in conf)
+    avg_conf = (sum(b["n"] * (b["lo"] + b["hi"]) / 2 for b in conf) / tot_n) if tot_n else 0.0
+    dims.append({
+        "key": "confidence", "label": "可信度", "score": clamp((avg_conf - 0.3) / 0.5 * 100),
+        "detail": f"平均 {avg_conf:.2f}",
+        "hint": "可信度偏低，去「检验所学」追问确认" if avg_conf < 0.6 else "可信度健康",
+        "view": "chat", "btn": "去检验" if avg_conf < 0.6 else "去提问",
+    })
+
+    # ③ 信源多样性：种类数（4 类拿满 60 分）+ 集中度（最高占比越低越多 40 分）
+    n_src = len(sources)
+    top_src = sources[0] if sources else None
+    top_share = (top_src["count"] / total) if top_src else 1.0
+    dims.append({
+        "key": "sources", "label": "信源多样性", "score": clamp((n_src - 1) / 3 * 60 + (1 - top_share) * 40),
+        "detail": f"{n_src} 类信源" + (f" · {top_src['kind']} 占 {top_share * 100:.0f}%" if top_src else ""),
+        "hint": "信源太单一，混着学不容易有盲区" if top_share >= 0.75 or n_src < 2 else "信源足够多样",
+        "view": "resources", "btn": "找找资料",
+    })
+
+    # ④ 新鲜度：最后学习距今天数（7 天内满分，30 天归零）+ 近 7 天增量加成
+    idle, last7 = 999, 0
+    if growth:
+        try:
+            last = date.fromisoformat(growth[-1]["day"])
+            idle = (date.today() - last).days
+            week_ago = (date.today() - timedelta(days=6)).isoformat()
+            last7 = sum(g["added"] for g in growth if g["day"] >= week_ago)
+        except ValueError:
+            idle = 0
+    fresh_score = max(0.0, 100 - max(0, idle) * 100 / 30) + min(10, last7)
+    dims.append({
+        "key": "freshness", "label": "学习新鲜度", "score": clamp(fresh_score),
+        "detail": (f"最后学习 {idle} 天前 · 近 7 天 +{last7} 条") if growth else "还没有学习记录",
+        "hint": "已经超过一周没学了，保持连续性" if idle >= 7 else "学习节奏正常",
+        "view": "learn", "btn": "继续学",
+    })
+
+    score = clamp(sum(d["score"] for d in dims) / len(dims))
+    level = "待补强" if score < 40 else ("起步" if score < 60 else ("良好" if score < 80 else "优秀"))
+    weakest = min(dims, key=lambda d: d["score"])
+    return {
+        "ver": ver, "empty": False, "score": score, "level": level,
+        "dims": dims, "weakest": weakest,
+    }
+
+
+def _reset_caches() -> None:
+    """清空全部版本键缓存。
+
+    生产进程内知识库不会被整体换掉，无需调用；测试套件每例都换一个临时库，
+    必须在换库后清一次，否则上一例的缓存会带着旧版本号误命中。
+    """
+    _SNAP_CACHE.update(ver=-1, ts=0.0, val=None)
+    _GRAPH_CACHE.update(ver=-1, edge_min=None, val=None)
+    _TMAP_CACHE.update(ver=-1, val=None)

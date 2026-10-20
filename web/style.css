@@ -302,6 +302,25 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 .bar { height: 6px; background: #141c28; border-radius: 4px; overflow: hidden; margin-top: 8px; }
 .bar i { display: block; height: 100%; background: linear-gradient(90deg, #4d8dff, #21d4a0); transition: width .4s ease; }
 
+/* ---------------- 知识库健康度卡片 ---------------- */
+.health-grid { display: flex; gap: 22px; align-items: flex-start; flex-wrap: wrap; }
+.health-gauge { flex: 0 0 150px; }
+.health-gauge svg { width: 150px; height: 150px; display: block; }
+.health-main { flex: 1; min-width: 240px; }
+.health-dim { margin-bottom: 10px; }
+.health-dim:last-child { margin-bottom: 0; }
+.health-weak {
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-soft, #1d2634);
+  font-size: 12.8px; color: var(--text-dim); line-height: 1.7;
+}
+.health-weak b { color: var(--text); }
+
+/* 分析页方向分布条：可点击下钻知识库 */
+.kb-drill { margin-bottom: 11px; cursor: pointer; border-radius: 6px; padding: 3px 5px; margin-left: -5px; transition: background .15s ease; }
+.kb-drill:last-child { margin-bottom: 0; }
+.kb-drill:hover { background: rgba(77, 141, 255, .08); }
+.kb-drill:active { background: rgba(77, 141, 255, .14); }
+
 /* ---------------- 提示 ---------------- */
 .toast-wrap { position: fixed; right: 22px; bottom: 22px; display: flex; flex-direction: column; gap: 9px; z-index: 99; }
 .toast {
@@ -421,6 +440,8 @@ label.field > span { display: block; font-size: 12px; color: var(--text-dim); ma
 /* ---------------- 分析视图 ---------------- */
 .chart { width: 100%; }
 .chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+/* 热力图自带显示尺寸（格子按数据Span自适应放大），只在不超宽时生效 */
+#an-heatmap svg { width: auto; max-width: 100%; }
 .chart text { font-family: -apple-system, "Microsoft YaHei", sans-serif; fill: var(--text-dim); }
 .chart .grid-line { stroke: var(--border-soft); stroke-width: 1; }
 .chart .axis-text { fill: var(--text-faint); font-size: 10px; }
