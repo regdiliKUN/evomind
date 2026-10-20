@@ -38,7 +38,7 @@ def _emit(on_event: Event | None, level: str, msg: str, **payload) -> None:
 # --------------------------------------------------------------------------
 # 环境检测与安装
 # --------------------------------------------------------------------------
-def check_env() -> dict:
+def _check_env_uncached() -> dict:
     mods = {}
     for name in ("torch", "transformers", "peft", "datasets"):
         try:
@@ -60,6 +60,22 @@ def check_env() -> dict:
     except Exception:
         pass
     return info
+
+
+#: check_env 的 TTL 缓存。环境（装了哪些包、有没有 CUDA）不会自己变，
+#: 而 /api/status 每几秒轮询一次，每次 torch.cuda.is_available() 是一次驱动调用。
+_env_cache: dict[str, Any] = {"ts": 0.0, "value": None}
+CHECK_ENV_TTL = 30.0
+
+
+def check_env() -> dict:
+    """带 30s TTL 的环境检测。安装/卸载依赖后由 install_env 主动失效。"""
+    now = time.monotonic()
+    if _env_cache["value"] is not None and now - _env_cache["ts"] < CHECK_ENV_TTL:
+        return dict(_env_cache["value"])
+    val = _check_env_uncached()
+    _env_cache.update(ts=now, value=val)
+    return dict(val)
 
 
 INSTALL_CMD = (
@@ -86,6 +102,8 @@ def install_env(on_event: Event | None = None) -> dict:
         except Exception as e:  # noqa: BLE001
             _emit(on_event, "error", f"安装异常：{e}")
             return {"ok": False, "msg": str(e)}
+    # 刚装完依赖，环境检测缓存必须失效，否则界面要等最多 30s 才反映新状态
+    _env_cache.update(ts=0.0, value=None)
     ok = check_env()["ready"]
     _emit(on_event, "ok" if ok else "warn", "微调环境就绪" if ok else "依赖仍不完整")
     return {"ok": ok}

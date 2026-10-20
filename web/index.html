@@ -243,6 +243,25 @@
         </div>
 
         <div class="card" style="margin-bottom:14px">
+          <div class="card-title">系统状态<span class="tag">轮询开销 · 磁盘 · 模型服务</span>
+            <span class="dim" style="margin-left:auto;font-size:11px">优化后每次轮询仅一次轻量读取</span>
+          </div>
+          <div class="rowflex" style="align-items:center;gap:22px;flex-wrap:wrap">
+            <div id="an-sys-gauge" class="chart" style="width:150px;height:150px;flex:0 0 auto"></div>
+            <div style="flex:1;min-width:240px">
+              <div class="rowflex" style="gap:26px;margin-bottom:10px">
+                <div><div style="font-size:12px;color:var(--text-faint)">状态接口均耗</div><div id="an-sys-ms" style="font-family:var(--mono);font-size:26px;font-weight:600">0 ms</div></div>
+                <div><div style="font-size:12px;color:var(--text-faint)">LLM 服务</div><div id="an-sys-llm" style="font-family:var(--mono);font-size:26px;font-weight:600">—</div></div>
+                <div><div style="font-size:12px;color:var(--text-faint)">可用模型</div><div id="an-sys-models" style="font-family:var(--mono);font-size:26px;font-weight:600">0</div></div>
+              </div>
+              <div class="dim" style="font-size:11px;margin-bottom:4px">每次状态轮询耗时（最近 20 次采样，单位 ms）</div>
+              <div id="an-sys-spark" class="chart" style="height:54px;width:100%;max-width:380px"></div>
+            </div>
+          </div>
+          <div id="an-sys-disk" class="chart" style="margin-top:8px"></div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
           <div class="card-title">
             学习历程<span class="tag">每次任务一条</span>
             <span class="dim" style="margin-left:auto;font-size:11px" id="an-sessions-sum"></span>

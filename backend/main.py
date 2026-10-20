@@ -49,16 +49,25 @@ def index() -> FileResponse:
 # --------------------------------------------------------------------------
 @app.get("/api/status")
 def api_status() -> dict:
+    # 仪表盘每几秒轮询一次。原来这里 healthy() + list_models() 向 Ollama 发两次
+    # 完全相同的 /api/tags，加上 memory.stats 与 downloader.disk_report 各自
+    # rglob 一遍 models 目录、finetune.check_env 每次探测 CUDA —— 一次轮询的
+    # 固定开销全花在重复计算上。现在：tags() 一次往返（2s TTL）、disk_usage_gb
+    # 5s TTL、check_env 30s TTL，轮询本身的开销降到一次轻量读取。
+    t0 = time.perf_counter()
+    ok, models = llm.tags()
     env = finetune.check_env()
-    return {
+    out = {
         "engine": evolve.engine.snapshot(),
         "stats": memory.stats(),
-        "llm": {"healthy": llm.healthy(), "models": llm.list_models()},
+        "llm": {"healthy": ok, "models": models},
         "config": config.load(),
         "disk": downloader.disk_report(),
         "finetune": {"ready": env["ready"], "gpu": env.get("gpu"), "cuda": env.get("cuda")},
         "finetune_state": finetune.state(),
     }
+    memory.record_status_poll((time.perf_counter() - t0) * 1000)
+    return out
 
 
 @app.get("/api/config")

@@ -29,6 +29,58 @@ def _client(timeout: float | None = None) -> httpx.Client:
     )
 
 
+def _parse_tags(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    out = []
+    for m in payload.get("models", []):
+        out.append(
+            {
+                "name": m.get("name"),
+                "size_gb": round((m.get("size") or 0) / (1024 ** 3), 2),
+                "params": (m.get("details") or {}).get("parameter_size"),
+                "quant": (m.get("details") or {}).get("quantization_level"),
+                "caps": m.get("capabilities") or [],
+            }
+        )
+    return out
+
+
+#: tags() 的 TTL 缓存。/api/status 每 6 秒轮询一次，而 healthy() 与 list_models()
+#: 打的是同一个 /api/tags —— 分开调用等于每次轮询向 Ollama 发两次完全相同的请求。
+#: TTL 取 8s（略大于轮询周期）：模型清单与健康状态几秒内不会变，staleness 对
+#: 状态展示无感；刚拉完模型由 pull_model 主动失效，不影响即时性。
+_tags_cache: dict[str, Any] = {"ts": 0.0, "healthy": False, "models": []}
+TAGS_TTL = 8.0
+
+
+def _invalidate_tags() -> None:
+    global _tags_cache
+    _tags_cache.update(ts=0.0, healthy=False, models=[])
+
+
+def tags() -> tuple[bool, list[dict[str, Any]]]:
+    """一次 /api/tags 同时拿回「服务是否健康」和「模型清单」。
+
+    带 2s TTL：模型清单几秒内不会变，而轮询频率远高于此，能省掉重复往返。
+    需要强制刷新（刚拉完模型）时传 fresh=True。
+    """
+    global _tags_cache
+    now = time.monotonic()
+    if now - _tags_cache["ts"] < TAGS_TTL:
+        return _tags_cache["healthy"], [dict(m) for m in _tags_cache["models"]]
+    try:
+        with _client(10) as c:
+            r = c.get("/api/tags")
+            if r.status_code != 200:
+                _tags_cache.update(ts=now, healthy=False, models=[])
+                return False, []
+            models = _parse_tags(r.json())
+    except Exception:
+        _tags_cache.update(ts=now, healthy=False, models=[])
+        return False, []
+    _tags_cache.update(ts=now, healthy=True, models=models)
+    return True, [dict(m) for m in models]
+
+
 def healthy() -> bool:
     try:
         with _client(5) as c:
@@ -42,18 +94,7 @@ def list_models() -> list[dict[str, Any]]:
         with _client(10) as c:
             r = c.get("/api/tags")
             r.raise_for_status()
-            out = []
-            for m in r.json().get("models", []):
-                out.append(
-                    {
-                        "name": m.get("name"),
-                        "size_gb": round((m.get("size") or 0) / (1024 ** 3), 2),
-                        "params": (m.get("details") or {}).get("parameter_size"),
-                        "quant": (m.get("details") or {}).get("quantization_level"),
-                        "caps": m.get("capabilities") or [],
-                    }
-                )
-            return out
+            return _parse_tags(r.json())
     except Exception:
         return []
 
@@ -80,6 +121,8 @@ def pull_model(name: str, on_progress=None) -> None:
                     raise LLMError(str(evt["error"]))
                 if on_progress:
                     on_progress(evt)
+    # 模型清单变了，状态展示的缓存立刻失效（否则要等最多一个 TTL）
+    _invalidate_tags()
 
 
 def ensure_models(on_event=None) -> None:

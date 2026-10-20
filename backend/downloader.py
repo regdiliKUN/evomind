@@ -83,7 +83,9 @@ def budget_check(size_gb: float, on_event: Event | None = None) -> tuple[bool, s
     max_one = float(config.get("max_model_gb", 40))
     if size_gb > max_one:
         return False, f"单个体积 {size_gb}GB 超过上限 {max_one}GB"
-    used = config.disk_usage_gb()
+    # 预算闸门必须用实时值：这里是下载前的最后一道关卡，缓存哪怕 15 秒，
+    # 也可能漏掉 concurrently 刚写进去的几个 GB。展示路径才用带 TTL 的版本。
+    used = config._disk_usage_gb_uncached()
     budget = float(config.get("disk_budget_gb", 200))
     if used + size_gb > budget:
         return False, f"预算不足：已用 {used}GB / 上限 {budget}GB，本次需 {size_gb}GB"

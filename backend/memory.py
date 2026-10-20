@@ -380,8 +380,23 @@ _perf = {
     "search_ms": 0.0,
     "snapshot_calls": 0,
     "snapshot_ms": 0.0,
+    "status_calls": 0,
+    "status_ms": 0.0,
 }
 _perf_lock = threading.Lock()
+#: 最近若干次 /api/status 的耗时，供分析视图的「系统状态」卡片画折线
+_status_series: list[float] = []
+_STATUS_SERIES_MAX = 40
+
+
+def record_status_poll(ms: float) -> None:
+    """记录一次 /api/status 的端到端耗时（毫秒）。"""
+    with _perf_lock:
+        _perf["status_calls"] += 1
+        _perf["status_ms"] += ms
+        _status_series.append(round(ms, 2))
+        if len(_status_series) > _STATUS_SERIES_MAX:
+            del _status_series[: len(_status_series) - _STATUS_SERIES_MAX]
 
 
 def _bump_search_cache() -> None:
@@ -408,6 +423,9 @@ def perf_stats() -> dict:
         sms = _perf["search_ms"]
         sc = _perf["snapshot_calls"]
         sm = _perf["snapshot_ms"]
+        tc = _perf["status_calls"]
+        tm = _perf["status_ms"]
+        series = list(_status_series)
     return {
         "search_calls": calls,
         "search_cache_hits": hits,
@@ -415,6 +433,9 @@ def perf_stats() -> dict:
         "search_avg_ms": round(sms / calls, 3) if calls else 0.0,
         "snapshot_calls": sc,
         "snapshot_avg_ms": round(sm / sc, 3) if sc else 0.0,
+        "status_calls": tc,
+        "status_avg_ms": round(tm / tc, 3) if tc else 0.0,
+        "status_series": series,
     }
 
 

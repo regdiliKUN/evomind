@@ -1679,7 +1679,7 @@ function svgGraph(graph) {
   return s + `</svg>`;
 }
 
-function svgGauge(rate) {
+function svgGauge(rate, label) {
   rate = Math.max(0, Math.min(100, rate | 0));
   const W = 150, H = 150, cx = 75, cy = 75, r = 58;
   const C = 2 * Math.PI * r;
@@ -1690,7 +1690,27 @@ function svgGauge(rate) {
     <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${col}" stroke-width="12" stroke-linecap="round"
       stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 ${cx} ${cy})"/>
     <text x="${cx}" y="${cy - 2}" text-anchor="middle" style="font-family:var(--mono);font-size:30px;font-weight:700;fill:var(--text)">${rate}%</text>
-    <text x="${cx}" y="${cy + 20}" text-anchor="middle" class="axis-text">命中率</text>
+    <text x="${cx}" y="${cy + 20}" text-anchor="middle" class="axis-text">${esc(label || "命中率")}</text>
+  </svg>`;
+}
+
+function svgDiskBar(d) {
+  if (!d) return '<div class="empty">等待状态数据…</div>';
+  const used = +(d.used_gb || 0), budget = +(d.budget_gb || 0), free = +(d.free_gb || 0);
+  const models = d.models || 0, datasets = d.datasets || 0;
+  // 分母取预算；预算未配置(0)时退化为已用量，避免除零
+  const denom = budget > 0 ? budget : Math.max(used, 1);
+  const W = 680, H = 66, pad = 4, barW = W - 190, bh = 16;
+  const pctReal = (used / denom) * 100;
+  // 预算用尽后再涨就会侵占磁盘剩余空间，>90% 转橙、100% 转红
+  const col = pctReal >= 100 ? "var(--red, #d9534f)" : pctReal >= 90 ? "var(--orange, #e0a23b)" : "var(--green)";
+  const wUsed = (Math.max(0, Math.min(100, pctReal)) / 100) * barW;
+  return `<svg viewBox="0 0 ${W} ${H}">
+    <text x="0" y="12" class="axis-text">磁盘预算占用（模型 + 数据集）</text>
+    <rect x="0" y="${pad + 14}" width="${barW}" height="${bh}" rx="4" fill="var(--border-soft)"/>
+    <rect x="0" y="${pad + 14}" width="${wUsed.toFixed(1)}" height="${bh}" rx="4" fill="${col}"/>
+    <text x="${barW + 10}" y="${pad + 26}" style="font-family:var(--mono);font-size:13px;fill:var(--text)">${used} / ${budget} GB</text>
+    <text x="0" y="${pad + 46}" class="axis-text">已用 ${pctReal.toFixed(1)}% · 磁盘剩余 ${free} GB · 模型 ${models} 个 · 数据集 ${datasets} 个</text>
   </svg>`;
 }
 
@@ -1891,11 +1911,30 @@ async function loadPerf() {
   setHTML($("#an-perf-hit"), rate + "%");
   setHTML($("#an-perf-ms"), (p.search_avg_ms || 0).toFixed(2) + " ms");
   setHTML($("#an-perf-calls"), String(p.search_calls || 0));
-  setHTML($("#an-perf-gauge"), svgGauge(rate));
+  setHTML($("#an-perf-gauge"), svgGauge(rate, "命中率"));
   // 维护最近 20 次平均耗时的趋势
   _perfHistory.push(p.search_avg_ms || 0);
   if (_perfHistory.length > 20) _perfHistory.shift();
   setHTML($("#an-perf-spark"), svgSpark(_perfHistory));
+  // 系统状态卡片：状态接口自身耗时 + LLM 服务 + 磁盘预算
+  // （磁盘/LLM 数据取自 refreshAll 已经拉过的 /api/status，不额外发请求）
+  loadSysStatus(p);
+}
+
+function loadSysStatus(p) {
+  const st = state.status || {};
+  const llm = st.llm || {};
+  const disk = st.disk || {};
+  const models = (llm.models || []).length;
+  const statusMs = p.status_avg_ms || 0;
+  setHTML($("#an-sys-ms"), statusMs.toFixed(2) + " ms");
+  setHTML($("#an-sys-llm"), llm.healthy ? "正常" : "离线");
+  $("#an-sys-llm").style.color = llm.healthy ? "var(--green)" : "var(--red, #d9534f)";
+  setHTML($("#an-sys-models"), String(models));
+  const budgetPct = disk.budget_gb ? Math.round(((disk.used_gb || 0) / disk.budget_gb) * 100) : 0;
+  setHTML($("#an-sys-gauge"), svgGauge(budgetPct, "预算占用"));
+  setHTML($("#an-sys-disk"), svgDiskBar(disk));
+  setHTML($("#an-sys-spark"), svgSpark((p.status_series || []).slice(-20)));
 }
 
 async function runSearchExplain() {

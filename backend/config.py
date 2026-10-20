@@ -9,6 +9,7 @@ import math
 import os
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -174,7 +175,7 @@ def update(patch: dict[str, Any]) -> dict[str, Any]:
         return dict(_cache)
 
 
-def disk_usage_gb() -> float:
+def _disk_usage_gb_uncached() -> float:
     """data/models + data/datasets 当前占用（GB）。"""
     total = 0
     for base in (MODELS, DATASETS):
@@ -185,6 +186,25 @@ def disk_usage_gb() -> float:
             except OSError:
                 pass
     return round(total / (1024 ** 3), 2)
+
+
+#: disk_usage_gb 的 TTL 缓存。仪表盘每 6 秒轮询一次 /api/status，而 memory.stats 与
+#: downloader.disk_report 各自都会调 disk_usage_gb —— 不改的话每次轮询要把整棵
+#: models/datasets 目录 rglob 两遍（模型文件动辄几万个目录项 + 每文件一次 stat）。
+#: TTL 取 15s（>2 个轮询周期）：占用是 GB 级的量，15 秒内的变化肉眼不可见；
+#: 下载前的预算闸门走 _disk_usage_gb_uncached()，不受此缓存影响。
+_disk_cache: dict[str, Any] = {"ts": 0.0, "value": 0.0}
+DISK_USAGE_TTL = 15.0
+
+
+def disk_usage_gb() -> float:
+    """带 5s TTL 的磁盘占用。数值变化以秒计，5s 内的重复轮询看到同一个值没有影响。"""
+    now = time.monotonic()
+    if now - _disk_cache["ts"] < DISK_USAGE_TTL:
+        return _disk_cache["value"]
+    val = _disk_usage_gb_uncached()
+    _disk_cache.update(ts=now, value=val)
+    return val
 
 
 def free_disk_gb() -> float:
