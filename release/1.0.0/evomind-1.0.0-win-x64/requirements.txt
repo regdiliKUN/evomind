@@ -1,0 +1,46 @@
+# EvoMind 运行依赖
+# 安装：.venv\Scripts\pip install -r requirements.txt
+#
+# 上界是刻意加的：这些库大版本升级常带破坏性改动
+# （transformers 5.x 已改过 torch_dtype → dtype、apply_chat_template 返回类型），
+# 不锁上界的话，半年后重装可能拿到装不上的新版本。
+
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+httpx>=0.26,<1.0
+beautifulsoup4>=4.12,<5.0
+lxml>=5.0,<7.0
+trafilatura>=1.8,<3.0
+numpy>=1.26,<3.0
+huggingface_hub>=0.23,<2.0
+
+# 本地书库解析
+pypdf>=4.0,<7.0
+EbookLib>=0.18,<1.0
+python-docx>=1.1,<2.0
+
+# 扫描件 OCR
+PyMuPDF>=1.24,<2.0
+# 1.x 的包名是 rapidocr-onnxruntime，但它的 Requires-Python 卡在 <3.13，
+# Python 3.13 装不上；2.x 改名 rapidocr 且换了 API。代码里两代都兼容
+# （backend/ocr.py 的 _Rapid2Compat 做形状适配），按 Python 版本二选一。
+rapidocr>=2.0,<3.0; python_version >= "3.13"
+rapidocr-onnxruntime>=1.3,<2.0; python_version < "3.13"
+# GPU 加速（可选，但装了就快 5-7 倍）。注意要先把 CPU 版卸掉：
+#   pip uninstall -y onnxruntime && pip install onnxruntime-gpu==1.22.0
+# 1.22 吃 CUDA 12（torch cu124 自带 cudart/cublas/cudnn9，不用另装 CUDA Toolkit）；
+# 1.23+ 要 CUDA 13，和现在的 torch 对不上。
+python-multipart>=0.0.9,<1.0
+
+# 微调（可选，不装也能用知识层；装了才需要在设置里配基座）
+# torch>=2.4,<3.0
+# transformers>=4.40,<6.0
+# peft>=0.10,<1.0
+# accelerate>=0.30,<2.0
+
+# 多模态摄取：不装也能用（图片走视觉模型、PDF 走文本层），
+# 缺哪个就少一种能力，界面「多模态」页会显示缺什么。
+# 平台视频（YouTube/Bilibili）的字幕与音轨解析
+yt-dlp>=2024.1.1
+# 无字幕音视频的本地转写。会连带装上 av（PyAV，视频抽帧也用它）
+faster-whisper>=1.0,<2.0

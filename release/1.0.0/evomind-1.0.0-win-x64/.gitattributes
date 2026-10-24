@@ -1,0 +1,12 @@
+# 默认统一 LF，避免跨平台换行混乱
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF，否则可能执行异常
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.gguf binary
+*.safetensors binary

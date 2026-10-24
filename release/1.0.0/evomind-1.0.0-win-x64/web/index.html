@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>EvoMind · 自进化学习引擎</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236c8cff'/><text x='16' y='23' font-size='18' font-family='sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'>E</text></svg>" />
+<link rel="stylesheet" href="/static/style.css?v=19" />
+</head>
+<body>
+<div class="app">
+  <!-- ============ 侧栏 ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">E</div>
+      <div class="brand-text">
+        <b>EvoMind</b>
+        <span>自进化学习引擎</span>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <div class="nav-item active" data-view="dashboard"><span class="ico">◈</span>总览</div>
+      <div class="nav-item" data-view="learn"><span class="ico">◐</span>自主进化</div>
+      <div class="nav-item" data-view="knowledge"><span class="ico">▤</span>知识库</div>
+      <div class="nav-item" data-view="analytics"><span class="ico">❖</span>分析</div>
+      <div class="nav-item" data-view="library"><span class="ico">▦</span>书库</div>
+      <div class="nav-item" data-view="media"><span class="ico">◫</span>多模态</div>
+      <div class="nav-item" data-view="resources"><span class="ico">⤓</span>资源获取</div>
+      <div class="nav-item" data-view="finetune"><span class="ico">⚙</span>权重进化</div>
+      <div class="nav-item" data-view="chat"><span class="ico">✎</span>检验所学</div>
+      <div class="nav-item" data-view="settings"><span class="ico">⋯</span>设置</div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="pill"><span class="dot" id="dot-llm"></span><span id="txt-llm">检测中</span></div>
+      <div class="pill"><span class="dot" id="dot-gpu"></span><span id="txt-gpu">—</span></div>
+      <button class="pill pill-btn" id="btn-guide" title="重新查看新手上路引导">⦿ 新手上路</button>
+    </div>
+  </aside>
+
+  <!-- ============ 主区 ============ -->
+  <main class="main">
+    <header class="topbar">
+      <h1 id="page-title">总览</h1>
+      <div class="spacer"></div>
+      <div class="metric"><b id="m-points">0</b><span>知识点</span></div>
+      <div class="metric"><b id="m-docs">0</b><span>已读资料</span></div>
+      <div class="metric"><b id="m-disk">0 GB</b><span>资源占用</span></div>
+      <div class="metric"><b id="m-state">空闲</b><span>引擎状态</span></div>
+      <div class="metric metric-lat" title="最近一次状态轮询的端到端耗时（越低越好）"><b id="m-latency">—</b><span>响应延迟</span></div>
+    </header>
+
+    <div class="content">
+      <!-- ---------- 总览 ---------- -->
+      <section class="view active" id="view-dashboard">
+        <div class="grid g4" style="margin-bottom:16px">
+          <div class="stat">
+            <div class="k">知识点总数</div>
+            <div class="v" id="s-points">0</div>
+            <div class="s" id="s-new">24 小时新增 0</div>
+          </div>
+          <div class="stat">
+            <div class="k">已消化资料</div>
+            <div class="v" id="s-docs">0</div>
+            <div class="s">网页 / 论文 / 仓库</div>
+          </div>
+          <div class="stat">
+            <div class="k">自主获取资源</div>
+            <div class="v" id="s-res">0</div>
+            <div class="s" id="s-res-disk">占用 0 GB</div>
+          </div>
+          <div class="stat">
+            <div class="k">学习任务</div>
+            <div class="v" id="s-sessions">0</div>
+            <div class="s">累计启动次数</div>
+          </div>
+        </div>
+
+        <div class="grid g2">
+          <div class="card">
+            <div class="card-title">能力分布<span class="tag">按学习方向</span></div>
+            <div id="topic-list"><div class="empty">还没有任何学习记录</div></div>
+          </div>
+          <div class="card">
+            <div class="card-title">最近活动<span class="tag" id="feed-live">实时</span></div>
+            <div class="stream" id="dash-stream" style="height:300px;min-height:300px"></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">知识库健康度<span class="tag" id="health-level">—</span></div>
+          <div class="health-grid">
+            <div class="health-gauge" id="health-gauge"></div>
+            <div class="health-main">
+              <div id="health-dims"><div class="empty">评分计算中…</div></div>
+              <div class="health-weak" id="health-weak"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">下一步建议<span class="tag">自动判断</span></div>
+          <div id="next-steps"></div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">成长里程碑<span class="tag" id="ms-level">—</span></div>
+          <div id="milestone"><div class="empty">加载中…</div></div>
+        </div>
+      </section>
+
+      <!-- ---------- 自主进化 ---------- -->
+      <section class="view" id="view-learn">
+        <div class="learn-grid">
+          <div class="card">
+            <div class="card-title">设定进化方向</div>
+            <label class="field">
+              <span>预设领域 · 自动帮你拆出学习方向</span>
+              <input id="direction-seed" value="ZBrush" maxlength="200" placeholder="例如 ZBrush、Blender、角色雕刻" />
+            </label>
+            <div class="rowflex" style="flex-wrap:wrap;margin-bottom:10px">
+              <button class="btn sm" id="btn-directions">刷新方向</button>
+              <button class="btn sm" id="btn-random-learn">随机选一个方向</button>
+            </div>
+            <div id="direction-options" class="direction-options" aria-live="polite"><div class="hint">随机选择只填写方向。选好轮数后，点击下方「开始进化学习」。</div></div>
+            <label class="field">
+              <span>学习方向（越具体，学得越深）</span>
+              <textarea id="direction" placeholder="例如：量子计算中的表面码纠错 / 大模型 Agent 的规划与反思机制 / 光固化 3D 打印的收缩补偿模型"></textarea>
+            </label>
+            <div class="dir-presets" id="presets">
+              <span class="chip">ZBrush</span>
+              <span class="chip">大模型 Agent 架构</span>
+              <span class="chip">RAG 检索增强前沿</span>
+              <span class="chip">强化学习对齐方法</span>
+              <span class="chip">光固化打印工艺</span>
+              <span class="chip">量化投资因子模型</span>
+            </div>
+
+            <div class="sep"></div>
+
+            <label class="field">
+              <span>迭代轮数（每轮约 2-4 分钟）</span>
+              <select id="rounds">
+                <option value="3">3 轮 · 快速摸底</option>
+                <option value="6" selected>6 轮 · 常规学习</option>
+                <option value="10">10 轮 · 深度钻研</option>
+                <option value="16">16 轮 · 长时间自学</option>
+              </select>
+            </label>
+
+            <div class="rowflex">
+              <button class="btn primary" id="btn-start" style="flex:1">开始进化学习</button>
+              <button class="btn danger" id="btn-stop" disabled>停止</button>
+            </div>
+
+            <div class="sep"></div>
+
+            <div class="auto-box">
+              <div class="auto-head">
+                <span class="auto-title">持续自学</span>
+                <button class="btn sm" id="btn-auto">开启</button>
+              </div>
+              <div class="auto-desc" id="auto-desc">
+                每段学习完成后最多等待30秒自动继续；导入、OCR或炼化时会等待。
+              </div>
+              <div class="rowflex" style="margin-top:10px;flex-wrap:wrap">
+                <label>间隔 <input id="auto-seconds" type="number" min="1" max="30" value="15" style="width:64px" /> 秒</label>
+                <label>每次 <input id="auto-rounds" type="number" min="1" max="100" value="2" style="width:64px" /> 轮</label>
+                <button class="btn sm" id="btn-auto-save">保存</button>
+              </div>
+            </div>
+
+            <div class="hint">
+              引擎会自己判断「还缺什么」，每轮检索式都不重复。遇到合适的模型或数据集，会在预算内自主下载。
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">
+              实时进化流
+              <span class="tag" id="stage-tag">空闲</span>
+            </div>
+            <div class="progress-ring" style="margin-bottom:14px">
+              <svg class="ring" viewBox="0 0 62 62">
+                <defs>
+                  <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0%" stop-color="#4d8dff" />
+                    <stop offset="100%" stop-color="#21d4a0" />
+                  </linearGradient>
+                </defs>
+                <circle class="bg" cx="31" cy="31" r="26"></circle>
+                <circle class="fg" id="ring-fg" cx="31" cy="31" r="26"
+                        stroke-dasharray="163.4" stroke-dashoffset="163.4"
+                        transform="rotate(-90 31 31)"></circle>
+              </svg>
+              <div>
+                <div style="font-size:13px;font-weight:600" id="round-label">等待启动</div>
+                <div class="dim" style="font-size:12px" id="focus-label">—</div>
+              </div>
+            </div>
+            <div class="stream" id="learn-stream">
+              <div class="stream-empty">
+                <div class="se-ico">◐</div>
+                <div class="se-title">还没有开始这一轮</div>
+                <div class="se-desc">开始后，这里会实时滚出它的每一步：检索了什么、读了哪几篇、提炼出几条结论。</div>
+                <ol class="se-steps">
+                  <li><b>1</b><span>左边填一个具体方向（越具体学得越深）</span></li>
+                  <li><b>2</b><span>选迭代轮数，一轮大约 2–4 分钟</span></li>
+                  <li><b>3</b><span>点「开始进化学习」，流会自己长出来</span></li>
+                </ol>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ---------- 学习方向自动更换 ---------- -->
+        <div class="card rot-card" id="rot-card">
+          <div class="card-title">
+            学习方向自动更换
+            <span class="tag" id="rot-tag">未启动</span>
+          </div>
+          <div class="hint" style="margin-bottom:12px">
+            只给一个大致方向就行：系统自动拆成若干具体子方向，每个连续学 N 轮后自动换下一个。
+            换向前会校验新方向是否还在这个范围内，越界的丢弃重选；子方向用尽会自动补充，学习不中断。
+          </div>
+          <div class="field-row g3">
+            <label class="field">
+              <span>大致方向（模糊即可）</span>
+              <input id="rot-seed" maxlength="200" placeholder="例如：光固化 3D 打印" />
+            </label>
+            <label class="field">
+              <span>每个子方向连续学多少轮</span>
+              <input id="rot-per" type="number" min="1" max="2000" value="100" />
+            </label>
+            <label class="field">
+              <span>总轮次上限</span>
+              <input id="rot-total" type="number" min="1" max="100000" value="300" />
+            </label>
+          </div>
+          <div class="field-row g3">
+            <label class="field">
+              <span>子方向数量</span>
+              <input id="rot-count" type="number" min="2" max="20" value="6" />
+            </label>
+            <label class="field">
+              <span>短期不重复（最近几个方向）</span>
+              <input id="rot-window" type="number" min="1" max="20" value="3" />
+            </label>
+            <label class="field">
+              <span>换向前校验语义边界</span>
+              <select id="rot-boundary">
+                <option value="1" selected>开启（推荐）</option>
+                <option value="0">关闭</option>
+              </select>
+            </label>
+          </div>
+          <div class="rowflex" style="flex-wrap:wrap">
+            <button class="btn primary" id="btn-rot-start">开始自动轮换</button>
+            <button class="btn sm" id="btn-rot-plan">预览子方向</button>
+            <button class="btn sm" id="btn-rot-pause" disabled>暂停</button>
+            <button class="btn sm" id="btn-rot-resume" disabled>恢复</button>
+            <button class="btn sm" id="btn-rot-skip" disabled>跳过当前方向</button>
+            <button class="btn danger" id="btn-rot-stop" disabled>结束并汇总</button>
+          </div>
+          <div class="rot-status" id="rot-status" role="status" aria-live="polite">尚未启动</div>
+          <div class="rot-bar" id="rot-bar" hidden><i id="rot-bar-fill"></i></div>
+          <div class="rot-plan" id="rot-plan-list"></div>
+          <div class="rot-summary" id="rot-summary" hidden></div>
+          <div class="rowflex" id="rot-summary-actions" hidden style="margin-top:8px">
+            <button class="btn sm" id="btn-rot-copy">复制汇总</button>
+          </div>
+          <details class="rot-history" id="rot-history" hidden>
+            <summary>最近任务</summary>
+            <div id="rot-history-list"></div>
+          </details>
+        </div>
+      </section>
+
+      <!-- ---------- 知识库 ---------- -->
+      <section class="view" id="view-knowledge">
+        <div class="card" style="margin-bottom:14px">
+          <div class="rowflex">
+            <input id="kb-search" placeholder="语义搜索知识库（问一句话，找出最相关的知识点）" maxlength="200" />
+            <select id="kb-topic" style="max-width:260px"><option value="">全部方向</option></select>
+            <button class="btn" id="btn-kb-search">搜索</button>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">重复知识清理<span class="tag">可撤销 · 保留出处</span></div>
+          <p class="hint">一键清理整个知识库中结论与补充内容一致的重复条目，保留可信度较高的一条。相近但内容不同的知识保留供核对。</p>
+          <div class="rowflex" style="flex-wrap:wrap;margin:10px 0">
+            <button class="btn" id="btn-cleanup">一键清理重复项</button>
+            <button class="btn sm" id="btn-cleanup-undo" disabled>撤销上次清理</button>
+            <span class="hint" id="cleanup-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">知识二次炼化<span class="tag">保留原始知识与出处</span></div>
+          <p class="hint">一键整理全部已入库的书籍知识：自动按书籍分批处理，已完成且未变化的内容会跳过，停止后可再次点击继续。</p>
+          <div class="rowflex" style="flex-wrap:wrap;margin:10px 0">
+            <button class="btn primary" id="btn-refine-books">一键炼化全部书籍</button>
+            <button class="btn sm" id="btn-refine-stop" disabled>停止炼化</button>
+          </div>
+          <progress id="refine-progress" max="100" value="0" style="width:100%" hidden aria-label="知识炼化进度"></progress>
+          <div class="hint" id="refine-status" role="status" aria-live="polite"></div>
+          <p class="hint">按上方选择的方向，归纳最近最多120条知识；选择“全部方向”时按方向分别炼化。结果独立保存，可追溯原文。</p>
+          <div class="rowflex" style="flex-wrap:wrap;margin:10px 0">
+            <button class="btn sm" id="btn-refine">仅炼化当前范围</button>
+          </div>
+          <div id="refine-results" aria-live="polite"><div class="empty">尚无炼化结果</div></div>
+          <div class="rowflex" style="justify-content:flex-end;margin-top:10px">
+            <button class="btn sm" id="btn-refine-prev" disabled>上一页</button>
+            <span class="hint" id="refine-page">第1页</span>
+            <button class="btn sm" id="btn-refine-next" disabled>下一页</button>
+          </div>
+        </div>
+        <div class="card" id="dup-card" style="margin-bottom:14px">
+          <div class="card-title">近似知识点<span class="tag" id="dup-threshold-label">相似度 ≥ 90%</span></div>
+          <p class="hint">扫描当前方向的全部知识点；选择“全部方向”时逐方向扫描。优先保留补充信息更完整的一条，完整度相同时保留更早创建的一条。清除前可展开逐对核对，清除后可撤销。</p>
+          <div class="rowflex dup-tools">
+            <label for="dup-threshold">相似度阈值（%）</label>
+            <input id="dup-threshold" type="number" min="50" max="100" step="0.1" value="90" style="max-width:100px" />
+            <button class="btn primary" id="btn-cleanup-similar">一键去除高相似度知识点</button>
+          </div>
+          <div class="hint" id="dup-status" role="status" aria-live="polite"></div>
+          <div id="dup-preview" hidden>
+            <div id="dup-preview-summary" class="hint" role="status"></div>
+            <div id="dup-preview-list"></div>
+            <div class="rowflex dup-tools">
+              <button class="btn sm" id="btn-preview-prev">上一页</button>
+              <span class="hint" id="dup-preview-page"></span>
+              <button class="btn sm" id="btn-preview-next">下一页</button>
+              <button class="btn primary" id="btn-confirm-similar">确认清除</button>
+              <button class="btn sm" id="btn-cancel-similar">取消</button>
+            </div>
+          </div>
+          <div id="dup-body"></div>
+          <div class="rowflex dup-tools">
+            <button class="btn sm" id="btn-dup-prev" disabled>上一页</button>
+            <span class="hint" id="dup-page"></span>
+            <button class="btn sm" id="btn-dup-next" disabled>下一页</button>
+          </div>
+        </div>
+        <div class="list" id="kb-list"><div class="empty">暂无知识点</div></div>
+      </section>
+
+      <!-- ---------- 分析 ---------- -->
+      <section class="view" id="view-analytics">
+        <div class="an-bar">
+          <div class="an-bar-l">
+            <span class="hint" id="an-ver">数据版本 —</span>
+          </div>
+          <div class="an-bar-r">
+            <span class="an-range" id="an-range-chip"></span>
+            <button class="btn sm" id="btn-an-refresh">刷新数据</button>
+          </div>
+        </div>
+
+        <div class="an-empty" id="an-empty" hidden>
+          <div class="an-empty-ico">❖</div>
+          <div class="an-empty-title">还没有可分析的数据</div>
+          <div class="an-empty-desc">
+            这个页面把知识库变成图表：知识点怎么长起来的、哪几天学得多、方向之间怎么关联、检索为什么命中。<br />
+            先去「自主进化」定一个方向让它学一轮，或者到「书库」导入几本书——有数据之后，这里会自己长出来。
+          </div>
+          <div class="an-empty-actions">
+            <button class="btn primary" data-goto="learn">去定一个方向</button>
+            <button class="btn" data-goto="library">去导入书库</button>
+          </div>
+        </div>
+
+        <div id="an-body">
+        <div class="grid g4 an-kpis">
+          <div class="stat">
+            <div class="k">知识点总数</div>
+            <div class="v" id="an-total">0</div>
+            <div class="s">已入库结论</div>
+          </div>
+          <div class="stat">
+            <div class="k">学习方向</div>
+            <div class="v" id="an-topics-n">0</div>
+            <div class="s">不同主题分组</div>
+          </div>
+          <div class="stat">
+            <div class="k">来源类型</div>
+            <div class="v" id="an-sources-n">0</div>
+            <div class="s" id="an-sources-top">—</div>
+          </div>
+          <div class="stat">
+            <div class="k">平均可信度</div>
+            <div class="v" id="an-conf-avg">0</div>
+            <div class="s">0–1 区间</div>
+          </div>
+        </div>
+
+        <div class="card an-card">
+          <div class="card-title">
+            知识增长曲线<span class="tag">累计 / 每日新增</span>
+            <div class="an-legend">
+              <span class="li"><i class="sw line"></i>累计知识点</span>
+              <span class="li"><i class="sw bar"></i>每日新增</span>
+            </div>
+            <span class="an-meta" id="an-growth-range"></span>
+          </div>
+          <div id="an-growth" class="chart"></div>
+        </div>
+
+        <div class="card an-card">
+          <div class="card-title">
+            学习活跃度<span class="tag">每日新增 · 热力图</span>
+            <span class="an-meta" id="an-heat-range"></span>
+          </div>
+          <div class="an-heat">
+            <div id="an-heatmap" class="chart"></div>
+            <div id="an-heat-side" class="an-heat-side"></div>
+          </div>
+        </div>
+
+        <div class="grid g2 an-row">
+          <div class="card an-card">
+            <div class="card-title">检索性能<span class="tag">缓存命中率 / 平均耗时</span></div>
+            <div class="an-kv-row">
+              <div id="an-perf-gauge" class="chart an-gauge"></div>
+              <div class="an-kv-main">
+                <div class="an-kv-grid">
+                  <div class="an-kv"><span>缓存命中</span><b id="an-perf-hit">0</b></div>
+                  <div class="an-kv"><span>平均检索</span><b id="an-perf-ms">0 ms</b></div>
+                  <div class="an-kv"><span>累计检索</span><b id="an-perf-calls">0</b></div>
+                </div>
+                <div id="an-perf-split" class="chart an-spark"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card an-card">
+            <div class="card-title">系统状态<span class="tag">轮询开销 · 磁盘 · 模型服务</span></div>
+            <div class="an-kv-row">
+              <div id="an-sys-gauge" class="chart an-gauge"></div>
+              <div class="an-kv-main">
+                <div class="an-kv-grid">
+                  <div class="an-kv"><span>状态接口均耗</span><b id="an-sys-ms">0 ms</b></div>
+                  <div class="an-kv"><span>LLM 服务</span><b id="an-sys-llm">—</b></div>
+                  <div class="an-kv"><span>可用模型</span><b id="an-sys-models">0</b></div>
+                </div>
+                <div class="an-spark-label">每次状态轮询耗时 · 最近 20 次采样（ms）</div>
+                <div id="an-sys-spark" class="chart an-spark"></div>
+              </div>
+            </div>
+            <div id="an-sys-disk" class="chart an-disk"></div>
+          </div>
+        </div>
+
+        <div class="card an-card">
+          <div class="card-title">
+            学习历程<span class="tag">每次任务一条</span>
+            <div class="an-legend">
+              <span class="li"><i class="sw dot" style="background:var(--green)"></i>完成</span>
+              <span class="li"><i class="sw dot" style="background:var(--amber)"></i>中止</span>
+              <span class="li"><i class="sw dot" style="background:var(--red)"></i>出错</span>
+            </div>
+            <span class="an-meta" id="an-sessions-sum"></span>
+          </div>
+          <div id="an-sessions" class="chart"></div>
+        </div>
+
+        <div class="grid g2 an-row">
+          <div class="card an-card">
+            <div class="card-title">能力分布<span class="tag">按学习方向</span></div>
+            <div id="an-topics" class="an-topic-list"><div class="empty">还没有任何学习记录</div></div>
+          </div>
+          <div class="card an-card">
+            <div class="card-title">可信度分布<span class="tag">直方图</span><span class="an-meta" id="an-conf-meta"></span></div>
+            <div id="an-conf" class="chart"></div>
+          </div>
+        </div>
+
+        <div class="grid g2 an-row">
+          <div class="card an-card">
+            <div class="card-title">来源构成<span class="tag">知识从哪来</span></div>
+            <div id="an-source" class="chart"></div>
+          </div>
+          <div class="card an-card">
+            <div class="card-title">
+              主题语义网络<span class="tag">可拖拽 · 悬停看关联 · 点击看知识点</span>
+            </div>
+            <div id="an-graph" class="chart"></div>
+            <div id="an-graph-detail" class="detail an-graph-detail"></div>
+          </div>
+        </div>
+
+        <div class="card an-card">
+          <div class="card-title">检索解释<span class="tag">为什么是这些结果</span></div>
+          <div class="an-search-row">
+            <input id="an-q" placeholder="输入一个查询，看它命中了哪些知识点、匹配度多少" maxlength="200" />
+            <button class="btn primary" id="btn-an-search">检索并解释</button>
+          </div>
+          <div id="an-search" class="chart"></div>
+          <div id="an-search-graph" class="chart an-search-graph"></div>
+        </div>
+        </div>
+      </section>
+
+      <!-- ---------- 书库 ---------- -->
+      <section class="view" id="view-library">
+        <div class="grid g4" style="margin-bottom:16px">
+          <div class="stat">
+            <div class="k">书库目录</div>
+            <div class="v" id="lib-dirs">0</div>
+            <div class="s">可添加多个</div>
+          </div>
+          <div class="stat">
+            <div class="k">已登记书目</div>
+            <div class="v" id="lib-books">0</div>
+            <div class="s" id="lib-pending">待解析 0</div>
+          </div>
+          <div class="stat">
+            <div class="k">已导入</div>
+            <div class="v" id="lib-done">0</div>
+            <div class="s" id="lib-skipped">跳过 0</div>
+          </div>
+          <div class="stat">
+            <div class="k">书中知识点</div>
+            <div class="v" id="lib-points">0</div>
+            <div class="s">已进入知识库</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">书库目录<span class="tag">可多个</span></div>
+          <div class="rowflex" style="margin-bottom:12px">
+            <input id="lib-path" placeholder="目录路径，例如 K:\书籍\我的电子书库" />
+            <input id="lib-excludes" placeholder="排除关键词（逗号分隔）" value="成人" style="max-width:200px" />
+            <button class="btn" id="btn-lib-add">添加目录</button>
+          </div>
+          <div class="dirsum" id="lib-dir-summary"></div>
+          <div class="list" id="lib-dir-list"><div class="empty">还没有添加目录</div></div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">导入操作</div>
+          <div class="rowflex" style="flex-wrap:wrap;margin-bottom:12px">
+            <button class="btn primary" id="btn-lib-scan">扫描目录</button>
+            <input id="lib-topic" placeholder="导入到哪个学习方向（留空用书名）" style="flex:1;min-width:220px" />
+            <button class="btn" id="btn-lib-parse" disabled>解析选中（0）</button>
+            <button class="btn" id="btn-lib-import" disabled>导入选中（0）</button>
+            <button class="btn" id="btn-lib-ocr" disabled>OCR 选中（0）</button>
+            <button class="btn danger" id="btn-lib-stop" disabled>停止</button>
+          </div>
+          <div class="rowflex" style="flex-wrap:wrap">
+            <input id="lib-url" placeholder="或粘贴一个链接（网页 / PDF / EPUB 直链）" style="flex:1;min-width:260px" />
+            <button class="btn" id="btn-lib-url">从链接导入</button>
+          </div>
+          <div class="hint" id="lib-task-hint">
+            扫描只是登记书目，不会解析内容。选好书再点「导入选中」才会真正提炼入库。
+          </div>
+          <div class="bar" style="display:none" id="lib-bar-wrap"><i id="lib-bar" style="width:0%"></i></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            书目清单
+            <span class="tag" id="lib-total">0</span>
+            <div class="rowflex" style="margin-left:auto;gap:8px">
+              <select id="lib-filter" style="width:auto;padding:5px 9px;font-size:12px">
+                <option value="">全部状态</option>
+                <option value="pending">待解析</option>
+                <option value="ready">可导入</option>
+                <option value="done">已导入</option>
+                <option value="skipped">已跳过</option>
+                <option value="failed">失败</option>
+              </select>
+              <input id="lib-search" placeholder="搜索书名" maxlength="60" style="width:180px;padding:5px 9px;font-size:12px" />
+              <button class="btn sm" id="btn-lib-selectall">全选</button>
+              <button class="btn sm" id="btn-lib-unselect">取消全选</button>
+              <input id="lib-select-n" type="number" min="1" placeholder="N"
+                     style="width:62px;padding:4px 7px;font-size:12px" />
+              <button class="btn sm" id="btn-lib-selectn">选前 N 本</button>
+            </div>
+          </div>
+          <div class="lib-scope" id="lib-scope" style="display:none"></div>
+          <div class="list scroll-y" id="lib-book-list"><div class="empty">还没有扫描到书目</div></div>
+        </div>
+      </section>
+
+      <!-- ---------- 资源 ---------- -->
+      <section class="view" id="view-resources">
+        <div class="grid g3" style="margin-bottom:16px">
+          <div class="stat">
+            <div class="k">资源占用 / 预算</div>
+            <div class="v" id="r-used">0 GB</div>
+            <div class="bar"><i id="r-bar" style="width:0%"></i></div>
+          </div>
+          <div class="stat">
+            <div class="k">磁盘剩余</div>
+            <div class="v" id="r-free">0 GB</div>
+            <div class="s">下载前会自动校验</div>
+          </div>
+          <div class="stat">
+            <div class="k">自主下载</div>
+            <div class="v" id="r-auto">开启</div>
+            <div class="s">超预算自动跳过</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">手动指定资源</div>
+          <div class="rowflex">
+            <input id="res-repo" placeholder="HuggingFace 仓库，如 Qwen/Qwen2.5-7B-Instruct 或 数据集 org/name" />
+            <select id="res-kind" style="max-width:170px">
+              <option value="hf_model">模型</option>
+              <option value="hf_dataset">数据集</option>
+              <option value="ollama">Ollama 模型</option>
+            </select>
+            <button class="btn primary" id="btn-res-add">获取</button>
+          </div>
+          <div class="hint">下载前会先算体积、再查预算。GGUF 模型下载完会自动注册进 Ollama。</div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">资源清单</div>
+          <div class="list" id="res-list"><div class="empty">还没有下载任何资源</div></div>
+        </div>
+      </section>
+
+      <!-- ---------- 多模态 ---------- -->
+      <section class="view" id="view-media">
+        <div class="grid g4" style="margin-bottom:16px">
+          <div class="stat">
+            <div class="k">视觉理解</div>
+            <div class="v" id="mm-vision">—</div>
+            <div class="s" id="mm-vision-s">检测中…</div>
+          </div>
+          <div class="stat">
+            <div class="k">语音转写</div>
+            <div class="v" id="mm-asr">—</div>
+            <div class="s" id="mm-asr-s">检测中…</div>
+          </div>
+          <div class="stat">
+            <div class="k">视频字幕</div>
+            <div class="v" id="mm-sub">—</div>
+            <div class="s" id="mm-sub-s">检测中…</div>
+          </div>
+          <div class="stat">
+            <div class="k">PDF / OCR</div>
+            <div class="v" id="mm-pdf">—</div>
+            <div class="s" id="mm-pdf-s">检测中…</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">摄取网络媒体<span class="tag" id="mm-mode">多模态已开启</span></div>
+          <textarea id="mm-urls" placeholder="每行一个链接。例如：
+https://example.com/figure-3.png
+https://www.youtube.com/watch?v=xxxx
+https://example.com/paper.pdf
+https://archive.org/details/lecture-2024"></textarea>
+          <div class="rowflex" style="margin-top:10px">
+            <input id="mm-direction" placeholder="这批资料属于哪个学习方向（可选，默认「多模态资料」）" maxlength="120" />
+            <button class="btn primary" id="btn-mm-ingest">开始摄取</button>
+            <button class="btn" id="btn-mm-stop">停止</button>
+          </div>
+          <div class="hint">
+            图片 → 本地视觉模型描述画面 + 转录图中文字；音频/视频 → 优先取平台字幕，没有字幕再本地转写音轨；
+            PDF → 先读文本层，扫描件自动走 OCR。解析出的文字会像网页正文一样提炼、核对、去重入库，
+            来源类型会标在知识条目上（图片/音频/视频/PDF）。<span id="mm-storage"></span>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">查缺补漏<span class="tag">用图片 / 视频补已有知识</span></div>
+          <div class="rowflex">
+            <select id="mm-bf-topic" style="flex:1"></select>
+            <input id="mm-bf-per" type="number" min="1" max="6" value="2" style="max-width:132px"
+                   title="每个方向最多摄取几个媒体来源" />
+            <button class="btn primary" id="btn-mm-backfill">开始补漏</button>
+          </div>
+          <div class="hint">
+            针对知识库里已有的方向，让模型先指出「文字讲不清、只能靠看图 / 看演示」的缺口，
+            再去搜对应的图片、视频、音频并提炼入库。每个方向最多取 <b>每个方向媒体数</b> 个来源，
+            已读过的媒体会自动跳过，可以反复点，越点越深。
+          </div>
+        </div>
+
+        <div class="grid g2" style="align-items:start">
+          <div class="card">
+            <div class="card-title">搜索媒体素材</div>
+            <div class="rowflex">
+              <input id="mm-q" placeholder="关键词，如 dynamesh resolution / 光固化 收缩补偿" maxlength="120" />
+              <button class="btn" id="btn-mm-search">搜索</button>
+            </div>
+            <div class="rowflex mm-kinds">
+              <label class="chip"><input type="checkbox" id="mm-k-image" checked /> 图片</label>
+              <label class="chip"><input type="checkbox" id="mm-k-audio" checked /> 音频</label>
+              <label class="chip"><input type="checkbox" id="mm-k-video" checked /> 视频</label>
+            </div>
+            <div class="list" id="mm-results" style="margin-top:12px">
+              <div class="empty">检索 Wikimedia Commons / Openverse / Internet Archive / YouTube，结果可直接摄取</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">摄取进度</div>
+            <div class="stream" id="media-stream" style="height:420px">
+              <div class="stream-empty">
+                <div class="se-ico">◫</div>
+                <div class="se-title">还没有开始摄取</div>
+                <div class="se-desc">贴一个链接、或者先搜一段素材，解析过程会实时显示在这里。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------- 权重进化 ---------- -->
+      <section class="view" id="view-finetune">
+        <div class="grid g2" style="align-items:start">
+          <div class="card">
+            <div class="card-title">微调环境</div>
+            <div id="ft-env"><div class="empty">检测中…</div></div>
+            <div class="rowflex" style="margin-top:14px">
+              <button class="btn primary" id="btn-ft-install">安装微调环境</button>
+            </div>
+            <div class="hint">
+              需要 PyTorch + Transformers + PEFT，约 3GB。装一次即可。你的 4090 跑 7B LoRA 微调约 17GB 显存，够用。
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">知识固化流程</div>
+            <div class="ft-steps">
+              <div class="ft-step"><b>1</b><span class="t">导出数据集</span><span class="v" id="ft-ds">未生成</span></div>
+              <div class="ft-step"><b>2</b><span class="t">LoRA 训练</span><span class="v" id="ft-train">未开始</span></div>
+              <div class="ft-step"><b>3</b><span class="t">合并权重</span><span class="v" id="ft-merge">—</span></div>
+            </div>
+            <div class="ft-progress" id="ft-progress" hidden><div class="bar"><i id="ft-bar" style="width:0%"></i></div></div>
+            <div class="rowflex" style="margin-top:14px;flex-wrap:wrap">
+              <button class="btn" id="btn-ft-dataset">生成训练集</button>
+              <button class="btn" id="btn-ft-train" disabled>开始微调</button>
+            </div>
+            <div class="hint">
+              把知识库里学到的内容，用 LoRA 压进模型参数。微调后的模型不再依赖检索，是「真的学会了」。
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">训练产出</div>
+          <div class="list" id="ft-outputs"><div class="empty">还没有产出</div></div>
+        </div>
+      </section>
+
+      <!-- ---------- 检验所学 ---------- -->
+      <section class="view" id="view-chat">
+        <div class="card chat-box">
+          <div class="chat-log" id="chat-log">
+            <div class="msg bot">问我任何关于已学方向的问题。我会用学到的知识回答，并标注出处。知识库里没有的，我会直接说不知道——不编。</div>
+            <div class="chat-hints" id="chat-hints">
+              <div class="ch-title">可以这样问</div>
+              <div class="ch-list">
+                <button class="chip" data-ask="HNSW 的 ef 参数调大调小分别有什么影响？">HNSW 的 ef 参数怎么调？</button>
+                <button class="chip" data-ask="Rust 的借用检查器是怎么判断生命周期冲突的？">借用检查器怎么判断冲突？</button>
+                <button class="chip" data-ask="为什么 RAG 的召回质量比模型大小更重要？">为什么召回比模型大小更重要？</button>
+              </div>
+            </div>
+          </div>
+          <div class="chat-input">
+            <input id="chat-q" placeholder="输入问题，回车发送" maxlength="500" />
+            <button class="btn primary" id="btn-chat">发送</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------- 设置 ---------- -->
+      <section class="view" id="view-settings">
+        <div class="grid g2" style="align-items:start">
+          <div class="card">
+            <div class="card-title">学习与推理</div>
+            <label class="field"><span>主推理模型</span><select id="cfg-model"></select></label>
+            <div class="field-hint" id="cfg-model-hint" hidden></div>
+            <label class="field"><span>向量模型</span><input id="cfg-embed" /></label>
+            <div class="field-row g3">
+              <label class="field"><span>每轮检索式数量</span><input id="cfg-qpr" type="number" min="1" max="8" /></label>
+              <label class="field"><span>每轮抓取网页数</span><input id="cfg-fpr" type="number" min="1" max="20" /></label>
+              <label class="field"><span>最低相关度</span><input id="cfg-rel" type="number" step="0.05" min="0" max="1" /></label>
+            </div>
+            <label class="field">
+              <span>Brave 搜索 API Key（可选，强烈建议填）</span>
+              <input id="cfg-search-key" placeholder="留空则只用免 Key 源（质量差一些）" />
+            </label>
+            <div class="hint" style="margin-top:-6px">
+              国内网络下通用搜索引擎会被反爬污染。填一个 Brave Key（免费 2000 次/月，
+              <a href="https://brave.com/search/api/" target="_blank" rel="noreferrer" style="color:#7ba7ee">申请地址</a>）
+              能明显提升检索质量，尤其是 ZBrush 这类软件操作方向。
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">资源下载</div>
+            <div class="field-row g2">
+              <label class="field"><span>总磁盘预算（GB）</span><input id="cfg-budget" type="number" min="10" /></label>
+              <label class="field"><span>单模型体积上限（GB）</span><input id="cfg-maxone" type="number" min="1" /></label>
+            </div>
+            <label class="field"><span>自动下载</span>
+              <select id="cfg-auto"><option value="1">开启（预算内自主下载）</option><option value="0">关闭（只记录不下载）</option></select>
+            </label>
+            <label class="field"><span>HF 镜像（国内可填 https://hf-mirror.com）</span><input id="cfg-hf" /></label>
+            <label class="field"><span>代理（可选，如 http://127.0.0.1:7890）</span><input id="cfg-proxy" /></label>
+            <label class="field">
+              <span>微调基座模型</span>
+              <input id="cfg-ft-base" placeholder="Qwen/Qwen2.5-0.5B-Instruct" />
+            </label>
+            <div class="hint" style="margin-top:-6px">
+              默认 0.5B，几分钟能跑完一轮，用来验证链路。<b>想要真正有用的模型改成
+              <code>Qwen/Qwen2.5-7B-Instruct</code></b>（需下载 14GB、约 17GB 显存）。
+            </div>
+            <button class="btn primary" id="btn-save-cfg" style="margin-top:6px">保存设置</button>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">多模态摄取<span class="tag">图片 / 音频 / 视频 / PDF</span></div>
+          <div class="field-row g3">
+            <label class="field"><span>摄取开关</span>
+              <select id="cfg-media">
+                <option value="1">开启（网页 + 媒体）</option>
+                <option value="0">关闭（只读文字网页）</option>
+              </select>
+            </label>
+            <label class="field"><span>每轮最多摄取媒体数</span>
+              <input id="cfg-media-per" type="number" min="0" max="20" />
+            </label>
+            <label class="field"><span>单文件下载上限（MB）</span>
+              <input id="cfg-media-max" type="number" min="1" max="2048" />
+            </label>
+          </div>
+          <div class="field-row g2">
+            <label class="field"><span>语音识别模型（faster-whisper）</span>
+              <select id="cfg-asr-model">
+                <option value="tiny">tiny · 最快，准确度低</option>
+                <option value="base">base</option>
+                <option value="small">small · 推荐（约 480MB）</option>
+                <option value="medium">medium · 更准，更慢</option>
+                <option value="large-v3">large-v3 · 最准，需大显存</option>
+              </select>
+            </label>
+            <label class="field"><span>视觉模型（须具备 vision 能力）</span>
+              <input id="cfg-vision" placeholder="如 qwen2.5vl:7b / qwen3.8:27b" />
+            </label>
+          </div>
+          <div class="hint" style="margin-top:-4px">
+            关闭后自主学习只读文字网页，与改造前一致。<b>语音转写需要
+            <code>pip install faster-whisper</code></b>，平台视频解析需要
+            <code>pip install yt-dlp</code>；两者都没装时，图片仍可用视觉模型/OCR 解析，PDF 仍可读文本层。
+            每轮媒体数建议 1-3：一段 10 分钟的音频转写要几十秒，设太大会把一轮学习拖长。
+          </div>
+          <button class="btn primary" id="btn-save-cfg-media" style="margin-top:6px">保存多模态设置</button>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="card-title">数据备份与恢复<span class="tag">一键导出</span></div>
+          <div class="field-row" style="grid-template-columns:1fr auto;align-items:end">
+            <label class="field"><span>备份备注（可选，如「升级前」）</span><input id="bak-label" placeholder="留空则只按时间命名" /></label>
+            <button class="btn primary" id="btn-bak-export">一键备份</button>
+          </div>
+          <div class="hint" style="margin-top:-4px">
+            把整个知识库（<code>knowledge.db</code>：知识点 / 书 / 章节 / OCR 结果）连同当前配置打成一个 zip，
+            存在 <code>data/backups/</code>，最多保留最近 <span id="bak-keep">10</span> 份。
+            下载后另存到别处（移动硬盘 / 网盘），新机器或新实例都能用它恢复。
+          </div>
+          <div class="sep"></div>
+          <div id="bak-list"><div class="empty">还没有备份。点上面的「一键备份」即可生成第一份。</div></div>
+          <div class="sep"></div>
+          <div class="field-row" style="grid-template-columns:1fr auto;align-items:end">
+            <label class="field"><span>从备份文件恢复（.zip）</span><input id="bak-file" type="file" accept=".zip" /></label>
+            <button class="btn danger" id="btn-bak-restore">恢复</button>
+          </div>
+          <div class="hint" style="margin-top:-4px">
+            恢复会用备份里的知识库<b>覆盖当前知识库</b>；当前库会先自动另存一份（备注 pre-restore）再替换，全程可回退。
+            学习 / 导入 / OCR / 持续自学进行中会被拒绝，请先停止。
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+  <!-- ---------- OCR 识别与校对抽屉 ---------- -->
+  <div class="drawer" id="ocr-drawer">
+    <div class="drawer-head">
+      <div>
+        <div class="t" id="ocr-title">—</div>
+        <div class="hint" id="ocr-sub" style="margin-top:3px"></div>
+      </div>
+      <button class="btn sm" id="ocr-close">关闭</button>
+    </div>
+    <div class="drawer-tools">
+      <input id="ocr-pages" value="all" placeholder="页范围，如 1-50" style="width:132px" />
+      <select id="ocr-engine">
+        <option value="rapid">快速引擎 · 每页 0.2-2 秒 · 适合中英文印刷体</option>
+        <option value="vision">精细引擎 · 约 40 秒/页 · 日文/表格/复杂版面用这个</option>
+      </select>
+      <button class="btn primary" id="ocr-start">开始识别</button>
+      <button class="btn danger" id="ocr-stop" disabled>停止</button>
+      <button class="btn" id="ocr-import">导入知识库</button>
+      <span class="hint" id="ocr-status"></span>
+      <span class="hint" id="ocr-device" title="识别用的计算设备"></span>
+    </div>
+    <div class="ocr-bar"><i id="ocr-bar"></i></div>
+    <div class="ocr-body">
+      <div class="ocr-pages" id="ocr-page-list"></div>
+      <div class="ocr-view">
+        <div class="ocr-img"><img id="ocr-img" alt="" /></div>
+        <div class="ocr-text">
+          <textarea id="ocr-text" placeholder="选左边任意一页，这里会显示识别出的文字，可以直接改"></textarea>
+          <div class="rowflex">
+            <button class="btn sm" id="ocr-save">保存校对</button>
+            <button class="btn sm" id="ocr-redo">换引擎重识别</button>
+            <span class="hint" id="ocr-page-info"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- 新手上路引导 ---------- -->
+  <div class="modal-mask" id="onboarding" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <div class="brand-mark" style="width:36px;height:36px;font-size:19px">E</div>
+        <div>
+          <div class="modal-title">欢迎使用 EvoMind</div>
+          <div class="hint" style="margin:3px 0 0">三步上路：定方向 → 开始学 → 看分析</div>
+        </div>
+      </div>
+      <div class="ob-step" id="ob-step"></div>
+      <div class="ob-dots" id="ob-dots"></div>
+      <div class="rowflex" style="justify-content:space-between;margin-top:16px">
+        <button class="btn sm" id="ob-skip">跳过引导</button>
+        <div class="rowflex">
+          <button class="btn sm" id="ob-prev">上一步</button>
+          <button class="btn primary sm" id="ob-next">下一步</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------- 知识点详情（右侧抽屉） ---------- -->
+  <div class="pdrawer-mask" id="pt-mask" hidden></div>
+  <aside class="pdrawer" id="pt-drawer" hidden aria-label="知识点详情">
+    <div class="pdrawer-head">
+      <div class="pdrawer-title">知识点详情</div>
+      <button class="btn sm" id="pt-close">关闭</button>
+    </div>
+    <div class="pdrawer-body" id="pt-body"></div>
+  </aside>
+
+<script src="/static/app.js?v=19"></script>
+</body>
+</html>

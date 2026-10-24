@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EvoMind 使用说明</title>
+<style>
+  :root{
+    --bg:#080b11; --panel:#111721; --panel2:#161e2b; --border:#1e2836;
+    --text:#e4ebf7; --dim:#93a0b5; --faint:#5f6c81;
+    --blue:#4d8dff; --green:#21d4a0; --amber:#ffb648; --red:#ff5f6d;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+    line-height:1.85; font-size:15.5px;
+    background-image:radial-gradient(900px 500px at 85% -10%,rgba(77,141,255,.10),transparent 60%),
+                     radial-gradient(700px 400px at 10% 110%,rgba(169,123,255,.07),transparent 60%);
+    background-attachment:fixed;
+  }
+  .wrap{max-width:860px;margin:0 auto;padding:0 26px 100px}
+
+  /* 首屏：只做一件事 */
+  .hero{padding:70px 0 54px;text-align:center}
+  .hero .logo{
+    width:64px;height:64px;border-radius:18px;margin:0 auto 22px;
+    background:linear-gradient(140deg,#4d8dff,#a97bff 70%,#21d4a0);
+    display:grid;place-items:center;font-size:30px;font-weight:800;color:#06101f;
+    box-shadow:0 10px 40px rgba(77,141,255,.4);
+  }
+  .hero h1{font-size:32px;letter-spacing:-.5px;margin-bottom:10px}
+  .hero p{color:var(--dim);font-size:16px}
+
+  .startbox{
+    margin:38px auto 0;max-width:560px;
+    background:linear-gradient(160deg,rgba(77,141,255,.16),rgba(169,123,255,.10));
+    border:1px solid rgba(77,141,255,.35);
+    border-radius:20px;padding:38px 30px;
+    box-shadow:0 20px 60px rgba(77,141,255,.15);
+  }
+  .startbox .label{font-size:13px;color:#9dbcff;letter-spacing:2px;margin-bottom:18px}
+  .fakebtn{
+    display:inline-block;
+    background:linear-gradient(135deg,#3f7ef0,#5a6df0);
+    color:#fff;font-size:19px;font-weight:700;
+    padding:19px 40px;border-radius:13px;
+    box-shadow:0 10px 30px rgba(77,141,255,.45);
+    letter-spacing:.5px;
+  }
+  .startbox .note{margin-top:20px;font-size:13.5px;color:var(--dim);line-height:1.9}
+  .startbox .note b{color:var(--amber)}
+
+  .startbox.second{
+    max-width:480px;padding:26px 26px;
+    background:linear-gradient(160deg,rgba(33,212,160,.10),rgba(77,141,255,.06));
+    border-color:rgba(33,212,160,.28);
+    box-shadow:0 14px 40px rgba(33,212,160,.10);
+  }
+  .startbox.second .fakebtn{font-size:16px;padding:14px 30px;border-radius:11px}
+
+  h2{
+    font-size:22px;margin:64px 0 20px;padding-bottom:12px;
+    border-bottom:1px solid var(--border);letter-spacing:-.2px;
+  }
+  h3{font-size:16.5px;margin:30px 0 12px;color:#b9c8dd}
+  p{margin:12px 0;color:#cdd6e4}
+  ul,ol{margin:12px 0 12px 24px;color:#cdd6e4}
+  li{margin:7px 0}
+  code{
+    background:#131c28;border:1px solid var(--border);border-radius:5px;
+    padding:2px 7px;font-family:Consolas,"Cascadia Code",monospace;
+    font-size:13px;color:#8fb6ff;
+  }
+  .card{
+    background:var(--panel);border:1px solid var(--border);
+    border-radius:14px;padding:22px 24px;margin:18px 0;
+  }
+  .card.warn{border-color:rgba(255,182,72,.3);background:rgba(255,182,72,.05)}
+  .card.info{border-color:rgba(77,141,255,.3);background:rgba(77,141,255,.05)}
+  .card.ok{border-color:rgba(33,212,160,.3);background:rgba(33,212,160,.05)}
+  .card .t{font-weight:700;margin-bottom:8px;font-size:15px}
+
+  .step{display:flex;gap:16px;margin:20px 0;align-items:flex-start}
+  .step .n{
+    flex-shrink:0;width:30px;height:30px;border-radius:9px;
+    background:var(--blue);color:#fff;display:grid;place-items:center;
+    font-weight:700;font-size:14px;margin-top:3px;
+  }
+  .step .body{flex:1}
+  .step .body b{display:block;font-size:15.5px;margin-bottom:5px}
+  .step .body span{color:var(--dim);font-size:14px}
+
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:14px}
+  th,td{text-align:left;padding:11px 13px;border-bottom:1px solid var(--border)}
+  th{color:var(--dim);font-weight:600;font-size:13px;background:#0d131c}
+  td{color:#cdd6e4}
+
+  .kbd{
+    background:#1a2433;border:1px solid #2b3a50;border-bottom-width:2px;
+    border-radius:5px;padding:1px 7px;font-size:12.5px;font-family:Consolas,monospace;
+  }
+  .muted{color:var(--faint);font-size:13.5px}
+  a{color:#7ba7ee}
+  hr{border:none;border-top:1px solid var(--border);margin:44px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="hero">
+    <div class="logo">E</div>
+    <h1>EvoMind</h1>
+    <p>一个会自己上网学习、并且越学越强的 AI</p>
+  </div>
+
+  <div class="startbox">
+    <div class="label">第 一 次 用</div>
+    <div class="fakebtn">⓪ 首次安装.cmd</div>
+    <div class="note">
+      装运行环境，大概几分钟。<br>
+      装的过程中会问你 <b>要不要在桌面放一个 EvoMind 图标</b>——<br>
+      选「要」还是「不要」都行，不影响使用。
+    </div>
+  </div>
+
+  <div class="startbox second">
+    <div class="label">以 后 每 次</div>
+    <div class="fakebtn">① 双击这里启动.cmd</div>
+    <div class="note">
+      双击后会出现一个黑色窗口，<b>不要关掉它</b>（关掉服务就停了）。<br>
+      浏览器会自动打开控制台，大概需要 10 秒。<br>
+      建了桌面图标的话，直接双击桌面上的 <b>EvoMind</b> 也一样。
+    </div>
+  </div>
+
+  <h2>它到底在做什么</h2>
+
+  <p>你可能听过「让 AI 自己学习」，但真正的自我进化其实是两件事。这个系统两件都做了：</p>
+
+  <div class="card info">
+    <div class="t">第一层：知识进化（RAG）— 立刻见效</div>
+    <p style="margin-top:8px">AI 自己决定「我该查什么」→ 去网上搜 → 打开网页读正文 → 把有用的结论提炼成一条条知识点存进知识库。<br>
+    下次回答问题时先查知识库。学得越多，懂得越多。</p>
+    <p class="muted" style="margin-top:10px">特点：几分钟就能看到新知识，随时可增删，不占显卡。</p>
+  </div>
+
+  <div class="card ok">
+    <div class="t">第二层：权重进化（LoRA 微调）— 真的改模型</div>
+    <p style="margin-top:8px">知识库攒够素材后，把这些内容做成训练集，用你的 4090 微调模型参数，产出一个新的模型。<br>
+    微调之后，知识就长在模型里了——不用查资料也能答上来。</p>
+    <p class="muted" style="margin-top:10px">特点：每次要跑几小时显卡，但这是真正的「模型进化」，不只是查资料。</p>
+  </div>
+
+  <div class="card">
+    <div class="t">第三层：自己找资源下载</div>
+    <p style="margin-top:8px">学习过程中如果发现网上有对口的模型或数据集，它会自己判断值不值得下，然后下载到本地。<br>
+    有安全阀：先算体积，再查磁盘预算，超了自动跳过，绝不会把硬盘塞爆。</p>
+  </div>
+
+  <h2>桌面图标</h2>
+
+  <p>安装的时候会问你一次要不要在桌面放图标。<b>选「不要」完全不影响使用</b>，只是每次得进文件夹找启动文件。</p>
+
+  <div style="display:flex;gap:26px;align-items:center;margin:26px 0">
+    <img src="assets/icon.png" width="76" height="76"
+         style="border-radius:16px;box-shadow:0 8px 26px rgba(77,141,255,.32)" alt="EvoMind 图标">
+    <div>
+      <div style="font-weight:700;margin-bottom:6px">EvoMind</div>
+      <div class="muted" style="line-height:1.7">
+        双击就启动，不用进文件夹找。<br>
+        图标用的是项目自己的渐变 E，和网页控制台左上角那个是同一个。
+      </div>
+    </div>
+  </div>
+
+  <h3>想加或者想删？随时可以</h3>
+
+  <p>双击 <b><code>③ 桌面图标.cmd</code></b>，它会先告诉你现在桌面上有没有，再问你要创建还是删除。</p>
+
+  <div class="card info">
+    <div class="t">一个小细节</div>
+    <p style="margin-top:8px">如果你的桌面被改到别的盘（比如 D 盘），它也能找对地方——
+    不会傻傻地往 <code>C:\Users\你的用户名\Desktop</code> 里塞文件。</p>
+  </div>
+
+  <h2>怎么用它学习</h2>
+
+  <div class="step">
+    <div class="n">1</div>
+    <div class="body">
+      <b>双击启动</b>
+      <span>运行「① 双击这里启动.cmd」，浏览器会打开控制台。</span>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="n">2</div>
+    <div class="body">
+      <b>左边点「自主进化」</b>
+      <span>在输入框里写你想让它学什么。</span>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="n">3</div>
+    <div class="body">
+      <b>方向写得越具体，学得越深</b>
+      <span>
+        ❌ 「人工智能」—— 太大，什么都学一点，什么都不深<br>
+        ✅ 「大模型 Agent 的规划与反思机制」—— 具体，能一路挖到机制层面
+      </span>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="n">4</div>
+    <div class="body">
+      <b>选轮数，点「开始进化学习」</b>
+      <span>3 轮约 10 分钟摸底；6 轮约 20 分钟；10 轮以上适合让它跑一下午。</span>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="n">5</div>
+    <div class="body">
+      <b>看右边的实时流，不用管它</b>
+      <span>你会看到它自己规划、自己搜索、自己读、自己提炼。绿色的是新学到的知识。</span>
+    </div>
+  </div>
+
+  <h3>它每一轮在干什么</h3>
+  <table>
+    <tr><th>阶段</th><th>动作</th></tr>
+    <tr><td>诊断缺口</td><td>先看已经会了什么，再判断「还缺什么」，生成不重复的检索词</td></tr>
+    <tr><td>多源检索</td><td>同时搜网页、arXiv 论文、GitHub 仓库、维基百科、HuggingFace</td></tr>
+    <tr><td>阅读</td><td>抓网页正文，自动去掉导航广告，只留干货</td></tr>
+    <tr><td>提炼</td><td>从正文里抽出能独立成立的结论，标上可信度和出处</td></tr>
+    <tr><td>入库</td><td>语义去重后写进知识库（重复的不会重复存）</td></tr>
+    <tr><td>资源扫描</td><td>顺手看看有没有值得下载的模型/数据集</td></tr>
+    <tr><td>反思</td><td>总结这轮学到什么、下一轮该往哪深挖</td></tr>
+  </table>
+
+  <div class="card warn">
+    <div class="t">为什么它不会原地打转</div>
+    <p style="margin-top:8px">普通爬虫是「搜关键词 → 存起来」，搜完就没了。<br>
+    这个系统每轮都会把「已经掌握的知识」和「用过的检索词」喂回给模型，强制它找新的空白点。
+    所以第 1 轮建立框架，第 3 轮进入机制细节，第 6 轮开始挖边界条件和争议点——一层比一层深。</p>
+  </div>
+
+  <h2>让它自己学（持续自学）</h2>
+
+  <p>如果你不想一直盯着，打开「自主进化」页下方的<b>持续自学</b>开关就行。</p>
+
+  <div class="card ok">
+    <div class="t">开启后会发生什么</div>
+    <ul style="margin-top:8px">
+      <li>它会立刻开始学一轮</li>
+      <li>学完之后等待1–30秒（新配置默认15秒），<b>自动接着学下一轮</b>；旧20分钟配置自动改为30秒</li>
+      <li>一直沿用你设的方向，不需要你再操作</li>
+      <li>关闭开关会停止后续调度；点「停止」会同时关闭调度并让当前学习收尾</li>
+    </ul>
+  </div>
+
+  <p>在持续自学开关下设置「间隔秒数」和「每次轮数」，点击保存即可。30秒是空闲等待上限，不是每轮学习的耗时上限。导入、OCR、微调或知识炼化期间会等待。</p>
+
+  <h2>随机挑选学习方向</h2>
+  <p>在自主进化页填写预设领域，例如 ZBrush，点击「刷新方向」即可获得6个候选。点击候选或「随机选一个方向」只会填写方向，随后选择3/6/10/16轮，再点「开始进化学习」。连续刷新会避开上一组候选；方向卡片区域可以滚动。</p>
+
+  <h2>让它自己换方向学（学习方向自动更换）</h2>
+
+  <p>「自主进化」页最下方的<b>学习方向自动更换</b>，适合只知道自己想学某个大领域、但说不出具体题目的时候。填一个大致的领域名，剩下的它自己安排。</p>
+
+  <div class="card ok">
+    <div class="t">它会怎么跑</div>
+    <ul style="margin-top:8px">
+      <li>先把模糊方向拆成若干具体子方向（默认6个），每条都要能检索、能验证</li>
+      <li>当前子方向连续学 N 轮（默认100轮）</li>
+      <li>学满 N 轮后，从剩余子方向里随机换一个，再学 N 轮</li>
+      <li>换之前会检查新方向是否还在你给的范围里，跑偏的直接丢弃重选；最近3个方向不重复</li>
+      <li>子方向学完了会自动补充新的；补不出来才回收旧的，学习不中断</li>
+      <li>达到总轮次上限（默认300轮）或你点「结束并汇总」时收尾，列出每个方向学了多少轮、新增多少条知识</li>
+    </ul>
+  </div>
+
+  <p>面板里可以直接改「每个子方向学多少轮」「总轮次上限」「子方向数量」「不重复窗口」和「是否校验边界」。点「预览子方向」可以先看会拆成哪些方向，不启动学习；确认没问题再点「开始自动轮换」。</p>
+
+  <p><b>暂停和恢复</b>：暂停会让当前这一轮跑完再停住，不会丢进度；点恢复就从剩余轮次接着学。进度、当前方向、切换历史都保存在本地数据库，关掉程序再打开仍然能看到上一次的结果。</p>
+
+  <p><b>跳过不想学的方向</b>：如果某个子方向不是你想学的，点「跳过当前方向」，当前这一轮跑完就换下一个，剩下的轮次不再浪费在它上面。被跳过的方向会按已学轮次记在汇总里，并标注「未学满」。另外，先点「预览子方向」再开始，会沿用你看到的那一批方向，不会换成另一组。</p>
+
+  <div class="card warn">
+    <div class="t">注意</div>
+    <p style="margin-top:8px">轮换会连续占用学习引擎，运行期间「开始进化学习」和持续自学都不可用（点「停止」会一起停掉）。拆解和换向各需要一次模型调用，约几秒到十几秒。</p>
+  </div>
+
+  <h2>一键清理重复知识</h2>
+  <p>在知识库顶部点「一键清理重复项」，会整理整个知识库中同方向、结论与补充内容一致的重复条目，保留可信度较高的一条。其他原记录和出处会归档，引用仍可追溯，也可点「撤销上次清理」完整恢复。相近但内容不同的知识保留，避免误删。</p>
+
+  <h2>知识二次炼化</h2>
+  <p><b>推荐：打开知识库，直接点击「一键炼化全部书籍」。</b>无需选书或方向，系统会分批整理全部已入库的书籍知识，不受120条上限影响。进度和结果会逐批保存；中途停止或重启后，再次点击会跳过已完成且未变化的内容，继续处理剩余部分。结果可按书名查看并翻页。</p>
+  <p>打开知识库，先选择上方方向，再点「炼化当前范围」。系统会整理最近最多120条知识，合并重复内容，浓缩为核心结论并单独保存。选择全部方向时，会分别处理每个方向。原始知识不删除、不覆盖。</p>
+  <p>展开炼化历史可查看核心内容、压缩比例和来源。点击「原知识」打开详情，也可回到来源原文核对。任务在后台执行，可以停止；当前模型请求完成后才会收尾。炼化结果不会自动改变模型权重。</p>
+
+  <div class="card warn">
+    <div class="t">什么时候该关掉</div>
+    <p style="margin-top:8px">持续自学开着的时候，显卡和网络会一直被占用。你要玩游戏、跑渲染、或者要用电脑干重活之前，记得先关掉。</p>
+  </div>
+
+  <h2>导入自己的电子书（书库）</h2>
+
+  <p>网上搜不到的内容，可以把你自己的书导进去。左边点「书库」。</p>
+
+  <div class="card info">
+    <div class="t">三步走</div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">1</div>
+      <div class="body"><b>添加目录</b>
+        <span>填书所在的文件夹路径，比如 <code>K:\书籍\我的电子书库</code>。可以加很多个。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">2</div>
+      <div class="body"><b>点「扫描目录」</b>
+        <span>它只登记有哪些书，不会解析。十几万文件大约十几秒。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">3</div>
+      <div class="body"><b>勾选想要的书 → 点「导入选中」</b>
+        <span>这一步才会真的读书、提炼知识点。后台跑，可以干别的。</span></div>
+    </div>
+  </div>
+
+  <h3>能读哪些格式</h3>
+  <p><code>txt</code> <code>md</code> <code>epub</code> <code>pdf</code> <code>docx</code> <code>html</code>，
+  或者直接粘贴一个链接。</p>
+
+  <div class="card info">
+    <div class="t">扫描版 PDF 要先 OCR</div>
+    <p style="margin-top:8px">PDF 有两种：一种是电子排版的（能提取文字），一种是扫描的（本质是图片）。<br>
+    扫描版提取不出文字，系统会标注「扫描版 PDF，需 OCR」。<br><br>
+    <b>这种可以点书目旁边的「OCR」按钮识别</b>，识别完就能正常导入了。<br>
+    当然，<code>txt</code> / <code>epub</code> / <code>docx</code> 最省事，能直接读。</p>
+  </div>
+
+  <h2>把扫描件变成能读的文字（OCR）</h2>
+
+  <p>扫描版的书，书目右边会有一个 <b>OCR</b> 按钮。点它。</p>
+
+  <div class="card">
+    <div class="t">两个引擎，怎么选</div>
+    <table style="margin-top:12px">
+      <tr><th>引擎</th><th>速度</th><th>什么时候用</th></tr>
+      <tr><td><b>快速</b></td><td>约 5 秒一页</td><td>中文、英文的书，字迹清楚</td></tr>
+      <tr><td><b>精细</b></td><td>约 40 秒一页</td><td>日文、有表格、排版复杂</td></tr>
+    </table>
+    <p style="margin-top:12px">同一页日文书实测：快速引擎认出来 483 字，一堆乱码；
+    精细引擎认出 897 字，句子完整能读。<b>日文一定要用精细。</b></p>
+  </div>
+
+  <div class="card ok">
+    <div class="t">操作就四步</div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">1</div>
+      <div class="body"><b>填页数范围</b>
+        <span>填 <code>1-50</code> 就是前 50 页。建议先跑 5-10 页看看效果，别一上来跑整本。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">2</div>
+      <div class="body"><b>选引擎，点开始识别</b>
+        <span>会一页一页跑，上面有进度条和字数。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">3</div>
+      <div class="body"><b>校对</b>
+        <span>左边点页码，右边上面是原图、下面是识别出的文字，可以直接改。改完点「保存校对」。</span></div>
+    </div>
+    <div class="step" style="margin:14px 0 0">
+      <div class="n">4</div>
+      <div class="body"><b>点「导入知识库」</b>
+        <span>就和普通书一样，开始提炼知识点了。</span></div>
+    </div>
+  </div>
+
+  <div class="card warn">
+    <div class="t">两个省时间的技巧</div>
+    <p style="margin-top:8px"><b>① 断了可以接着跑。</b>已经识别过的页会自动跳过，不用从头再来。<br><br>
+    <b>② 只跑需要的章节。</b>一本 150 页的书，快速引擎要 15 分钟，精细引擎要 2-3 小时。
+    先挑你最需要的部分跑，比如前 40 页。</p>
+  </div>
+
+  <h3>排除不想导入的目录</h3>
+  <p>添加目录时可以填「排除关键词」，路径里含这些词的会自动跳过。<br>
+  比如填 <code>成人</code>，那所有路径带这个词的文件夹都不会被扫描。</p>
+
+  <h3>导入之后在哪看</h3>
+  <p>知识点会进「知识库」，每条都标着出自哪本书的哪一章。<br>
+  也可以直接去「检验所学」提问，书里的内容会和网上学的一起被检索到。</p>
+
+  <div class="card">
+    <div class="t">一个小限制</div>
+    <p style="margin-top:8px">每本书默认最多提炼 40 个块（约 8 万字）。太厚的书会只学前半部分——
+    这是为了避免一本书跑一整天。需要更多可以在导入时调整。</p>
+  </div>
+
+  <h2>几个页面分别干什么</h2>
+
+  <table>
+    <tr><th>页面</th><th>用途</th></tr>
+    <tr><td>总览</td><td>看总共学了多少、各方向分布、最近在干什么</td></tr>
+    <tr><td>自主进化</td><td>设定方向、启动学习、看实时过程</td></tr>
+    <tr><td>知识库</td><td>看学到的每一条知识，能语义搜索，能删除错的</td></tr>
+    <tr><td>书库</td><td>导入自己的电子书，支持多个目录</td></tr>
+    <tr><td>资源获取</td><td>看它自己下了什么，也可以手动指定要下哪个模型</td></tr>
+    <tr><td>权重进化</td><td>把知识做成训练集，微调出新模型</td></tr>
+    <tr><td>检验所学</td><td>直接问它问题，它只用学过的知识回答并标出处</td></tr>
+    <tr><td>设置</td><td>改模型、改预算、配代理</td></tr>
+  </table>
+
+  <h3>「检验所学」为什么值得用</h3>
+  <p>这是判断它到底学没学会的地方。它的回答有两个特点：</p>
+  <ul>
+    <li><b>只用知识库里的内容</b>，不会拿模型自带的记忆糊弄你</li>
+    <li><b>学得不够就直接说不知道</b>，并告诉你缺什么</li>
+  </ul>
+  <p>如果它答得含糊，说明这个方向还没学透，回去多加几轮。</p>
+
+  <h2>权重进化（微调）怎么用</h2>
+
+  <p>这是让模型「真的变强」的部分。整个流程四步：</p>
+
+  <div class="step">
+    <div class="n">1</div>
+    <div class="body"><b>装微调环境</b>
+      <span>点「安装微调环境」，约 3GB。装一次就行，之后不用再装。</span></div>
+  </div>
+  <div class="step">
+    <div class="n">2</div>
+    <div class="body"><b>攒够知识</b>
+      <span>知识库至少要有几百条知识点。太少学不出东西。</span></div>
+  </div>
+  <div class="step">
+    <div class="n">3</div>
+    <div class="body"><b>生成训练集</b>
+      <span>把知识点自动改写成多样化的问答对，这是训练素材。</span></div>
+  </div>
+  <div class="step">
+    <div class="n">4</div>
+    <div class="body"><b>开始微调</b>
+      <span>4090 上跑 7B 模型约 17GB 显存，够用。跑完会产出 adapter 和合并后的完整模型。</span></div>
+  </div>
+
+  <div class="card warn">
+    <div class="t">微调前请知道的几件事</div>
+    <ul style="margin-top:8px">
+      <li><b>会跑很久</b>：几百条样本 2 轮，大约 1-3 小时，显卡会满载</li>
+      <li><b>样本质量决定成败</b>：知识库里的垃圾内容会被一起学进去，建议先去知识库删掉明显没用的</li>
+      <li><b>不是越大越好</b>：几百条样本容易过拟合，最好的用法是持续积累、小步多次</li>
+    </ul>
+  </div>
+
+  <h2>关于它自己下载资源</h2>
+
+  <p>默认是<b>全自动</b>的：学到某个方向时，它会去 HuggingFace 找对口的模型和数据集，用模型自己判断值不值得下，然后下载。</p>
+
+  <h3>四道安全阀</h3>
+  <ol>
+    <li><b>体积上限</b>：单个模型默认不超过 40GB</li>
+    <li><b>总预算</b>：所有下载加起来不超过 200GB（可在设置里改）</li>
+    <li><b>磁盘余量</b>：下载前检查剩余空间，不够就跳过</li>
+    <li><b>相关性筛选</b>：先让模型判断「这个资源对当前方向有没有用」，没用就不下</li>
+  </ol>
+
+  <p>如果不想让它自动下，去「设置」里把「自动下载」关掉，它就只记录、不下载。</p>
+
+  <div class="card ok">
+    <div class="t">一个实用细节</div>
+    <p style="margin-top:8px">如果下载的是 GGUF 格式的模型，它会自动注册进 Ollama，
+    你可以在「设置 → 主推理模型」里直接切换使用，不用手动配置。</p>
+  </div>
+
+  <h2>常见问题</h2>
+
+  <h3>双击后黑窗口一闪就没了</h3>
+  <p>先运行「② 修复环境.cmd」重建依赖，再启动。如果还是不行，看黑窗口里的报错。</p>
+
+  <h3>提示模型离线</h3>
+  <p>Ollama 没启动。启动器会自动拉起它，如果失败，手动打开一次 Ollama 程序再刷新页面。</p>
+
+  <h3>学习很慢</h3>
+  <p>正常。每篇网页都要模型读一遍再提炼，一轮 2-4 分钟。想快就把「设置 → 每轮抓取网页数」调小，或换成更小的模型。</p>
+
+  <h3>它学的东西不准</h3>
+  <p>去「知识库」把错的删掉。也可以把「设置 → 知识点入库最低相关度」调高（比如 0.6），只收强相关的。</p>
+
+  <h3>能不能完全离线用</h3>
+  <p>推理是纯本地的，但学习必须联网（要搜资料）。下载资源可以配 HF 镜像加速。</p>
+
+  <h3>自动轮换卡在「学习中」不动</h3>
+  <p>单轮要检索、抓网页、提炼，2-4 分钟是正常的，轮次数字只在整轮跑完才涨。看右边事件流走到哪一步：停在「多源检索」多半是搜索源限流，等一会儿会自己重试。</p>
+
+  <h3>自动轮换总在「丢弃越界子方向」</h3>
+  <p>这是边界校验在拦模型跑偏，属于正常保护。如果一直补不进新方向，说明你给的领域名太宽（比如只写「设计」），换成更具体的领域名（比如「光固化 3D 打印」）再试。</p>
+
+  <h3>自动轮换显示「等待其他任务结束」</h3>
+  <p>学习引擎同一时间只能干一件事：你手动点了学习、或在导入书、OCR、炼化，轮换就会排队等。对方结束会自动继续，不计入失败。</p>
+
+  <hr>
+
+  <h2>文件都是干什么的</h2>
+
+  <table>
+    <tr><th>文件/目录</th><th>说明</th></tr>
+    <tr><td><code>⓪ 首次安装.cmd</code></td><td>第一次用跑这个，装环境、可选建桌面图标</td></tr>
+    <tr><td><code>① 双击这里启动.cmd</code></td><td>日常启动，最常用</td></tr>
+    <tr><td><code>② 修复环境.cmd</code></td><td>依赖坏了时用它重建</td></tr>
+    <tr><td><code>③ 桌面图标.cmd</code></td><td>随时增删桌面图标</td></tr>
+    <tr><td><code>data/knowledge/</code></td><td>知识库数据库（你的学习成果都在这）</td></tr>
+    <tr><td><code>data/models/</code></td><td>它自己下载的模型</td></tr>
+    <tr><td><code>data/datasets/</code></td><td>它自己下载的数据集</td></tr>
+    <tr><td><code>data/finetune/</code></td><td>微调产出的模型</td></tr>
+    <tr><td><code>backend/</code></td><td>程序代码</td></tr>
+    <tr><td><code>web/</code></td><td>控制台界面</td></tr>
+    <tr><td><code>assets/icon.ico</code></td><td>桌面图标文件</td></tr>
+  </table>
+
+  <div class="card">
+    <div class="t">备份提醒</div>
+    <p style="margin-top:8px">整个 <code>data/</code> 目录就是它的全部记忆。想迁移或备份，拷走这个目录就够了。</p>
+  </div>
+
+  <p class="muted" style="margin-top:60px;text-align:center">EvoMind · 本机运行，数据不出门</p>
+
+</div>
+</body>
+</html>
