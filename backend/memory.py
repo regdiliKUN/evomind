@@ -72,6 +72,19 @@ CREATE TABLE IF NOT EXISTS document_attempts (
 -- 主题定范围 → URL 精确命中 → 时间过滤，列顺序必须照这个来。
 -- 早期版本建的是 (topic,last_at)，URL 只能回表逐行比，台账涨到十万级就明显变慢。
 CREATE INDEX IF NOT EXISTS idx_attempts_lookup ON document_attempts(topic, url, last_at);
+-- 读取失败台账：document_attempts 只记「读到了、提炼过」，读不出来的页面
+-- 不进台账，于是每轮都被当成新资料重读。实测 4 个动态渲染首页各失败约 1250 次。
+-- hard = 页面本身的问题（正文过短 / 4xx / 非文本），fails 含网络抖动等临时失败。
+CREATE TABLE IF NOT EXISTS fetch_failures (
+    url TEXT PRIMARY KEY, host TEXT NOT NULL DEFAULT '',
+    fails INTEGER DEFAULT 0, hard INTEGER DEFAULT 0,
+    last_error TEXT DEFAULT '', first_at REAL, last_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_fetch_failures_host ON fetch_failures(host, last_at);
+-- 按站点汇总：一次都没读成功过、却屡次读不出正文的站点，整站跳过。
+CREATE TABLE IF NOT EXISTS fetch_hosts (
+    host TEXT PRIMARY KEY, ok INTEGER DEFAULT 0, hard INTEGER DEFAULT 0, last_at REAL
+);
 CREATE TABLE IF NOT EXISTS learning_queries (
     topic TEXT NOT NULL, query TEXT NOT NULL, used_at REAL,
     PRIMARY KEY (topic, query)
@@ -331,6 +344,7 @@ def _upgrade(c: sqlite3.Connection) -> None:
     except Exception:  # noqa: BLE001  旧库可能没有
         pass
     _backfill_attempts(c)
+    _backfill_fetch_failures(c)
     _daily_maintenance(c)
 
 
@@ -432,6 +446,45 @@ def _backfill_attempts(c: sqlite3.Connection) -> None:
             " ON CONFLICT(url,topic) DO NOTHING",
             (since,),
         )
+    except Exception:  # noqa: BLE001  台账只是加速，坏了不该挡住建连接
+        pass
+
+
+def _backfill_fetch_failures(c: sqlite3.Connection) -> None:
+    """老库一次性补失败台账与站点统计（来源：documents 表的最后一次抓取状态）。
+
+    documents 只留每个 URL 最后一次的结果，原因未知，所以按「页面本身读不了」记 2 次，
+    让窗口内（doc_retry_days）立即生效；窗口外的旧失败自然过期，不会误锁。
+    """
+    try:
+        claimed = c.execute(
+            "INSERT OR IGNORE INTO maintenance(name,done_at) VALUES('fetch_failures_backfill',?)",
+            (time.time(),),
+        ).rowcount
+        if not claimed:
+            return
+        from urllib.parse import urlsplit
+
+        since = time.time() - max(1.0, float(config.get("doc_retry_days", 7))) * 86400
+        hosts: dict[str, list] = {}
+        fails = []
+        for url, ok, at in c.execute("SELECT url, ok, fetched_at FROM documents WHERE url<>''"):
+            host = (urlsplit(url).hostname or "").lower()
+            h = hosts.setdefault(host, [0, 0, 0.0])
+            if ok:
+                h[0] += 1
+            else:
+                h[1] += 1
+                if (at or 0) >= since:
+                    fails.append((url, host, at, at))
+            h[2] = max(h[2], at or 0.0)
+        with c:
+            c.executemany(
+                "INSERT OR IGNORE INTO fetch_failures(url,host,fails,hard,last_error,first_at,last_at)"
+                " VALUES (?,?,2,2,'历史记录：读取失败',?,?)", fails)
+            c.executemany(
+                "INSERT OR IGNORE INTO fetch_hosts(host,ok,hard,last_at) VALUES (?,?,?,?)",
+                [(h, v[0], v[1], v[2]) for h, v in hosts.items() if h])
     except Exception:  # noqa: BLE001  台账只是加速，坏了不该挡住建连接
         pass
 
@@ -897,6 +950,123 @@ def mark_doc(url: str, title: str, topic: str, chars: int, ok: bool) -> None:
         (url, title, topic, chars, 1 if ok else 0, time.time()),
     )
     c.commit()
+
+
+#: 同一网址「页面本身读不了」累计几次后，在重读窗口内跳过。
+URL_HARD_LIMIT = 2
+#: 临时失败（超时、断网、429/5xx）累计几次后跳过；只跳 1 天，网络恢复后照常重试。
+URL_SOFT_LIMIT = 3
+SOFT_WINDOW_DAYS = 1.0
+#: 一次都没读成功过的站点，读不出正文累计几次后整站跳过。
+HOST_HARD_LIMIT = 6
+
+_HARD_MARKERS = ("正文过短", "非文本内容", "未返回内容")
+
+
+def _is_hard_failure(error: str) -> bool:
+    """页面本身的问题才算「硬失败」：动态渲染、非文本、4xx（429 限流除外）。
+
+    超时 / 连接失败 / 5xx 多半是网络或对方临时故障，按「软失败」计，
+    否则断一次网就会把一大批好站点锁上一周。
+    """
+    e = error or ""
+    if any(m in e for m in _HARD_MARKERS):
+        return True
+    m = re.match(r"HTTP (\d{3})", e)
+    return bool(m) and m.group(1).startswith("4") and m.group(1) != "429"
+
+
+def _host(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def record_fetch(url: str, ok: bool, error: str = "") -> None:
+    """记一次抓取结果：成功就清掉该网址的失败记录，并给站点记一次成功。"""
+    if not url or error == "已停止":
+        return
+    host, now = _host(url), time.time()
+    hard = 0 if ok else int(_is_hard_failure(error))
+    with _lock:
+        c = conn()
+        with c:
+            if ok:
+                c.execute("DELETE FROM fetch_failures WHERE url=?", (url,))
+            else:
+                c.execute(
+                    "INSERT INTO fetch_failures(url,host,fails,hard,last_error,first_at,last_at)"
+                    " VALUES (?,?,1,?,?,?,?) ON CONFLICT(url) DO UPDATE SET"
+                    " fails=fails+1, hard=hard+excluded.hard,"
+                    " last_error=excluded.last_error, last_at=excluded.last_at",
+                    (url, host, hard, (error or "")[:200], now, now),
+                )
+            if host and (ok or hard):
+                c.execute(
+                    "INSERT INTO fetch_hosts(host,ok,hard,last_at) VALUES (?,?,?,?)"
+                    " ON CONFLICT(host) DO UPDATE SET ok=ok+excluded.ok,"
+                    " hard=hard+excluded.hard, last_at=excluded.last_at",
+                    (host, int(bool(ok)), hard, now),
+                )
+
+
+def blocked_hosts(*, days: float | None = None) -> set[str]:
+    """重读窗口内：从没读成功过、且读不出正文已达上限的站点。"""
+    if days is None:
+        days = float(config.get("doc_retry_days", 7))
+    since = time.time() - float(days) * 86400
+    try:
+        return {r[0] for r in conn().execute(
+            "SELECT host FROM fetch_hosts WHERE ok=0 AND hard>=? AND last_at>=?",
+            (HOST_HARD_LIMIT, since))}
+    except sqlite3.Error:
+        return set()
+
+
+def fetch_blocked(urls: list[str], *, days: float | None = None) -> dict[str, str]:
+    """这批网址里哪些该跳过，返回 {url: 原因}。一次查询，供选资料时批量过滤。"""
+    clean = [u for u in dict.fromkeys(urls) if u]
+    if not clean:
+        return {}
+    if days is None:
+        days = float(config.get("doc_retry_days", 7))
+    if float(days) <= 0:
+        return {}
+    now = time.time()
+    hard_since = now - float(days) * 86400
+    soft_since = now - SOFT_WINDOW_DAYS * 86400
+    out: dict[str, str] = {}
+    hosts_of = {u: _host(u) for u in clean}
+    bad_hosts: set[str] = set()
+    c = conn()
+    # 网址失败记录与站点黑名单合成一条查询（UNION ALL）：选资料本来就要查台账和已学两次，
+    # 这里再多一次固定开销，不随候选数增长。
+    for i in range(0, len(clean), 400):
+        part = clean[i:i + 400]
+        hosts = sorted({hosts_of[u] for u in part if hosts_of[u]})
+        um, hm = ",".join("?" * len(part)), ",".join("?" * len(hosts)) or "''"
+        try:
+            rows = c.execute(
+                f"SELECT url, fails, hard, last_at, 0 FROM fetch_failures WHERE url IN ({um})"
+                f" UNION ALL SELECT host, 0, hard, last_at, 1 FROM fetch_hosts"
+                f" WHERE ok=0 AND hard>=? AND last_at>=? AND host IN ({hm})",
+                (*part, HOST_HARD_LIMIT, hard_since, *hosts))
+        except sqlite3.Error:
+            return out
+        for key, fails, hard, last_at, is_host in rows:
+            if is_host:
+                bad_hosts.add(key)
+            elif hard >= URL_HARD_LIMIT and last_at >= hard_since:
+                out[key] = f"已读取失败 {fails} 次"
+            elif fails >= URL_SOFT_LIMIT and last_at >= soft_since:
+                out[key] = f"近一天读取失败 {fails} 次"
+    for u in clean:
+        if hosts_of[u] in bad_hosts:
+            out[u] = "站点读不出正文"
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1966,6 +2136,17 @@ def export_training_pairs(topic: str | None = None, limit: int = 5000) -> list[d
 # --------------------------------------------------------------------------
 # 会话 / 资源
 # --------------------------------------------------------------------------
+def close_stale_sessions() -> int:
+    """服务启动时调用：此刻不可能有学习在跑，库里仍是 running 的都是上次异常退出的残留。"""
+    c = conn()
+    with c:
+        n = c.execute(
+            "UPDATE sessions SET status='stopped', ended_at=COALESCE(ended_at, started_at),"
+            " note=CASE WHEN COALESCE(note,'')='' THEN '程序退出时中断' ELSE note END"
+            " WHERE status='running'").rowcount
+    return n
+
+
 def start_session(direction: str) -> str:
     sid = uuid.uuid4().hex[:12]
     c = conn()

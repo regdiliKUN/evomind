@@ -51,8 +51,12 @@ class IsolatedTest(unittest.TestCase):
         analytics._reset_caches()
         # 书库建表守卫按库文件身份记忆；每例换库后要让它重新建表
         library._INIT_DONE["db"] = None
+        # 检索限流冷却是进程级状态：某例触发「检索全空」后不清掉，会让后续用例的
+        # 多轮学习在第 2 轮被冷却提前收尾
+        evolve._reset_search_backoff()
 
     def tearDown(self):
+        evolve._reset_search_backoff()
         for c in self.connections:
             c.close()
         self.db_factory.stop()

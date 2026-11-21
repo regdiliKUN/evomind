@@ -297,6 +297,10 @@ def _startup() -> None:
     except Exception as e:  # noqa: BLE001
         _startup_warn("轮换状态恢复", e)
     try:
+        memory.close_stale_sessions()
+    except Exception as e:  # noqa: BLE001
+        _startup_warn("学习会话状态恢复", e)
+    try:
         scheduler.start_auto_if_needed()
     except Exception as e:  # noqa: BLE001
         _startup_warn("持续自学启动", e)

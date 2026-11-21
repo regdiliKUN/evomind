@@ -33,6 +33,49 @@ MEDIA_KINDS = ("image", "audio", "video", "pdf")
 #: 资料读尽的方向，剩下的轮次只会反复检索同一批 URL，每轮白付一次规划调用
 #: 加两次检索扇出（4 条检索式 × 6-8 个源）。3 轮足够区分「偶发限流」和「真读尽了」。
 STALL_LIMIT = 3
+#: 检索源全空（基本都是被限流）后的冷却：第 1 次 1 分钟，之后翻倍，封顶 30 分钟。
+#: 原来持续自学每 1-30 秒就开下一次，限流期间照样硬撞，实测 4107 次学习里 90% 一条没学到，
+#: 「所有检索源都返回空」累计 6977 次。冷却期内调度器不开新任务，进行中的任务提前收尾。
+SEARCH_BACKOFF_BASE = 60.0
+SEARCH_BACKOFF_MAX = 1800.0
+_backoff_lock = threading.Lock()
+_backoff = {"streak": 0, "until": 0.0}
+
+
+def search_cooldown() -> float:
+    """检索冷却剩余秒数；0 表示可以检索。"""
+    with _backoff_lock:
+        return max(0.0, _backoff["until"] - time.time())
+
+
+def _note_search(empty: bool) -> float:
+    """登记一次检索结果；全空就延长冷却并返回冷却秒数，有结果就清零。"""
+    with _backoff_lock:
+        if not empty:
+            _backoff.update(streak=0, until=0.0)
+            return 0.0
+        _backoff["streak"] += 1
+        wait = min(SEARCH_BACKOFF_MAX, SEARCH_BACKOFF_BASE * 2 ** (_backoff["streak"] - 1))
+        _backoff["until"] = time.time() + wait
+        return wait
+
+
+def _reset_search_backoff() -> None:
+    with _backoff_lock:
+        _backoff.update(streak=0, until=0.0)
+
+
+def _avoid_hint() -> str:
+    """把「读不出正文」的站点告诉规划器，别再用 site: 把检索引过去。"""
+    try:
+        hosts = sorted(memory.blocked_hosts())[:10]
+    except Exception:  # noqa: BLE001
+        return ""
+    if not hosts:
+        return ""
+    return "以下站点的页面读不出正文，不要用 site: 指向它们：" + "、".join(hosts)
+
+
 #: 正文由机器生成的来源（视觉描述 / 语音转写）。PDF 虽然是媒体，但文字是
 #: 作者写的、可逐字核对，所以仍用网页版提炼提示词。
 TRANSCRIBED_KINDS = ("image", "audio", "video")
@@ -212,6 +255,7 @@ PLAN_USER = """## 学习方向
 
 ## 当前是第 {round_no} / {total_rounds} 轮
 {stage_hint}
+{avoid_hint}
 
 请输出 JSON：
 {{
@@ -720,9 +764,11 @@ class Engine:
         urls = [c.get("url") or "" for c in cands]
         tried = memory.attempted_urls(urls, topic)
         learned = memory.docs_learned(urls, topic)
+        blocked = self._blocked(urls)
         for c in cands:
             url = c.get("url") or ""
-            if not url or url in seen or url in self._visited or url in tried:
+            if (not url or url in seen or url in self._visited or url in tried
+                    or url in blocked):
                 continue
             # 同一方向读过的媒体不再重复摄取，否则每次补漏都在原地打转
             if url in learned:
@@ -740,6 +786,16 @@ class Engine:
                         for c in picked),
         )
         return picked
+
+    def _blocked(self, urls: list[str]) -> dict[str, str]:
+        """失败台账判定该跳过的网址；查不了就当都不跳（台账只是加速，不该挡住学习）。"""
+        try:
+            blocked = memory.fetch_blocked(urls)
+        except Exception:  # noqa: BLE001
+            return {}
+        if blocked:
+            self._emit("info", f"跳过 {len(blocked)} 个反复读取失败的来源")
+        return blocked
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         """等本轮学习结束。返回 True 表示已结束，False 表示超时仍在跑。
@@ -775,6 +831,13 @@ class Engine:
             for r in range(1, rounds + 1):
                 if self._stop.is_set():
                     self._emit("warn", "收到停止指令，正在收尾")
+                    break
+                # 第 1 轮总是跑（用户手动点开始就是要试一次）；之后在限流冷却期内提前收尾，
+                # 不把剩余轮次全耗在撞墙上。
+                cooldown = search_cooldown()
+                if r > 1 and cooldown > 0:
+                    self._emit("warn", f"检索源被限流，暂停检索 {math.ceil(cooldown / 60)} 分钟；"
+                                       f"本次提前结束（剩余 {rounds - r + 1} 轮未跑）")
                     break
                 self.state["round"] = r
                 points_before, fetched_before = self.state["points"], self.state["fetched"]
@@ -888,6 +951,9 @@ class Engine:
 
         # ③ 抓取
         todo = self._pick_targets(results)
+        if not todo and not results and search_cooldown() > 0:
+            # 检索源全空 = 被限流；此时换词重搜只会再撞一次墙，直接结束本轮。
+            return
         if not todo:
             # 候选都读过了，直接 return 等于这一轮白跑。换一组更具体的检索词再试一次。
             extra = search.query_variants(direction, self.state["focus"])
@@ -989,6 +1055,7 @@ class Engine:
                     total_rounds=total,
                     stage_hint=stage_hint + "\n优先补充缺口：" + "；".join(str(g) for g in self._gaps[:6]),
                     qnum=int(config.get("queries_per_round", 4)),
+                    avoid_hint=_avoid_hint(),
                 ),
             )
             if not isinstance(plan, dict) or not isinstance(plan.get("queries"), list):
@@ -1034,10 +1101,13 @@ class Engine:
 
         cnt = Counter(r.get("source", "?") for r in all_results)
         if cnt:
+            _note_search(False)
             detail = " ".join(f"{k}×{v}" for k, v in cnt.most_common())
             self._emit("info", f"各源命中：{detail}")
-        else:
-            self._emit("warn", "所有检索源都返回空（大概率被限流），本轮没有新资料")
+        elif not self._stop.is_set():
+            wait = _note_search(True)
+            self._emit("warn", "所有检索源都返回空（大概率被限流），本轮没有新资料；"
+                               f"暂停检索 {int(wait // 60) or 1} 分钟再试")
 
         return search.rank_results(all_results, " ".join(queries))
 
@@ -1078,10 +1148,12 @@ class Engine:
         urls = [r.get("url", "") for r in results if r.get("url")]
         tried = memory.attempted_urls(urls, topic)
         learned = memory.docs_learned(urls, topic)
+        blocked = self._blocked(urls)
         candidates: list[dict] = []
         for r in results:
             url = r.get("url", "")
-            if not url or url in self._visited or url in tried or url in learned:
+            if (not url or url in self._visited or url in tried or url in learned
+                    or url in blocked):
                 continue
             kind = r.get("kind") or "web"
             if kind in ("image", "audio", "video", "pdf"):
@@ -1207,6 +1279,11 @@ class Engine:
                                 len(doc.get("text", "")), doc.get("ok", False))
             except Exception as e:  # noqa: BLE001
                 self._emit("warn", f"抓取记录写入失败（不影响本轮学习）：{url[:80]} · {str(e)[:60]}")
+            # 失败台账：读不出来的页面下次直接跳过，不再每轮重读（同样只是旁路，失败不中断）
+            try:
+                memory.record_fetch(url, bool(doc.get("ok")), doc.get("error", ""))
+            except Exception:  # noqa: BLE001
+                pass
             if not doc.get("ok"):
                 self._emit("warn", f"读取失败：{url[:100]} · {doc.get('error', '未知原因')}")
             elif doc["kind"] in ("image", "audio", "video", "pdf"):

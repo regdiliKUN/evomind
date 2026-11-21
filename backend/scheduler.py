@@ -40,6 +40,12 @@ def _tick() -> None:
         if not direction:
             return
         now = time.time()
+        cooldown = evolve.search_cooldown()
+        if cooldown > 0:
+            # 检索源被限流：不开新任务，等冷却结束（原来每 1-30 秒就再撞一次）
+            _state.update(next_run=now + cooldown,
+                          waiting=f"检索源被限流，约 {int(cooldown // 60) + 1} 分钟后继续")
+            return
         last_end = max(_state["last_run"], evolve.engine.state.get("finished_at", 0))
         due = last_end + interval() if last_end else now
         _state["next_run"] = due
