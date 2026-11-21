@@ -1,4 +1,3 @@
-0af50a9ac69b737b1680634929d7ba7bc8bafa6791bb7f2648618af444a08018  release/1.0.0/evomind-1.0.0-win-x64/.gitattributes
 83dd6f221e3851cecdaa36e13825ab98930c45810dc16f2d52bc492b8f004eab  release/1.0.0/evomind-1.0.0-win-x64/.gitignore
 75c48e270285d4ee228afa3e54600e3e4be1034124b8be2833e76b0db311a965  release/1.0.0/evomind-1.0.0-win-x64/EvoMind.exe
 6640d84de37a777dacb31dc8f662d3dd5d9b1c6c803668785ec9d29a48404bf4  release/1.0.0/evomind-1.0.0-win-x64/EvoMind.spec
@@ -39,7 +38,7 @@ f2cd26ae25a6162204c134a60cc56a47c01e8b14c358eec375f0659ee2a8b354  release/1.0.0/
 75c48e270285d4ee228afa3e54600e3e4be1034124b8be2833e76b0db311a965  release/1.0.0/evomind-1.0.0-win-x64/dist/EvoMind.exe
 35746cf81efb6ea8b8c810f666832d920d8e94983ca4da2f041bc26d466d230b  release/1.0.0/evomind-1.0.0-win-x64/evomind_launcher.py
 fa484038f58a329ac492d439f824103bcf210820a81331ce329c540338d90e7b  release/1.0.0/evomind-1.0.0-win-x64/requirements.txt
-f1d01a7e61f427da596007424c211d48eb8b91351e98002c31e416e824f1386e  release/1.0.0/evomind-1.0.0-win-x64/run.py
+6d81fe7d61b960e3382d3cdbda7711acca6cf724877e9d18a62f530a15de6338  release/1.0.0/evomind-1.0.0-win-x64/run.py
 ecf083e385803139be5f0deb7fc05d40e3f95bda132c198ad446eaf68161e6b1  release/1.0.0/evomind-1.0.0-win-x64/scripts/bench/.gitignore
 f6b84ca0e89fe34fc617646c1e30d335d3e6a6668df94e9d6c6fafc9bc0c66e0  release/1.0.0/evomind-1.0.0-win-x64/scripts/bench/_env.py
 490a8e7220852ce0a0c74ef6074c9f9bfcde8eb58a34d94ca2716d0beb679c6c  release/1.0.0/evomind-1.0.0-win-x64/scripts/bench/ab_ocr.sh

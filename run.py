@@ -99,11 +99,31 @@ def ensure_ollama() -> bool:
     return False
 
 
-def pick_port(preferred: int = 8765) -> int:
-    for p in range(preferred, preferred + 20):
-        if not port_open(p):
+# 候选端口：先 8765..8784，再备用段 18765..18784。
+# Windows 的 Hyper-V / WSL / Docker 会把整段端口（如 8716-8815）划为保留，
+# 段内端口没人监听、connect 探测显示「空闲」，但 bind 报 WinError 10013；
+# 主段整段落在保留区时只靠顺延逃不出去，所以要有一段离得远的备用端口。
+CANDIDATE_PORTS = [*range(8765, 8785), *range(18765, 18785)]
+
+
+def can_bind(port: int, host: str = "127.0.0.1") -> bool:
+    """真正 bind 一次：既排除已被占用的，也排除被系统保留的端口。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def pick_port() -> int:
+    env = os.environ.get("EVOMIND_PORT", "").strip()
+    if env.isdigit():
+        return int(env)
+    for p in CANDIDATE_PORTS:
+        if can_bind(p):
             return p
-    return preferred
+    return CANDIDATE_PORTS[0]
 
 
 def is_evomind(port: int) -> bool:
@@ -178,7 +198,7 @@ def main() -> None:
     # 结果就是 OCR 和导入能在两个进程里同时跑，互相抢 GPU、抢数据库。
     # 只探 8765 会漏判：pick_port() 在端口被占用时顺延到 8766..8784，
     # 于是第二个实例照样起来，和第一个抢同一份 SQLite 与 GPU。
-    running = next((p for p in range(8765, 8785)
+    running = next((p for p in CANDIDATE_PORTS
                     if port_open(p) and is_evomind(p)), None)
     if running:
         url = f"http://127.0.0.1:{running}"
