@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from backend import analytics, config, evolve, library, llm, memory
+from backend import analytics, config, evolve, library, llm, memory, search
 
 
 class IsolatedTest(unittest.TestCase):
@@ -42,6 +42,10 @@ class IsolatedTest(unittest.TestCase):
         self.db_factory = patch.object(memory.sqlite3, "connect", side_effect=connect)
         self.db_factory.start()
         memory._invalidate()
+        # 进程级缓存也要清：媒体检索、向量化结果都按进程缓存，
+        # 用例之间串味会让「换了假实现却拿到上一例结果」这种鬼故事出现。
+        search.media_cache_clear()
+        llm.embed_cache_clear()
         # 分析聚合按「写入版本号」缓存；每例换一个新库，必须清掉上一例的缓存，
         # 否则旧版本号会误命中（生产进程内库不会换，无需担心）
         analytics._reset_caches()
@@ -344,10 +348,12 @@ class ApiTests(IsolatedTest):
         self.assertEqual(response.json()["total"], 1)
 
     def test_negative_event_limit_is_bounded(self):
+        # 第 42 轮起越界参数由框架声明式 Query(ge/le) 拦截，返回规范 422
+        # 而不是在业务层静默 clamp 成空列表；断言随契约对齐。
         memory.log_event("info", "test")
         response = self.client.get("/api/events/recent", params={"limit": -1})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), [])
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("limit", response.text)
 
     def test_static_console_served(self):
         for path in ("/", "/static/app.js", "/static/style.css"):

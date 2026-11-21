@@ -4,13 +4,14 @@
 """
 from __future__ import annotations
 
+import base64
 import re
 import threading
 import time
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, parse_qs, urlencode, urlunparse, urljoin
 
 from bs4 import BeautifulSoup
 
@@ -90,11 +91,11 @@ def search_bing(query: str, limit: int = 10) -> list[Result]:
                 a = block.select_one("h2 a")
                 if not a:
                     continue
-                url = (a.get("href") or "").strip()
+                url = canonical_url(a.get("href") or "")
                 if not url.startswith("http"):
                     continue
                 # 排除必应自家的跳转/聚合页
-                if "bing.com" in url or "microsofttranslator" in url:
+                if domain_of(url) in ("bing.com", "microsofttranslator.com"):
                     continue
                 p = block.select_one(".b_caption p") or block.select_one("p")
                 out.append(
@@ -125,8 +126,32 @@ STOPWORDS = {
 
 
 def _en_tokens(text: str) -> set[str]:
-    words = re.findall(r"[A-Za-z]{4,}", text or "")
+    words = re.findall(r"[A-Za-z][A-Za-z0-9]{1,}", text or "")
     return {w.lower() for w in words} - STOPWORDS
+
+
+#: 中文虚词/高频功能字。含这些字的二元组几乎不带主题信息，却是打分噪音的主要来源。
+_CJK_STOP = set("的了和与是在有为对把被就也都而及或个这那其之以等上下中里到从会能要不很更最再又还只才但却如若因所该此每各些么吧呢啊吗着过地得")
+
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
+
+
+def cjk_terms(text: str) -> set[str]:
+    """中文检索词：滑动二元组，滤掉含虚词的组合。
+
+    原来用 `re.findall(r"[\u4e00-\u9fff]{2}", query)`：不重叠切分，
+    「衣褶的受力点」会切出「衣褶 / 的受 / 力点」——「的受」是纯噪音，
+    既抬高无关页面的匹配分，也漏掉「褶的」这类真实组合。改成滑动窗口 +
+    虚词过滤后，命中信号才对准实词。检索排序与段落打分共用这一套口径。
+    """
+    out: set[str] = set()
+    for run in _CJK_RUN.findall(text or ""):
+        for i in range(len(run) - 1):
+            gram = run[i:i + 2]
+            if gram[0] in _CJK_STOP or gram[1] in _CJK_STOP:
+                continue
+            out.add(gram)
+    return out
 
 
 def _lexically_relevant(text: str, query: str) -> bool:
@@ -366,28 +391,37 @@ def search_stackexchange(query: str, limit: int = 6, site: str | None = None) ->
 #   - 因此这里走「分类主题列表 + 帖子页」，不碰站内搜索和 RSS
 #   - 主题列表本地缓存 30 分钟，避免重复请求
 _ZBC_CATEGORIES = [
-    ("zbrush-usage-questions", 6, 10),   # 4.5 万主题，技术问答主阵地
-    ("zscripting-help", 14, 4),          # 脚本与 API
+    ("zbrush-usage-questions", 6, 2),
+    ("zscripting-help", 14, 1),
 ]
-_zbc_cache: dict[str, Any] = {"ts": 0.0, "topics": []}
+_zbc_cache: dict[str, Any] = {"ts": 0.0, "topics": [], "ttl": 1800.0}
 _zbc_lock = threading.Lock()
+_zbc_fetch_lock = threading.Lock()   # 只串行化「真正去拉列表」的线程
 ZBC_BASE = "https://www.zbrushcentral.com"
 
 
 def _load_zbc_topics(max_age: float = 1800.0) -> list[dict]:
     with _zbc_lock:
-        if _zbc_cache["topics"] and (time.time() - _zbc_cache["ts"]) < max_age:
+        if time.time() - _zbc_cache["ts"] < float(_zbc_cache["ttl"]):
             return _zbc_cache["topics"]
 
+    # 网络请求不能放在 _zbc_lock 里：3 个分类最多 3×8 秒，多源并发检索
+    # 时所有撞到 zbc 的调用者会串行排队。用独立 fetch 锁 + 二次检查，
+    # 既不重复拉取，也不长时间占用读锁。
+    with _zbc_fetch_lock:
+        with _zbc_lock:
+            if time.time() - _zbc_cache["ts"] < float(_zbc_cache["ttl"]):
+                return _zbc_cache["topics"]
+
         topics: list[dict] = []
-        c = _client(20)
+        c = _client(8)
         for slug, cid, pages in _ZBC_CATEGORIES:
             for page in range(pages):
                 try:
                     r = c.get(
                         f"{ZBC_BASE}/c/{slug}/{cid}.json",
                         params={"page": page},
-                        timeout=20,
+                        timeout=8,
                     )
                     if r.status_code != 200:
                         break
@@ -398,8 +432,12 @@ def _load_zbc_topics(max_age: float = 1800.0) -> list[dict]:
                     topics.extend(batch)
                 except Exception:
                     break
-        _zbc_cache["topics"] = topics
-        _zbc_cache["ts"] = time.time()
+        with _zbc_lock:
+            _zbc_cache["topics"] = topics
+            _zbc_cache["ts"] = time.time()
+            # 空结果通常是一次网络抖动/限流，只缓存 60 秒；旧实现把 ts
+            # 刷成当前时间，导致整个源静默失效半小时。
+            _zbc_cache["ttl"] = max_age if topics else 60.0
         return topics
 
 
@@ -452,6 +490,27 @@ def search_zbrushcentral(query: str, limit: int = 8) -> list[Result]:
     return out
 
 
+def query_variants(direction: str, focus: str = "") -> list[str]:
+    """Short, domain-anchored fallbacks instead of long all-AND sentences."""
+    text = direction + " " + focus
+    anchors = re.findall(r"[A-Za-z][A-Za-z0-9-]+", text)
+    if "zbrush" in text.lower():
+        anchors = ["ZBrush"] + [a for a in anchors if a.lower() != "zbrush"]
+    translations = {
+        "细分": "subdivision", "分辨率": "resolution", "面数": "polygon count",
+        "笔刷": "brush settings", "拓扑": "retopology", "投射": "project details",
+        "薄壁": "wall thickness", "定位": "alignment", "头部": "head sculpting",
+        "衣褶": "cloth folds", "头发": "hair sculpting", "导出": "export scale",
+        "遮罩": "masking", "贴图": "texture maps", "雕刻": "sculpting",
+    }
+    hints = [value for key, value in translations.items() if key in text]
+    core = " ".join(dict.fromkeys(anchors[:4] + hints[:2])) or direction[:100]
+    queries = [f"{core} workflow guide", f"{core} troubleshooting parameters", f"{direction[:100]} 教程 参数"]
+    if "zbrush" in text.lower():
+        queries.insert(0, f"site:help.maxon.net {core}")
+    return queries
+
+
 # --------------------------------------------------------------------------
 # Brave Search API（需 Key，但质量最好，免费额度 2000 次/月）
 # --------------------------------------------------------------------------
@@ -492,6 +551,48 @@ def search_brave(query: str, limit: int = 10) -> list[Result]:
 # --------------------------------------------------------------------------
 # 聚合
 # --------------------------------------------------------------------------
+DOC_ROOTS = {
+    "zbrush": "https://help.maxon.net/zbr/en-us/Content/html/user-guide/3d-modeling/modeling-basics/creating-meshes/dynamesh/dynamesh.html",
+    "blender": "https://docs.blender.org/manual/en/latest/",
+}
+_docs_cache: dict[str, tuple[float, list[Result]]] = {}
+_docs_lock = threading.Lock()
+
+
+def search_documentation(query: str, limit: int = 8) -> list[Result]:
+    """Search official navigation indexes directly, independent of web search availability."""
+    product = next((name for name in DOC_ROOTS if name in query.lower()), None)
+    if not product:
+        return []
+    root = DOC_ROOTS[product]
+    with _docs_lock:
+        ts, links = _docs_cache.get(root, (0, []))
+        # Cache failures briefly as well, so four parallel queries don't hammer a dead host.
+        if time.monotonic() - ts > (3600 if links else 60):
+            links = []
+            try:
+                with _client(10) as client:
+                    response = client.get(root, timeout=10)
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, "lxml")
+                    for a in soup.select("a[href]"):
+                        url = canonical_url(urljoin(root, a.get("href", "")))
+                        title = a.get_text(" ", strip=True)
+                        if not title or domain_of(url) != domain_of(root) or not urlparse(url).path.endswith((".html", "/")):
+                            continue
+                        links.append({"title": f"{product.title()} · {title}", "url": url,
+                                      "snippet": f"{product} 官方文档 · " + unquote(urlparse(url).path),
+                                      "source": "official_docs", "kind": "documentation"})
+            except Exception:
+                pass
+            _docs_cache[root] = (time.monotonic(), dedupe(links))
+    # Product-only matches aren't enough: require a matching operation/feature.
+    terms = _en_tokens(query) - {product, "site", "help", "maxon", "net", "official", "documentation", "guide", "workflow", "tutorial"}
+    if terms:
+        links = [r for r in links if terms & _en_tokens(r["title"] + " " + r["url"])]
+    return rank_results(links, query)[:limit]
+
+
 # 只有查询里出现这些词，才认为该方向值得查 arXiv。
 # 注意排除 "mesh" / "generation" / "architecture" 这类通用词 ——
 # 「3D Mesh Generation」论文和 ZBrush 建模操作是两回事，会把噪音塞满抓取配额。
@@ -508,7 +609,288 @@ def should_use_arxiv(query: str) -> bool:
     return bool(_en_tokens(query) & ACADEMIC_HINTS)
 
 
+# --------------------------------------------------------------------------
+# 媒体检索（图片 / 音频 / 视频）
+#
+# 全部免 API Key，并且只返回「能直接交给 media.extract 的地址」：
+#   - Commons / Openverse 直接给文件 URL
+#   - Internet Archive 给 details 页，由 media 侧解析成直链
+#   - YouTube 等平台页给页面 URL，由 yt-dlp 取字幕/音轨
+# 任何一个源失败都只返回空列表，不影响整轮学习。
+# --------------------------------------------------------------------------
+_COMMONS_FILETYPE = {
+    "image": "filetype:bitmap|drawing",
+    "audio": "filetype:audio",
+    "video": "filetype:video",
+}
+
+
+def search_commons(query: str, kind: str = "image", limit: int = 6) -> list[Result]:
+    """维基共享资源：CC 授权，量大且带结构化元数据。"""
+    out: list[Result] = []
+    ft = _COMMONS_FILETYPE.get(kind)
+    if not ft:
+        return out
+    try:
+        with _client(25) as c:
+            r = c.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params={
+                    "action": "query", "format": "json", "generator": "search",
+                    "gsrsearch": f"{query} {ft}", "gsrnamespace": 6,
+                    "gsrlimit": max(1, min(limit, 12)),
+                    "prop": "imageinfo", "iiprop": "url|mime|size|extmetadata",
+                    "iiurlwidth": 640,
+                },
+                timeout=25,
+            )
+            if r.status_code != 200:
+                return out
+            pages = ((r.json() or {}).get("query") or {}).get("pages") or {}
+    except Exception:  # noqa: BLE001
+        return out
+
+    for page in pages.values():
+        info = (page.get("imageinfo") or [{}])[0]
+        url = info.get("url") or ""
+        if not url:
+            continue
+        meta = info.get("extmetadata") or {}
+        desc = re.sub(r"<[^>]+>", " ", str((meta.get("ImageDescription") or {}).get("value") or ""))
+        out.append({
+            "title": str(page.get("title") or "").removeprefix("File:")[:160],
+            "url": url,
+            "snippet": re.sub(r"\s+", " ", desc).strip()[:180],
+            "source": "commons",
+            "kind": kind,
+            "thumb": info.get("thumburl") or "",
+            "license": str((meta.get("LicenseShortName") or {}).get("value") or ""),
+            "page": str(info.get("descriptionurl") or ""),
+        })
+    return out
+
+
+def search_openverse(query: str, kind: str = "image", limit: int = 6) -> list[Result]:
+    """Openverse（原 CC Search）：图片与音频，免 Key，匿名有速率限制。"""
+    out: list[Result] = []
+    bucket = "images" if kind == "image" else "audio" if kind == "audio" else ""
+    if not bucket:
+        return out
+    try:
+        with _client(25) as c:
+            r = c.get(
+                f"https://api.openverse.org/v1/{bucket}/",
+                params={"q": query, "page_size": max(1, min(limit, 12))},
+                timeout=25,
+            )
+            if r.status_code != 200:
+                return out
+            items = (r.json() or {}).get("results") or []
+    except Exception:  # noqa: BLE001
+        return out
+    for it in items:
+        url = it.get("url") or ""
+        if not url:
+            continue
+        out.append({
+            "title": str(it.get("title") or it.get("name") or "")[:160],
+            "url": url,
+            "snippet": str(it.get("description") or it.get("creator") or "")[:180],
+            "source": "openverse",
+            "kind": kind,
+            "thumb": it.get("thumbnail") or "",
+            "license": f"{it.get('license','')} {it.get('license_version','')}".strip(),
+            "page": it.get("foreign_landing_url") or "",
+        })
+    return out
+
+
+def search_archive(query: str, kind: str = "audio", limit: int = 6) -> list[Result]:
+    """Internet Archive：讲座录音、会议录像、老教材，免 Key。"""
+    out: list[Result] = []
+    mediatype = "audio" if kind == "audio" else "movies" if kind == "video" else ""
+    if not mediatype:
+        return out
+    try:
+        # Archive 默认是宽松 OR 匹配，「3d printing tutorial」会返回一堆
+        # Art of Illusion 教程。改成逐词 AND，精度提升明显。
+        words = [w for w in re.split(r"\s+", query.strip()) if w]
+        strict = " AND ".join(words) if len(words) > 1 else (words[0] if words else query)
+        with _client(25) as c:
+            r = c.get(
+                "https://archive.org/advancedsearch.php",
+                params={
+                    "q": f"({strict}) AND mediatype:({mediatype})",
+                    "fl[]": ["identifier", "title", "description", "runtime"],
+                    "rows": max(1, min(limit, 12)),
+                    "page": 1, "output": "json",
+                },
+                timeout=25,
+            )
+            if r.status_code != 200:
+                return out
+            docs = (((r.json() or {}).get("response") or {}).get("docs")) or []
+    except Exception:  # noqa: BLE001
+        return out
+    for d in docs:
+        ident = d.get("identifier")
+        if not ident:
+            continue
+        desc = d.get("description")
+        if isinstance(desc, list):
+            desc = " ".join(str(x) for x in desc)
+        out.append({
+            "title": str(d.get("title") or ident)[:160],
+            "url": f"https://archive.org/details/{ident}",
+            "snippet": re.sub(r"<[^>]+>", " ", str(desc or ""))[:180],
+            "source": "archive",
+            "kind": kind,
+            "thumb": f"https://archive.org/services/img/{ident}",
+            "license": "archive.org",
+            "page": f"https://archive.org/details/{ident}",
+        })
+    return out
+
+
+def search_ytdlp(query: str, kind: str = "video", limit: int = 4) -> list[Result]:
+    """YouTube 等平台的站内搜索（需要 yt-dlp，未安装则返回空）。"""
+    try:
+        import yt_dlp
+    except Exception:  # noqa: BLE001
+        return []
+    n = max(1, min(limit, 8))
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "noplaylist": True, "extract_flat": True, "socket_timeout": 20}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{n}:{query}", download=False) or {}
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[Result] = []
+    for e in (info.get("entries") or []):
+        if not e:
+            continue
+        vid = e.get("id") or ""
+        url = e.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
+        if not url.startswith("http"):
+            continue
+        out.append({
+            "title": str(e.get("title") or "")[:160],
+            "url": url,
+            "snippet": str(e.get("description") or "")[:180],
+            "source": "youtube",
+            "kind": kind,
+            "thumb": e.get("thumbnail") or (
+                f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if vid else ""),
+            "license": "平台内容",
+            "page": url,
+            "duration": e.get("duration") or 0,
+        })
+    return out
+
+
+MEDIA_SOURCES = {
+    "commons": search_commons,
+    "openverse": search_openverse,
+    "archive": search_archive,
+    "youtube": search_ytdlp,
+}
+
+
+#: 媒体检索结果的短缓存。一次 search_media 要并行打 4 个外部源（最慢 30-40 秒），
+#: 而学习循环隔轮就用同一个 query 再查一次、补漏还会对同一方向连查 3 个检索式。
+#: 10 分钟内的同一组参数直接复用，省掉的是真实网络往返。
+_media_cache: dict[tuple, tuple[float, list[Result]]] = {}
+_media_lock = threading.Lock()
+MEDIA_CACHE_TTL = 600.0
+MEDIA_CACHE_MAX = 64
+
+
+def media_cache_clear() -> None:
+    """测试与配置变更时清空媒体检索缓存。"""
+    with _media_lock:
+        _media_cache.clear()
+
+
+def search_media(
+    query: str,
+    *,
+    kinds: list[str] | tuple[str, ...] = ("image", "audio", "video"),
+    limit: int = 6,
+    sources: list[str] | None = None,
+) -> list[Result]:
+    """并发检索多个媒体源，按模态去重。
+
+    每种模态至少配两个源：Commons/Openverse 偏静态素材，
+    Archive/YouTube 偏讲座与演示视频，互为补充。
+    """
+    q = (query or "").strip()
+    if len(q) < 2:
+        return []
+    # limit 同时决定每源取数与最终截断，缓存里存的又是已截断的 out：
+    # 键不含 limit 时 limit=6 的结果会被 limit=30 的调用方命中。
+    key = (q, tuple(sorted(kinds)), tuple(sorted(sources or MEDIA_SOURCES)), int(limit))
+    now = time.monotonic()
+    with _media_lock:
+        hit = _media_cache.get(key)
+        if hit and now - hit[0] < MEDIA_CACHE_TTL:
+            return [dict(r) for r in hit[1]]
+    wanted = [k for k in kinds if k in ("image", "audio", "video")]
+    if not wanted:
+        return []
+
+    plan: list[tuple[str, str]] = []
+    names = set(sources or MEDIA_SOURCES.keys())
+    for kind in wanted:
+        for name in ("commons", "openverse", "archive", "youtube"):
+            if name not in names:
+                continue
+            # 源能力与模态匹配：Openverse 无视频、Archive 无图片、YouTube 只有视频
+            if name == "openverse" and kind == "video":
+                continue
+            if name == "archive" and kind == "image":
+                continue
+            if name == "youtube" and kind != "video":
+                continue
+            plan.append((name, kind))
+
+    results: list[Result] = []
+    if not plan:
+        return results
+    with ThreadPoolExecutor(max_workers=min(8, len(plan))) as ex:
+        futs = {
+            ex.submit(
+                MEDIA_SOURCES[name], q, kind,
+                max(2, limit // max(1, len(wanted)) + 1),
+            ): f"{name}:{kind}"
+            for name, kind in plan
+        }
+        for f in as_completed(futs):
+            try:
+                results.extend(f.result(timeout=40))
+            except Exception:  # noqa: BLE001
+                continue
+
+    seen: set[str] = set()
+    out: list[Result] = []
+    for r in results:
+        url_key = (r.get("url") or "").split("?")[0]
+        if not url_key or url_key in seen:
+            continue
+        seen.add(url_key)
+        out.append(r)
+    out = out[: limit * max(1, len(wanted))]
+    with _media_lock:
+        if len(_media_cache) >= MEDIA_CACHE_MAX:
+            # 简单淘汰：清掉最早的一半，避免无限增长
+            for old_key in sorted(_media_cache, key=lambda k: _media_cache[k][0])[: MEDIA_CACHE_MAX // 2]:
+                _media_cache.pop(old_key, None)
+        _media_cache[key] = (now, list(out))
+    return out
+
+
 SOURCES = {
+    "docs": search_documentation,
     "brave": search_brave,
     "se": search_stackexchange,
     "zbc": search_zbrushcentral,
@@ -519,8 +901,8 @@ SOURCES = {
     "web": search_web,
 }
 
-# 主力源。通用搜索（bing/web）在国内网络下容易被反爬污染，放最后兜底。
-DEFAULT_SOURCES = ["brave", "se", "zbc", "arxiv", "github", "wiki"]
+# 通用与专用源并行；文档目录直连不依赖搜索引擎的可用性。
+DEFAULT_SOURCES = ["docs", "brave", "bing", "web", "se", "zbc", "arxiv", "github", "wiki"]
 
 
 def search(
@@ -528,7 +910,7 @@ def search(
     *,
     limit: int = 10,
     sources: list[str] | None = None,
-    with_hf: bool = True,
+    with_hf: bool = False,
 ) -> list[Result]:
     """并发检索多个源并去重。
 
@@ -537,7 +919,7 @@ def search(
       - StackExchange：免 Key，建模/3D打印方向质量很高
       - arXiv：只对学术方向启用，否则会误匹配
       - GitHub / Wikipedia：稳定可用
-      - Bing / DuckDuckGo：被反爬污染，只作最后兜底
+      - Bing / DuckDuckGo：并行参与；无结果时可配置 Brave Key 或网络代理
     """
     names = list(sources or DEFAULT_SOURCES)
     if "arxiv" in names and not should_use_arxiv(query):
@@ -549,6 +931,15 @@ def search(
     if len(q) < 2 or not re.search(r"[0-9A-Za-z\u4e00-\u9fa5]", q):
         return []
 
+    # Forum indexes and code/model repositories are specialized sources, not a
+    # replacement for general web search. Avoid unrelated hits and wasted calls.
+    if "zbrush" not in q.lower() and "dynamesh" not in q.lower():
+        names = [n for n in names if n != "zbc"]
+    if "zbrush" in q.lower():
+        names = [n for n in names if n != "se"]
+    if not should_use_arxiv(q) and not re.search(r"code|python|script|api|github|plugin|代码|脚本", q, re.I):
+        names = [n for n in names if n != "github"]
+
     tasks = [(n, SOURCES[n]) for n in names if n in SOURCES]
     results: list[Result] = []
     with ThreadPoolExecutor(max_workers=len(tasks) + 2) as ex:
@@ -556,7 +947,7 @@ def search(
         if with_hf:
             futs[ex.submit(search_hf, query, 4, "model")] = "hf_model"
             futs[ex.submit(search_hf, query, 3, "dataset")] = "hf_dataset"
-        for f, _name in futs.items():
+        for f in as_completed(futs):
             try:
                 results.extend(f.result(timeout=45))
             except Exception:
@@ -564,7 +955,9 @@ def search(
 
     # 一个结果都没有时才动用通用搜索兜底（它的结果质量不可靠）
     if not results:
-        for fn in (search_bing, search_web):
+        for name, fn in (("bing", search_bing), ("web", search_web)):
+            if name in names:
+                continue
             try:
                 got = fn(query, limit)
                 if got:
@@ -573,18 +966,70 @@ def search(
             except Exception:
                 continue
 
-    return dedupe(results)
+    return rank_results(results, q)
+
+
+def canonical_url(url: str) -> str:
+    """Unwrap search-engine links and remove tracking parameters for deduplication."""
+    try:
+        parsed = urlparse(url.strip())
+        params = parse_qs(parsed.query)
+        host = (parsed.hostname or "").lower()
+        if host.endswith("duckduckgo.com") and params.get("uddg"):
+            return canonical_url(params["uddg"][0])
+        if host in ("www.bing.com", "bing.com", "cn.bing.com") and parsed.path.startswith("/ck/"):
+            target = params.get("u", [""])[0]
+            if target.startswith("a1"):
+                encoded = target[2:]
+                target = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode()
+            return canonical_url(target)
+        if parsed.scheme not in ("http", "https") or not host:
+            return ""
+        query = {k: v for k, v in params.items() if not k.lower().startswith("utm_") and k.lower() not in ("fbclid", "gclid", "msclkid")}
+        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", "", urlencode(query, doseq=True), ""))
+    except (ValueError, UnicodeError):
+        return ""
+
+
+def rank_results(items: list[Result], query: str) -> list[Result]:
+    """Lexical relevance + documentation priority + bounded domain diversity."""
+    words = _en_tokens(query) - {"official", "documentation", "tutorial", "guide", "site"}
+    chinese = cjk_terms(query)
+    scored = []
+    for item in dedupe(items):
+        text = f"{item.get('title', '')} {item.get('snippet', '')} {unquote(item['url'])}".lower()
+        matches = len(words & _en_tokens(text)) + sum(w in text for w in chinese)
+        if (words or chinese) and not matches:
+            continue
+        # Require the explicitly named product, instead of loosely related words.
+        if "zbrush" in words and "zbrush" not in text and "pixologic" not in text:
+            continue
+        score = matches / max(1, len(words) + len(chinese))
+        host = domain_of(item["url"])
+        official = host in ("help.maxon.net", "docs.blender.org", "docs.python.org", "learn.microsoft.com") or host.endswith(".edu")
+        score += .35 if official else .1 if item.get("kind") == "qa" else 0
+        if re.search(r"crack|keygen|破解版|激活码|购买|download free", text):
+            continue
+        scored.append(dict(item, rank_score=round(score, 4)))
+    scored.sort(key=lambda r: -r["rank_score"])
+    # Interleave domains so one forum or mirror cannot fill the reading budget.
+    counts, first, rest = {}, [], []
+    for item in scored:
+        host = domain_of(item["url"])
+        counts[host] = counts.get(host, 0) + 1
+        (first if counts[host] <= 3 else rest).append(item)
+    return first + rest
 
 
 def dedupe(items: list[Result]) -> list[Result]:
     seen: set[str] = set()
     out: list[Result] = []
     for it in items:
-        url = (it.get("url") or "").strip().rstrip("/")
+        url = canonical_url(it.get("url") or "").rstrip("/")
         if not url or url in seen:
             continue
         seen.add(url)
-        out.append(it)
+        out.append(dict(it, url=url))
     return out
 
 

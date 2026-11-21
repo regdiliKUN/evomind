@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Iterable, Iterator
 
 import httpx
@@ -210,7 +211,20 @@ def chat(
     timeout: float | None = None,
     tools: list[dict] | None = None,
     think: bool | None = None,
+    images: list[str] | None = None,
 ) -> str:
+    """对话补全。
+
+    `images` 是 base64 字符串列表，会挂到最后一条消息上（Ollama 的原生多模态
+    字段）。只有具备 vision 能力的模型才能吃图；纯文本模型请走
+    `media.image_text()` 先转成文字，那条路径对模型没有要求。
+    """
+    if images:
+        messages = [dict(m) for m in messages]
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                m["images"] = list(images)
+                break
     payload: dict[str, Any] = {
         "model": model or config.get("model"),
         "messages": messages,
@@ -338,13 +352,29 @@ def chat_json(
 # --------------------------------------------------------------------------
 # 向量化
 # --------------------------------------------------------------------------
-def embed(texts: Iterable[str], *, batch: int = 16) -> list[list[float]]:
-    items = [t if t.strip() else " " for t in texts]
+#: 文本 → 向量的小缓存。
+#:
+#: 学习循环每轮都用同一个「方向」字符串去检索一次（`_plan` 里的 memory.search），
+#: 而检索结果缓存会在每次入库后失效，于是每轮都要重新向量化同一个句子。
+#: 在 24GB 卡上这只是一次 7ms 的调用；显存小到只能驻留一个模型时，
+#: 它会把 27B 挤下去、下一次对话再重新加载（20-40 秒）。
+#: 同一批里重复的文本也顺带合并成一次请求。
+_embed_cache: "OrderedDict[tuple[str, str], list[float]]" = OrderedDict()
+_embed_lock = threading.Lock()
+EMBED_CACHE_MAX = 256
+
+
+def embed_cache_clear() -> None:
+    with _embed_lock:
+        _embed_cache.clear()
+
+
+def _embed_remote(payload: list[str], model: str, batch: int) -> list[list[float]]:
+    """真正打 Ollama /api/embed。按 batch 分批，保持返回顺序。"""
     out: list[list[float]] = []
-    model = config.get("embed_model")
     c = _client(300)
-    for i in range(0, len(items), batch):
-        chunk = items[i : i + batch]
+    for i in range(0, len(payload), max(1, batch)):
+        chunk = payload[i : i + max(1, batch)]
         try:
             r = c.post("/api/embed", json={"model": model, "input": chunk}, timeout=300)
             r.raise_for_status()
@@ -352,3 +382,39 @@ def embed(texts: Iterable[str], *, batch: int = 16) -> list[list[float]]:
         except httpx.HTTPError as e:
             raise LLMError(f"向量化失败（模型 {model} 是否已下载？）：{e}") from e
     return out
+
+
+def embed(texts: Iterable[str], *, batch: int = 16) -> list[list[float]]:
+    items = [t if t.strip() else " " for t in texts]
+    if not items:
+        return []
+    model = config.get("embed_model")
+    keys = [(model, t) for t in items]
+    out: list[list[float] | None] = [None] * len(items)
+
+    with _embed_lock:
+        for i, key in enumerate(keys):
+            hit = _embed_cache.get(key)
+            if hit is not None:
+                _embed_cache.move_to_end(key)
+                out[i] = list(hit)
+
+    # 未命中的文本去重后一次性请求：同一批里重复的句子只算一次
+    pending: dict[tuple[str, str], list[int]] = {}
+    for i, key in enumerate(keys):
+        if out[i] is None:
+            pending.setdefault(key, []).append(i)
+    if pending:
+        payload = [key[1] for key in pending]
+        vectors = _embed_remote(payload, model, batch)
+        if len(vectors) != len(payload):
+            raise LLMError(f"向量化返回数量不符：请求 {len(payload)}，返回 {len(vectors)}")
+        with _embed_lock:
+            for key, vec in zip(pending, vectors):
+                for i in pending[key]:
+                    out[i] = list(vec)
+                _embed_cache[key] = list(vec)
+                _embed_cache.move_to_end(key)
+            while len(_embed_cache) > EMBED_CACHE_MAX:
+                _embed_cache.popitem(last=False)
+    return [v if v is not None else [] for v in out]

@@ -16,6 +16,10 @@ data/
 # 打包产物（可用 scripts/pack.py 重新生成，不入库）
 dist/
 build/
+build_evomind/
+# PyInstaller 生成的单文件启动器（由 evomind_launcher.py 重新打包）
+EvoMind.exe
+# EvoMind.spec 是构建配置，必须入库：忽略后换机器打包会丢 hiddenimports / datas
 
 # 临时文件
 .tmpedge/
@@ -37,3 +41,7 @@ desktop.ini
 
 # 基准产物（可重新生成的对照 json，体积大）
 scripts/bench/*.json
+
+# 微调产物与模型权重（单文件可达数 GB，且属于本地数据）
+*.gguf
+*.safetensors

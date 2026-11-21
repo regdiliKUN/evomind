@@ -14,7 +14,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ICON = ROOT / "assets" / "icon.ico"
-LAUNCHER = ROOT / "① 双击这里启动.cmd"
+# 优先指向编译好的原生启动器；没有 EXE 时回退到 .cmd 启动器。
+LAUNCHER_EXE = ROOT / "EvoMind.exe"
+LAUNCHER_CMD = ROOT / "① 双击这里启动.cmd"
 LINK_NAME = "EvoMind.lnk"
 
 _PS_TEMPLATE = """$ErrorActionPreference = 'Stop'
@@ -28,6 +30,11 @@ $s.WindowStyle = 1
 $s.Save()
 Write-Output 'OK'
 """
+
+
+def launcher() -> Path:
+    """返回当前应该作为快捷方式目标的启动器。"""
+    return LAUNCHER_EXE if LAUNCHER_EXE.exists() else LAUNCHER_CMD
 
 
 def is_windows() -> bool:
@@ -84,22 +91,35 @@ def create(quiet: bool = False) -> tuple[bool, str]:
     """创建桌面快捷方式。返回 (成功, 说明)。"""
     if not is_windows():
         return False, "仅支持 Windows"
-    if not LAUNCHER.exists():
-        return False, f"找不到启动器：{LAUNCHER.name}"
+    target = launcher()
+    if not target.exists():
+        return False, f"找不到启动器：{target.name}"
 
     lnk = link_path()
     lnk.parent.mkdir(parents=True, exist_ok=True)
+    # 已存在的快捷方式要显式删掉：WScript.Shell.Save() 在覆盖现存文件时
+    # 会抛 UnauthorizedAccessException（目标已存在且被 shell 缓存占用）。
+    if lnk.exists():
+        try:
+            lnk.unlink()
+        except Exception as e:  # noqa: BLE001
+            return False, f"无法覆盖已存在的快捷方式（请手动删除后重试）：{lnk} — {e}"
 
     script = _PS_TEMPLATE.format(
         lnk=str(lnk).replace("'", "''"),
-        target=str(LAUNCHER).replace("'", "''"),
+        target=str(target).replace("'", "''"),
         workdir=str(ROOT).replace("'", "''"),
         icon=str(ICON).replace("'", "''"),
     )
 
-    tmp = Path(tempfile.gettempdir()) / "evomind_shortcut.ps1"
-    # UTF-8 with BOM：Windows PowerShell 5.1 靠 BOM 判断编码
-    tmp.write_text(script, encoding="utf-8-sig")
+    # 唯一临时文件：固定名字在并发创建（或上次残留）时会互相覆盖，
+    # finally 还可能删掉对方正在用的脚本。
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8-sig", suffix=".ps1",
+        prefix="evomind-", delete=False,
+    ) as f:  # UTF-8 with BOM：Windows PowerShell 5.1 靠 BOM 判断编码
+        f.write(script)
+        tmp = Path(f.name)
 
     try:
         r = subprocess.run(
@@ -111,9 +131,7 @@ def create(quiet: bool = False) -> tuple[bool, str]:
                 "-File", str(tmp),
             ],
             capture_output=True,
-            text=True,
-            encoding="gbk",
-            errors="replace",
+            text=False,
             timeout=60,
         )
     except Exception as e:  # noqa: BLE001
@@ -124,8 +142,18 @@ def create(quiet: bool = False) -> tuple[bool, str]:
         except Exception:
             pass
 
+    # PowerShell 5.1 输出随系统 locale 变化（GBK / OEM / UTF-8），
+    # 逐字节取回后按 BOM / 编码依次尝试，避免错误原因变成乱码。
+    def _decode(raw: bytes) -> str:
+        for enc in ("utf-8-sig", "gbk"):
+            try:
+                return (raw or b"").decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return (raw or b"").decode("utf-8", errors="replace")
+
     if r.returncode != 0:
-        err = (r.stderr or r.stdout or "").strip().splitlines()
+        err = (_decode(r.stderr) or _decode(r.stdout)).strip().splitlines()
         return False, err[-1] if err else "未知错误"
 
     if not lnk.exists():
@@ -153,4 +181,5 @@ if __name__ == "__main__":
         print(remove())
     else:
         print(f"桌面目录：{get_desktop()}")
+        print(f"启动器　：{launcher()}")
         print(f"快捷方式：{link_path()}  存在={exists()}")

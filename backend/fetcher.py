@@ -1,4 +1,9 @@
-"""网页抓取与正文提取：把任意 URL 变成干净的文本。"""
+"""网页抓取与正文提取：把任意 URL 变成干净的文本。
+
+多模态扩展：图片 / 音频 / 视频 / PDF 不再被当成「非文本内容」直接判失败，
+而是转交 `media` 模块走对应通道（视觉模型 / 语音转写 / 字幕 / PDF 文本层+OCR），
+输出仍然是同构的 Doc，学习循环无需区分来源类型。
+"""
 from __future__ import annotations
 
 import re
@@ -7,11 +12,14 @@ from typing import Any
 from bs4 import BeautifulSoup
 from lxml import html as lxml_html
 
-from . import config, httpc
+from . import config, httpc, media
 
 Doc = dict[str, Any]
 
 MAX_CHARS = 60000
+#: 网页 HTML 最多读这么多字节。正文最终只留 MAX_CHARS（6 万字）；正常页面
+#: HTML 多在几 MB 以内，截断后的 HTML 仍能被 lxml / trafilatura 容错解析。
+MAX_HTML_BYTES = 10 * 1024 * 1024
 
 #: HTML→文本解析路径开关（仅用于基准 A/B）。True = 旧 BS4 包装路径，
 #: False = 纯 lxml 路径（默认）。两者共用同一个 libxml2 解析器，输出字节一致。
@@ -38,6 +46,18 @@ def _client(timeout: float | None = None) -> "httpc.Borrowed":
         headers=_headers(),
         follow_redirects=True,
     )
+
+
+def _read_capped_text(r: Any, limit: int | None = None) -> str:
+    """从流式响应读至多 limit 字节并按响应编码解码（与 httpx 的 r.text 同口径）。"""
+    limit = MAX_HTML_BYTES if limit is None else limit
+    buf = bytearray()
+    for chunk in r.iter_bytes(65536):
+        buf += chunk
+        if len(buf) >= limit:
+            del buf[limit:]
+            break
+    return bytes(buf).decode(r.encoding or "utf-8", errors="replace")
 
 
 def _clean(text: str) -> str:
@@ -211,8 +231,28 @@ def _discourse_fetch(url: str) -> Doc | None:
 
 
 def fetch(url: str) -> Doc:
-    """抓取单页并提取正文。返回 {ok, url, title, text, error}。"""
+    """抓取单页并提取正文。返回 {ok, url, title, text, error}。
+
+    媒体 URL（图片/音频/视频/PDF）返回的 Doc 额外带 `kind` 与 `meta`，
+    `text` 是视觉描述、字幕或转写文本。
+    """
     doc: Doc = {"ok": False, "url": url, "title": "", "text": "", "error": ""}
+    try:
+        # 入口只做无网络的结构校验：真正的 IP 判定由共享客户端的
+        # request hook 在发请求前完成（含重定向）。若在这里就解析 DNS，
+        # 离线或 DNS 抖动时会在分派媒体类型之前提前返回，把「暂时解析
+        # 不了」误报成「恶意地址」。
+        httpc.assert_url_shape(url)
+    except ValueError as e:
+        doc["error"] = str(e)
+        return doc
+
+    # 媒体直链 / 平台页：从 URL 就能判类型，直接交给 media，不必先抓 HTML
+    kind = media.kind_of(url)
+    if kind in media.SUPPORTED_KINDS:
+        got = media.extract(url, kind=kind)
+        got.setdefault("title", url)
+        return got
 
     # StackExchange 问答：走 API
     if "stackexchange.com/questions/" in url:
@@ -257,20 +297,33 @@ def fetch(url: str) -> Doc:
             return doc
 
     # 通用抓取
+    # 流式读：先看状态码与 Content-Type 再决定读不读正文。原来 c.get() 会把
+    # 整个响应读进内存——检索结果里一个无扩展名的 1GB 视频直链或无限流，
+    # 要先整段下进内存才发现「不是文本」，随后 media 还要再下一遍。
+    media_kind = ""
     try:
         c = _client()
-        r = c.get(url, timeout=config.get("request_timeout", 20))
-        if r.status_code >= 400:
-            doc["error"] = f"HTTP {r.status_code}"
-            return doc
-        ctype = r.headers.get("content-type", "")
-        if "html" not in ctype and "xml" not in ctype and "text" not in ctype:
-            doc["error"] = f"非文本内容: {ctype}"
-            return doc
-        html = r.text
+        with c.stream("GET", url, timeout=config.get("request_timeout", 20)) as r:
+            if r.status_code >= 400:
+                doc["error"] = f"HTTP {r.status_code}"
+                return doc
+            ctype = r.headers.get("content-type", "")
+            if "html" not in ctype and "xml" not in ctype and "text" not in ctype:
+                # 无扩展名的媒体直链（CDN 生成的 /a1b2c3）只能靠响应头判断；
+                # 正文一个字节都不读，交给 media 按它自己的体积上限去下载。
+                media_kind = media.kind_of(url, ctype)
+                if media_kind not in media.SUPPORTED_KINDS:
+                    doc["error"] = f"非文本内容: {ctype}"
+                    return doc
+            else:
+                html = _read_capped_text(r)
     except Exception as e:  # noqa: BLE001
         doc["error"] = str(e)[:200]
         return doc
+    if media_kind:
+        got = media.extract(url, kind=media_kind)
+        got.setdefault("title", url)
+        return got
 
     title = ""
     body = ""

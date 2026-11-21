@@ -3,9 +3,11 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="referrer" content="no-referrer" />
+<meta name="color-scheme" content="dark" />
 <title>EvoMind · 自进化学习引擎</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236c8cff'/><text x='16' y='23' font-size='18' font-family='sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'>E</text></svg>" />
-<link rel="stylesheet" href="/static/style.css?v=18" />
+<link rel="stylesheet" href="/static/style.css?v=22" />
 </head>
 <body>
 <div class="app">
@@ -19,16 +21,17 @@
       </div>
     </div>
 
-    <nav class="nav">
-      <div class="nav-item active" data-view="dashboard"><span class="ico">◈</span>总览</div>
-      <div class="nav-item" data-view="learn"><span class="ico">◐</span>自主进化</div>
-      <div class="nav-item" data-view="knowledge"><span class="ico">▤</span>知识库</div>
-      <div class="nav-item" data-view="analytics"><span class="ico">❖</span>分析</div>
-      <div class="nav-item" data-view="library"><span class="ico">▦</span>书库</div>
-      <div class="nav-item" data-view="resources"><span class="ico">⤓</span>资源获取</div>
-      <div class="nav-item" data-view="finetune"><span class="ico">⚙</span>权重进化</div>
-      <div class="nav-item" data-view="chat"><span class="ico">✎</span>检验所学</div>
-      <div class="nav-item" data-view="settings"><span class="ico">⋯</span>设置</div>
+    <nav class="nav" aria-label="主导航">
+      <div class="nav-item active" data-view="dashboard" role="tab" tabindex="0" aria-current="page"><span class="ico">◈</span>总览</div>
+      <div class="nav-item" data-view="learn" role="tab" tabindex="0"><span class="ico">◐</span>自主进化</div>
+      <div class="nav-item" data-view="knowledge" role="tab" tabindex="0"><span class="ico">▤</span>知识库</div>
+      <div class="nav-item" data-view="analytics" role="tab" tabindex="0"><span class="ico">❖</span>分析</div>
+      <div class="nav-item" data-view="library" role="tab" tabindex="0"><span class="ico">▦</span>书库</div>
+      <div class="nav-item" data-view="media" role="tab" tabindex="0"><span class="ico">◫</span>多模态</div>
+      <div class="nav-item" data-view="resources" role="tab" tabindex="0"><span class="ico">⤓</span>资源获取</div>
+      <div class="nav-item" data-view="finetune" role="tab" tabindex="0"><span class="ico">⚙</span>权重进化</div>
+      <div class="nav-item" data-view="chat" role="tab" tabindex="0"><span class="ico">✎</span>检验所学</div>
+      <div class="nav-item" data-view="settings" role="tab" tabindex="0"><span class="ico">⋯</span>设置</div>
     </nav>
 
     <div class="sidebar-foot">
@@ -92,7 +95,7 @@
           <div class="health-grid">
             <div class="health-gauge" id="health-gauge"></div>
             <div class="health-main">
-              <div id="health-dims"><div class="empty">评分计算中…</div></div>
+              <div id="health-dims"><div class="sk-line"></div><div class="sk-line"></div><div class="sk-line"></div><div class="sk-line"></div></div>
               <div class="health-weak" id="health-weak"></div>
             </div>
           </div>
@@ -105,7 +108,7 @@
 
         <div class="card" style="margin-top:14px">
           <div class="card-title">成长里程碑<span class="tag" id="ms-level">—</span></div>
-          <div id="milestone"><div class="empty">加载中…</div></div>
+          <div id="milestone"><div class="sk-stack"><div class="sk-line"></div><div class="sk-line w70"></div><div class="sk-line w45"></div></div></div>
         </div>
       </section>
 
@@ -115,10 +118,20 @@
           <div class="card">
             <div class="card-title">设定进化方向</div>
             <label class="field">
+              <span>预设领域 · 自动帮你拆出学习方向</span>
+              <input id="direction-seed" value="ZBrush" maxlength="200" placeholder="例如 ZBrush、Blender、角色雕刻" />
+            </label>
+            <div class="rowflex" style="flex-wrap:wrap;margin-bottom:10px">
+              <button class="btn sm" id="btn-directions">刷新方向</button>
+              <button class="btn sm" id="btn-random-learn">随机选一个方向</button>
+            </div>
+            <div id="direction-options" class="direction-options" aria-live="polite"><div class="hint">随机选择只填写方向。选好轮数后，点击下方「开始进化学习」。</div></div>
+            <label class="field">
               <span>学习方向（越具体，学得越深）</span>
               <textarea id="direction" placeholder="例如：量子计算中的表面码纠错 / 大模型 Agent 的规划与反思机制 / 光固化 3D 打印的收缩补偿模型"></textarea>
             </label>
             <div class="dir-presets" id="presets">
+              <span class="chip">ZBrush</span>
               <span class="chip">大模型 Agent 架构</span>
               <span class="chip">RAG 检索增强前沿</span>
               <span class="chip">强化学习对齐方法</span>
@@ -151,7 +164,12 @@
                 <button class="btn sm" id="btn-auto">开启</button>
               </div>
               <div class="auto-desc" id="auto-desc">
-                开启后，学完一段空闲一会儿就自动接着学，不用一直盯着
+                每段学习完成后最多等待30秒自动继续；导入、OCR或炼化时会等待。
+              </div>
+              <div class="rowflex" style="margin-top:10px;flex-wrap:wrap">
+                <label>间隔 <input id="auto-seconds" type="number" min="1" max="30" value="15" style="width:64px" /> 秒</label>
+                <label>每次 <input id="auto-rounds" type="number" min="1" max="100" value="2" style="width:64px" /> 轮</label>
+                <button class="btn sm" id="btn-auto-save">保存</button>
               </div>
             </div>
 
@@ -197,6 +215,68 @@
             </div>
           </div>
         </div>
+
+        <!-- ---------- 学习方向自动更换 ---------- -->
+        <div class="card rot-card" id="rot-card">
+          <div class="card-title">
+            学习方向自动更换
+            <span class="tag" id="rot-tag">未启动</span>
+          </div>
+          <div class="hint" style="margin-bottom:12px">
+            只给一个大致方向就行：系统自动拆成若干具体子方向，每个连续学 N 轮后自动换下一个。
+            换向前会校验新方向是否还在这个范围内，越界的丢弃重选；子方向用尽会自动补充，学习不中断。
+          </div>
+          <div class="field-row g3">
+            <label class="field">
+              <span>大致方向（模糊即可）</span>
+              <input id="rot-seed" maxlength="200" placeholder="例如：光固化 3D 打印" />
+            </label>
+            <label class="field">
+              <span>每个子方向连续学多少轮</span>
+              <input id="rot-per" type="number" min="1" max="2000" value="100" />
+            </label>
+            <label class="field">
+              <span>总轮次上限</span>
+              <input id="rot-total" type="number" min="1" max="100000" value="300" />
+            </label>
+          </div>
+          <div class="field-row g3">
+            <label class="field">
+              <span>子方向数量</span>
+              <input id="rot-count" type="number" min="2" max="20" value="6" />
+            </label>
+            <label class="field">
+              <span>短期不重复（最近几个方向）</span>
+              <input id="rot-window" type="number" min="1" max="20" value="3" />
+            </label>
+            <label class="field">
+              <span>换向前校验语义边界</span>
+              <select id="rot-boundary">
+                <option value="1" selected>开启（推荐）</option>
+                <option value="0">关闭</option>
+              </select>
+            </label>
+          </div>
+          <div class="rowflex" style="flex-wrap:wrap">
+            <button class="btn primary" id="btn-rot-start">开始自动轮换</button>
+            <button class="btn sm" id="btn-rot-plan">预览子方向</button>
+            <button class="btn sm" id="btn-rot-pause" disabled>暂停</button>
+            <button class="btn sm" id="btn-rot-resume" disabled>恢复</button>
+            <button class="btn sm" id="btn-rot-skip" disabled>跳过当前方向</button>
+            <button class="btn danger" id="btn-rot-stop" disabled>结束并汇总</button>
+          </div>
+          <div class="rot-status" id="rot-status" role="status" aria-live="polite">尚未启动</div>
+          <div class="rot-bar" id="rot-bar" hidden><i id="rot-bar-fill"></i></div>
+          <div class="rot-plan" id="rot-plan-list"></div>
+          <div class="rot-summary" id="rot-summary" hidden></div>
+          <div class="rowflex" id="rot-summary-actions" hidden style="margin-top:8px">
+            <button class="btn sm" id="btn-rot-copy">复制汇总</button>
+          </div>
+          <details class="rot-history" id="rot-history" hidden>
+            <summary>最近任务</summary>
+            <div id="rot-history-list"></div>
+          </details>
+        </div>
       </section>
 
       <!-- ---------- 知识库 ---------- -->
@@ -208,9 +288,83 @@
             <button class="btn" id="btn-kb-search">搜索</button>
           </div>
         </div>
-        <div class="card" id="dup-card" style="margin-bottom:14px" hidden>
-          <div class="card-title">近重复知识点<span class="tag">相似度 ≥ 0.90</span></div>
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">重复知识清理<span class="tag">可撤销 · 保留出处</span></div>
+          <p class="hint">一键清理整个知识库中结论与补充内容一致的重复条目，保留可信度较高的一条。相近但内容不同的知识保留供核对。</p>
+          <div class="rowflex" style="flex-wrap:wrap;margin:10px 0">
+            <button class="btn" id="btn-cleanup">一键清理重复项</button>
+            <button class="btn sm" id="btn-cleanup-undo" disabled>撤销上次清理</button>
+            <span class="hint" id="cleanup-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">知识二次炼化<span class="tag">保留原始知识与出处</span></div>
+          <p class="hint">一键整理全部已入库的书籍知识：自动按书籍分批处理，已完成且未变化的内容会跳过，停止后可再次点击继续。</p>
+          <div class="rowflex" style="flex-wrap:wrap;margin:10px 0">
+            <button class="btn primary" id="btn-refine-books">一键炼化全部书籍</button>
+            <button class="btn sm" id="btn-refine-stop" disabled>停止炼化</button>
+          </div>
+          <progress id="refine-progress" max="100" value="0" style="width:100%" hidden aria-label="知识炼化进度"></progress>
+          <div class="hint" id="refine-status" role="status" aria-live="polite"></div>
+          <p class="hint">按上方选择的方向，归纳最近最多120条知识；选择“全部方向”时按方向分别炼化。结果独立保存，可追溯原文。</p>
+          <div class="rowflex" style="flex-wrap:wrap;margin:10px 0">
+            <button class="btn sm" id="btn-refine">仅炼化当前范围</button>
+          </div>
+          <div id="refine-results" aria-live="polite"><div class="empty">尚无炼化结果</div></div>
+          <div class="rowflex" style="justify-content:flex-end;margin-top:10px">
+            <button class="btn sm" id="btn-refine-prev" disabled>上一页</button>
+            <span class="hint" id="refine-page">第1页</span>
+            <button class="btn sm" id="btn-refine-next" disabled>下一页</button>
+          </div>
+        </div>
+        <div class="card" id="dup-card" style="margin-bottom:14px">
+          <div class="card-title">近似知识点<span class="tag" id="dup-threshold-label">相似度 ≥ 90%</span></div>
+          <p class="hint">扫描当前方向的全部知识点；选择“全部方向”时逐方向扫描。优先保留补充信息更完整的一条，完整度相同时保留更早创建的一条。清除前可展开逐对核对，清除后可撤销。</p>
+          <div class="rowflex dup-tools">
+            <label for="dup-threshold">相似度阈值（%）</label>
+            <input id="dup-threshold" type="number" min="50" max="100" step="0.1" value="90" style="max-width:100px" />
+            <button class="btn primary" id="btn-cleanup-similar">一键去除高相似度知识点</button>
+          </div>
+          <div class="hint" id="dup-status" role="status" aria-live="polite"></div>
+          <div id="dup-preview" hidden>
+            <div id="dup-preview-summary" class="hint" role="status"></div>
+            <div id="dup-preview-list"></div>
+            <div class="rowflex dup-tools">
+              <button class="btn sm" id="btn-preview-prev">上一页</button>
+              <span class="hint" id="dup-preview-page"></span>
+              <button class="btn sm" id="btn-preview-next">下一页</button>
+              <button class="btn primary" id="btn-confirm-similar">确认清除</button>
+              <button class="btn sm" id="btn-cancel-similar">取消</button>
+            </div>
+          </div>
           <div id="dup-body"></div>
+          <div class="rowflex dup-tools">
+            <button class="btn sm" id="btn-dup-prev" disabled>上一页</button>
+            <span class="hint" id="dup-page"></span>
+            <button class="btn sm" id="btn-dup-next" disabled>下一页</button>
+          </div>
+        </div>
+        <div class="card" id="ops-card" style="margin-top:14px">
+          <div class="card-title">证据复核与检索运维<span class="tag" id="ops-policy">策略加载中…</span></div>
+          <p class="hint">历史无引文知识按「本地 OCR 逐字补证 / 来源 URL 复检 / 无法定位」三层处理。所有动作默认是预演（dry run），只有勾选下方开关才会真正写库或发出网络请求；补到引文也只标记为可核对，不会自动认定事实成立。</p>
+          <div class="rowflex" style="flex-wrap:wrap;gap:8px;margin:10px 0">
+            <button class="btn sm" id="btn-ops-plan">无引文盘点（只读）</button>
+            <button class="btn sm" id="btn-ops-enqueue">入队</button>
+            <button class="btn sm" id="btn-ops-local">本地逐字补证</button>
+            <button class="btn sm" id="btn-ops-urls">来源 URL 复检</button>
+            <button class="btn sm" id="btn-ops-status">复核进度</button>
+          </div>
+          <div class="rowflex" style="flex-wrap:wrap;gap:8px;margin:10px 0">
+            <button class="btn sm" id="btn-ops-index">词法索引状态</button>
+            <input id="ops-q" placeholder="混合检索词，如 ZBrush 4R6" style="max-width:220px" />
+            <button class="btn sm" id="btn-ops-hybrid">混合召回测试</button>
+            <button class="btn sm" id="btn-ops-events">事件聚合</button>
+            <button class="btn sm" id="btn-ops-topics">主题聚类</button>
+          </div>
+          <label class="hint" style="display:flex;align-items:center;gap:6px;margin-bottom:8px;cursor:pointer">
+            <input type="checkbox" id="ops-write" /> 真正执行（取消预演；入队/补证会写库，URL 复检会联网）
+          </label>
+          <div id="ops-output" class="hint" style="white-space:pre-wrap;max-height:300px;overflow:auto"><div class="empty">点上方按钮查看结果</div></div>
         </div>
         <div class="list" id="kb-list"><div class="empty">暂无知识点</div></div>
       </section>
@@ -493,6 +647,95 @@
         </div>
       </section>
 
+      <!-- ---------- 多模态 ---------- -->
+      <section class="view" id="view-media">
+        <div class="grid g4" style="margin-bottom:16px">
+          <div class="stat">
+            <div class="k">视觉理解</div>
+            <div class="v" id="mm-vision">—</div>
+            <div class="s" id="mm-vision-s">检测中…</div>
+          </div>
+          <div class="stat">
+            <div class="k">语音转写</div>
+            <div class="v" id="mm-asr">—</div>
+            <div class="s" id="mm-asr-s">检测中…</div>
+          </div>
+          <div class="stat">
+            <div class="k">视频字幕</div>
+            <div class="v" id="mm-sub">—</div>
+            <div class="s" id="mm-sub-s">检测中…</div>
+          </div>
+          <div class="stat">
+            <div class="k">PDF / OCR</div>
+            <div class="v" id="mm-pdf">—</div>
+            <div class="s" id="mm-pdf-s">检测中…</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">摄取网络媒体<span class="tag" id="mm-mode">多模态已开启</span></div>
+          <textarea id="mm-urls" placeholder="每行一个链接。例如：
+https://example.com/figure-3.png
+https://www.youtube.com/watch?v=xxxx
+https://example.com/paper.pdf
+https://archive.org/details/lecture-2024"></textarea>
+          <div class="rowflex" style="margin-top:10px">
+            <input id="mm-direction" placeholder="这批资料属于哪个学习方向（可选，默认「多模态资料」）" maxlength="120" />
+            <button class="btn primary" id="btn-mm-ingest">开始摄取</button>
+            <button class="btn" id="btn-mm-stop">停止</button>
+          </div>
+          <div class="hint">
+            图片 → 本地视觉模型描述画面 + 转录图中文字；音频/视频 → 优先取平台字幕，没有字幕再本地转写音轨；
+            PDF → 先读文本层，扫描件自动走 OCR。解析出的文字会像网页正文一样提炼、核对、去重入库，
+            来源类型会标在知识条目上（图片/音频/视频/PDF）。<span id="mm-storage"></span>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">查缺补漏<span class="tag">用图片 / 视频补已有知识</span></div>
+          <div class="rowflex">
+            <select id="mm-bf-topic" style="flex:1"></select>
+            <input id="mm-bf-per" type="number" min="1" max="6" value="2" style="max-width:132px"
+                   title="每个方向最多摄取几个媒体来源" />
+            <button class="btn primary" id="btn-mm-backfill">开始补漏</button>
+          </div>
+          <div class="hint">
+            针对知识库里已有的方向，让模型先指出「文字讲不清、只能靠看图 / 看演示」的缺口，
+            再去搜对应的图片、视频、音频并提炼入库。每个方向最多取 <b>每个方向媒体数</b> 个来源，
+            已读过的媒体会自动跳过，可以反复点，越点越深。
+          </div>
+        </div>
+
+        <div class="grid g2" style="align-items:start">
+          <div class="card">
+            <div class="card-title">搜索媒体素材</div>
+            <div class="rowflex">
+              <input id="mm-q" placeholder="关键词，如 dynamesh resolution / 光固化 收缩补偿" maxlength="120" />
+              <button class="btn" id="btn-mm-search">搜索</button>
+            </div>
+            <div class="rowflex mm-kinds">
+              <label class="chip"><input type="checkbox" id="mm-k-image" checked /> 图片</label>
+              <label class="chip"><input type="checkbox" id="mm-k-audio" checked /> 音频</label>
+              <label class="chip"><input type="checkbox" id="mm-k-video" checked /> 视频</label>
+            </div>
+            <div class="list" id="mm-results" style="margin-top:12px">
+              <div class="empty">检索 Wikimedia Commons / Openverse / Internet Archive / YouTube，结果可直接摄取</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-title">摄取进度</div>
+            <div class="stream" id="media-stream" style="height:420px">
+              <div class="stream-empty">
+                <div class="se-ico">◫</div>
+                <div class="se-title">还没有开始摄取</div>
+                <div class="se-desc">贴一个链接、或者先搜一段素材，解析过程会实时显示在这里。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- ---------- 权重进化 ---------- -->
       <section class="view" id="view-finetune">
         <div class="grid g2" style="align-items:start">
@@ -566,6 +809,14 @@
               <label class="field"><span>最低相关度</span><input id="cfg-rel" type="number" step="0.05" min="0" max="1" /></label>
             </div>
             <label class="field">
+              <span>资料重读间隔（天）</span>
+              <input id="cfg-retry" type="number" min="1" max="365" />
+            </label>
+            <div class="hint" style="margin-top:-6px">
+              一篇资料提炼过之后，这么多天内不再重复抓取和提炼。调大更省时间（同一方向很快“读尽”），
+              调小更容易发现更新，但会重复付抓取与提炼的代价。
+            </div>
+            <label class="field">
               <span>Brave 搜索 API Key（可选，强烈建议填）</span>
               <input id="cfg-search-key" placeholder="留空则只用免 Key 源（质量差一些）" />
             </label>
@@ -599,6 +850,45 @@
         </div>
 
         <div class="card" style="margin-top:14px">
+          <div class="card-title">多模态摄取<span class="tag">图片 / 音频 / 视频 / PDF</span></div>
+          <div class="field-row g3">
+            <label class="field"><span>摄取开关</span>
+              <select id="cfg-media">
+                <option value="1">开启（网页 + 媒体）</option>
+                <option value="0">关闭（只读文字网页）</option>
+              </select>
+            </label>
+            <label class="field"><span>每轮最多摄取媒体数</span>
+              <input id="cfg-media-per" type="number" min="0" max="20" />
+            </label>
+            <label class="field"><span>单文件下载上限（MB）</span>
+              <input id="cfg-media-max" type="number" min="1" max="2048" />
+            </label>
+          </div>
+          <div class="field-row g2">
+            <label class="field"><span>语音识别模型（faster-whisper）</span>
+              <select id="cfg-asr-model">
+                <option value="tiny">tiny · 最快，准确度低</option>
+                <option value="base">base</option>
+                <option value="small">small · 推荐（约 480MB）</option>
+                <option value="medium">medium · 更准，更慢</option>
+                <option value="large-v3">large-v3 · 最准，需大显存</option>
+              </select>
+            </label>
+            <label class="field"><span>视觉模型（须具备 vision 能力）</span>
+              <input id="cfg-vision" placeholder="如 qwen2.5vl:7b / qwen3.8:27b" />
+            </label>
+          </div>
+          <div class="hint" style="margin-top:-4px">
+            关闭后自主学习只读文字网页，与改造前一致。<b>语音转写需要
+            <code>pip install faster-whisper</code></b>，平台视频解析需要
+            <code>pip install yt-dlp</code>；两者都没装时，图片仍可用视觉模型/OCR 解析，PDF 仍可读文本层。
+            每轮媒体数建议 1-3：一段 10 分钟的音频转写要几十秒，设太大会把一轮学习拖长。
+          </div>
+          <button class="btn primary" id="btn-save-cfg-media" style="margin-top:6px">保存多模态设置</button>
+        </div>
+
+        <div class="card" style="margin-top:14px">
           <div class="card-title">数据备份与恢复<span class="tag">一键导出</span></div>
           <div class="field-row" style="grid-template-columns:1fr auto;align-items:end">
             <label class="field"><span>备份备注（可选，如「升级前」）</span><input id="bak-label" placeholder="留空则只按时间命名" /></label>
@@ -628,7 +918,7 @@
 
 <div class="toast-wrap" id="toasts"></div>
   <!-- ---------- OCR 识别与校对抽屉 ---------- -->
-  <div class="drawer" id="ocr-drawer">
+  <div class="drawer" id="ocr-drawer" role="dialog" aria-modal="true" aria-label="OCR 识别与校对">
     <div class="drawer-head">
       <div>
         <div class="t" id="ocr-title">—</div>
@@ -666,7 +956,7 @@
   </div>
 
   <!-- ---------- 新手上路引导 ---------- -->
-  <div class="modal-mask" id="onboarding" hidden>
+  <div class="modal-mask" id="onboarding" hidden role="dialog" aria-modal="true" aria-label="新手上路引导">
     <div class="modal">
       <div class="modal-head">
         <div class="brand-mark" style="width:36px;height:36px;font-size:19px">E</div>
@@ -689,7 +979,7 @@
 
   <!-- ---------- 知识点详情（右侧抽屉） ---------- -->
   <div class="pdrawer-mask" id="pt-mask" hidden></div>
-  <aside class="pdrawer" id="pt-drawer" hidden aria-label="知识点详情">
+  <aside class="pdrawer" id="pt-drawer" hidden role="dialog" aria-modal="true" aria-label="知识点详情">
     <div class="pdrawer-head">
       <div class="pdrawer-title">知识点详情</div>
       <button class="btn sm" id="pt-close">关闭</button>
@@ -697,6 +987,6 @@
     <div class="pdrawer-body" id="pt-body"></div>
   </aside>
 
-<script src="/static/app.js?v=18"></script>
+<script src="/static/app.js?v=21"></script>
 </body>
 </html>

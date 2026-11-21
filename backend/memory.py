@@ -14,14 +14,68 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from . import config, llm
+from . import config, event_ops, evidence, llm, review_pipeline, topics
 
 _lock = threading.RLock()
 _local = threading.local()
 _vec_cache: dict[int, "_VecStore"] | None = None
 _cache_lock = threading.RLock()
 
+#: 面向 API 的知识点列（不含 embedding BLOB）。生命周期与证据列一并返回，
+#: 前端与训练导出才能看到「这条知识有没有原文依据、被改过几次、现在什么状态」。
+_POINT_COLUMNS = (
+    "id,topic,claim,detail,source_url,source_title,source_kind,tags,confidence,"
+    "created_at,evidence,evidence_locator,evidence_hash,status,revision,"
+    "created_by,model_version,embed_model_version,verification,supersedes,"
+    "updated_at,reviewed_at,archived_at"
+)
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS cleanup_runs (
+    id TEXT PRIMARY KEY, created_at REAL, removed INTEGER, restored_at REAL
+);
+CREATE TABLE IF NOT EXISTS cleanup_archive (
+    run_id TEXT NOT NULL, point_id TEXT NOT NULL, kept_id TEXT NOT NULL,
+    row_json TEXT NOT NULL, embedding BLOB, PRIMARY KEY(run_id,point_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cleanup_point ON cleanup_archive(point_id);
+CREATE INDEX IF NOT EXISTS idx_cleanup_kept ON cleanup_archive(kept_id);
+CREATE TABLE IF NOT EXISTS knowledge_provenance (
+    id TEXT PRIMARY KEY, point_id TEXT NOT NULL, row_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provenance_point ON knowledge_provenance(point_id);
+CREATE TABLE IF NOT EXISTS refinements (
+    id TEXT PRIMARY KEY, topic TEXT NOT NULL, items TEXT NOT NULL,
+    sources TEXT NOT NULL, input_ids TEXT NOT NULL, input_count INTEGER,
+    before_chars INTEGER, after_chars INTEGER, created_at REAL
+);
+CREATE TABLE IF NOT EXISTS refinement_coverage (
+    point_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, refinement_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS refinement_books (
+    refinement_id TEXT PRIMARY KEY, book_id TEXT NOT NULL, book_title TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS learned_documents (
+    url TEXT NOT NULL, topic TEXT NOT NULL, learned_at REAL,
+    PRIMARY KEY (url, topic)
+);
+CREATE TABLE IF NOT EXISTS document_attempts (
+    url TEXT NOT NULL, topic TEXT NOT NULL, attempts INTEGER DEFAULT 1,
+    yielded INTEGER DEFAULT 0, first_at REAL, last_at REAL,
+    -- D8：三段漏斗分别记数。yielded 只表示「这篇有没有实际产出」，
+    -- candidates/verified/ingested 才是 12→5→2 的可核对口径。
+    candidates INTEGER DEFAULT 0, verified INTEGER DEFAULT 0,
+    ingested INTEGER DEFAULT 0,
+    PRIMARY KEY (url, topic)
+);
+-- 选资料时的查询形状是 (topic=?, url IN (...), last_at>=?)：
+-- 主题定范围 → URL 精确命中 → 时间过滤，列顺序必须照这个来。
+-- 早期版本建的是 (topic,last_at)，URL 只能回表逐行比，台账涨到十万级就明显变慢。
+CREATE INDEX IF NOT EXISTS idx_attempts_lookup ON document_attempts(topic, url, last_at);
+CREATE TABLE IF NOT EXISTS learning_queries (
+    topic TEXT NOT NULL, query TEXT NOT NULL, used_at REAL,
+    PRIMARY KEY (topic, query)
+);
 CREATE TABLE IF NOT EXISTS knowledge (
     id TEXT PRIMARY KEY,
     topic TEXT NOT NULL,
@@ -35,11 +89,73 @@ CREATE TABLE IF NOT EXISTS knowledge (
     embedding BLOB,
     session_id TEXT DEFAULT '',
     book_id TEXT DEFAULT '',
-    created_at REAL
+    created_at REAL,
+    -- Knowledge-engineering foundation. Definitions live in evidence.KNOWLEDGE_COLUMNS
+    -- so a fresh DB and a migrated DB always end up with identical columns.
+    evidence TEXT DEFAULT '',
+    evidence_locator TEXT DEFAULT '',
+    evidence_hash TEXT DEFAULT '',
+    status TEXT DEFAULT 'unverified',
+    revision INTEGER DEFAULT 1,
+    created_by TEXT DEFAULT '',
+    model_version TEXT DEFAULT '',
+    embed_model_version TEXT DEFAULT '',
+    verification TEXT DEFAULT '',
+    supersedes TEXT DEFAULT '',
+    updated_at REAL,
+    reviewed_at REAL,
+    archived_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_k_topic ON knowledge(topic);
 CREATE INDEX IF NOT EXISTS idx_k_created ON knowledge(created_at);
 CREATE INDEX IF NOT EXISTS idx_k_book ON knowledge(book_id);
+-- status / verification 的索引不能放在这里：老库首次启动时
+-- CREATE TABLE IF NOT EXISTS knowledge 是 no-op，表上还没有这两列，
+-- executescript 会在 _upgrade() 之前抛 "no such column: status"。
+-- 改由 _upgrade() 补完列后按 POST_UPGRADE_INDEXES 创建。
+
+-- Immutable pre-change images. Rows are INSERT-only; corrections never erase history.
+CREATE TABLE IF NOT EXISTS knowledge_revisions (
+    revision_id TEXT PRIMARY KEY,
+    point_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    row_json TEXT NOT NULL,
+    changed_at REAL,
+    actor TEXT DEFAULT '',
+    reason TEXT DEFAULT '',
+    kind TEXT DEFAULT 'update'
+);
+CREATE INDEX IF NOT EXISTS idx_rev_point ON knowledge_revisions(point_id, changed_at);
+CREATE TABLE IF NOT EXISTS knowledge_feedback (
+    id TEXT PRIMARY KEY,
+    point_id TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    note TEXT DEFAULT '',
+    created_at REAL,
+    actor TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_fb_point ON knowledge_feedback(point_id, created_at);
+CREATE TABLE IF NOT EXISTS knowledge_verifications (
+    id TEXT PRIMARY KEY,
+    point_id TEXT NOT NULL,
+    method TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    model TEXT DEFAULT '',
+    detail TEXT DEFAULT '',
+    created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_ver_point ON knowledge_verifications(point_id, created_at);
+CREATE TABLE IF NOT EXISTS source_checks (
+    url TEXT PRIMARY KEY,
+    last_checked_at REAL,
+    status TEXT DEFAULT 'unknown',
+    note TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL
+);
 
 CREATE TABLE IF NOT EXISTS documents (
     url TEXT PRIMARY KEY,
@@ -74,6 +190,48 @@ CREATE TABLE IF NOT EXISTS resources (
     created_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS curriculum_runs (
+    id TEXT PRIMARY KEY,
+    seed TEXT NOT NULL,
+    status TEXT DEFAULT 'running',
+    rounds_per_direction INTEGER DEFAULT 100,
+    total_limit INTEGER DEFAULT 300,
+    subdirection_count INTEGER DEFAULT 6,
+    total_rounds INTEGER DEFAULT 0,
+    started_at REAL,
+    ended_at REAL,
+    stop_reason TEXT DEFAULT '',
+    summary TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS curriculum_directions (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    seq INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending',
+    rounds INTEGER DEFAULT 0,
+    points INTEGER DEFAULT 0,
+    first_round INTEGER DEFAULT 0,
+    last_round INTEGER DEFAULT 0,
+    added_at REAL,
+    note TEXT DEFAULT '',
+    sessions TEXT DEFAULT '[]',
+    session_total INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_cd_run ON curriculum_directions(run_id);
+
+CREATE TABLE IF NOT EXISTS curriculum_switches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    ts REAL,
+    from_direction TEXT DEFAULT '',
+    to_direction TEXT DEFAULT '',
+    reason TEXT DEFAULT '',
+    at_round INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_cs_run ON curriculum_switches(run_id);
+
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL,
@@ -81,35 +239,264 @@ CREATE TABLE IF NOT EXISTS events (
     message TEXT,
     payload TEXT DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS maintenance (
+    name TEXT PRIMARY KEY, done_at REAL
+);
+""" + event_ops._SCHEMA + topics._SCHEMA + review_pipeline._SCHEMA + """
 """
+
+# 依赖「迁移后才存在」的列的索引。绝不能并入 SCHEMA：真实老库第一次启动时
+# CREATE TABLE IF NOT EXISTS knowledge 是 no-op，此时表上还没有 status /
+# verification，executescript 会直接抛 sqlite3.OperationalError，整个 conn()
+# 起不来，_upgrade() 根本没机会执行。补列完成后再逐条确认并创建。
+POST_UPGRADE_INDEXES = (
+    ("idx_k_status", "status"),
+    ("idx_k_verification", "verification"),
+)
 
 
 def _upgrade(c: sqlite3.Connection) -> None:
     """给老库补列（CREATE TABLE IF NOT EXISTS 不会加列）。
 
-    book_id 原本由 library.init_db() 用 ALTER 添加，但 knowledge 表现在由
-    memory 自己写入，必须保证任何一条连接拿到的表都有这一列。
-    索引不用在这里建：SCHEMA 里的 CREATE INDEX IF NOT EXISTS 每次建连接都会跑。
+    不依赖新列的索引由 SCHEMA 的 CREATE INDEX IF NOT EXISTS 每次建连接时维护；
+    依赖新列的 status / verification 索引必须等本函数补完列再建（见
+    POST_UPGRADE_INDEXES），否则老库会在 executescript 阶段就启动失败。
+    所有变更都是 additive，不删列、不重建表、不改已有行的内容；唯一的例外是
+    首次迁移时把「迁移前就存在的行」如实标成 legacy，并把 detail 里嵌的
+    引文抽到独立的 evidence 列。
+    """
+    for sql in (
+        "ALTER TABLE knowledge ADD COLUMN book_id TEXT DEFAULT ''",
+        # 方向轮换每批学完记一次会话 id，方便从汇总跳回具体学习记录
+        "ALTER TABLE curriculum_directions ADD COLUMN sessions TEXT DEFAULT '[]'",
+        # 会话明细只留最近 20 条，总数单独记，避免截断后统计偏小
+        "ALTER TABLE curriculum_directions ADD COLUMN session_total INTEGER DEFAULT 0",
+        # D8：老库补三段漏斗列（additive，不改已有行）
+        "ALTER TABLE document_attempts ADD COLUMN candidates INTEGER DEFAULT 0",
+        "ALTER TABLE document_attempts ADD COLUMN verified INTEGER DEFAULT 0",
+        "ALTER TABLE document_attempts ADD COLUMN ingested INTEGER DEFAULT 0",
+    ):
+        try:
+            c.execute(sql)
+        except Exception:  # noqa: BLE001  列已存在
+            pass
+
+    # knowledge 的证据 / 生命周期列：单一真源在 evidence.KNOWLEDGE_COLUMNS，
+    # 避免 SCHEMA（新库）与 ALTER（老库）各写一份后悄悄漂移。
+    try:
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(knowledge)")}
+    except Exception:  # noqa: BLE001
+        cols = set()
+    first_migration = bool(cols) and "status" not in cols
+    for name, decl in evidence.KNOWLEDGE_COLUMNS:
+        if name in cols:
+            continue
+        try:
+            c.execute(f"ALTER TABLE knowledge ADD COLUMN {name} {decl}")
+        except Exception:  # noqa: BLE001  列已存在 / 简化测试表
+            pass
+
+    # 索引必须晚于 ALTER TABLE。逐列复查而不是无条件建：某些测试会造一张
+    # 极简 knowledge 表，ALTER 失败时这里也不该把建连接拖垮。
+    try:
+        cols_after = {r["name"] for r in c.execute("PRAGMA table_info(knowledge)")}
+    except Exception:  # noqa: BLE001
+        cols_after = set()
+    for idx_name, col_name in POST_UPGRADE_INDEXES:
+        if col_name not in cols_after:
+            continue
+        try:
+            c.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON knowledge({col_name})")
+        except Exception:  # noqa: BLE001  索引不该挡住建连接
+            pass
+
+    if first_migration:
+        _backfill_legacy_points(c)
+    # 引文抽取用独立的一次性标记：某个中间版本若只抽到带换行的那批，
+    # 下次启动仍能补抽剩下 97.7%，且不会覆盖已有 evidence 或用户纠错。
+    _extract_legacy_evidence(c)
+    try:
+        c.execute(
+            "INSERT INTO schema_meta(key,value,updated_at) VALUES('schema_version',?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (str(evidence.SCHEMA_VERSION), time.time()),
+        )
+    except Exception:  # noqa: BLE001  元信息不该挡住建连接
+        pass
+
+    # 旧索引 (topic,last_at) 对现在的查询只剩「主题定范围」这点用处，
+    # 换成 (topic,url,last_at) 后 URL 也能走索引，不必回表逐行比较。
+    try:
+        c.execute("DROP INDEX IF EXISTS idx_attempts_topic")
+    except Exception:  # noqa: BLE001  旧库可能没有
+        pass
+    _backfill_attempts(c)
+    _daily_maintenance(c)
+
+
+def _backfill_legacy_points(c: sqlite3.Connection) -> None:
+    """首次迁移：把「迁移前就存在的行」如实标成 legacy。
+
+    只负责状态标注；引文抽取拆到 _extract_legacy_evidence()，两者用不同的
+    maintenance 标记，这样即使某个中间版本漏抽过引文，也能独立补抽一次。
     """
     try:
-        c.execute("ALTER TABLE knowledge ADD COLUMN book_id TEXT DEFAULT ''")
-    except Exception:  # noqa: BLE001  列已存在
+        claimed = c.execute(
+            "INSERT OR IGNORE INTO maintenance(name,done_at) "
+            "VALUES('knowledge_legacy_migration',?)", (time.time(),),
+        ).rowcount
+        if not claimed:
+            return
+        c.execute(
+            "UPDATE knowledge SET status='legacy' "
+            "WHERE status IS NULL OR status='' OR status='unverified'"
+        )
+    except Exception:  # noqa: BLE001  标注失败只影响统计，不该挡住服务
+        pass
+
+
+def _extract_legacy_evidence(c: sqlite3.Connection) -> None:
+    """把 detail 里嵌的历史引文抽成独立列（v2：识别全部历史格式）。
+
+    真实库实测：21138 条里有 3440 条（16.3%）在 detail 中拼了「原文依据：」，
+    其中仅 79 条前缀是换行、3361 条前缀是空格。旧规则只认 ``\\n原文依据：``，
+    会把 97.7% 的历史引文永远留在自由文本里，证据覆盖率被低估成 0.4%。
+    写入规范仍是 EVIDENCE_MARKER（带换行），读取用 EVIDENCE_ANCHOR（不带前缀
+    空白），互不干扰。
+
+    不重跑字面校验（原文快照没落库，无法复核），所以 verification 记为
+    legacy_embedded 而不是 literal_pass —— 不假装这些引文现在已被验证。
+    ``COALESCE(revision,1)<=1`` 保证不会把用户通过纠错接口清掉 evidence 的
+    行又填回去。
+    """
+    try:
+        claimed = c.execute(
+            "INSERT OR IGNORE INTO maintenance(name,done_at) "
+            "VALUES('knowledge_evidence_extract_v2',?)", (time.time(),),
+        ).rowcount
+        if not claimed:
+            return
+        anchor = evidence.EVIDENCE_ANCHOR
+        c.execute(
+            "UPDATE knowledge SET "
+            "evidence=TRIM(SUBSTR(detail, INSTR(detail, ?) + LENGTH(?))),"
+            " verification='legacy_embedded' "
+            "WHERE INSTR(detail, ?) > 0 AND COALESCE(evidence,'')='' "
+            "AND COALESCE(revision,1)<=1",
+            (anchor, anchor, anchor),
+        )
+        rows = c.execute(
+            "SELECT id,evidence,source_url FROM knowledge "
+            "WHERE COALESCE(evidence,'')<>'' AND COALESCE(evidence_hash,'')=''"
+        ).fetchall()
+        c.executemany(
+            "UPDATE knowledge SET evidence_hash=?,evidence_locator=? WHERE id=?",
+            [(evidence.sha256(r["evidence"]),
+              evidence.locator_for(r["source_url"] or "", "", r["evidence"]),
+              r["id"]) for r in rows],
+        )
+    except Exception:  # noqa: BLE001  回填失败只影响统计，不该挡住服务
+        pass
+
+
+def _backfill_attempts(c: sqlite3.Connection) -> None:
+    """老库一次性补台账：把 documents 里「抓过但没产出知识」的记录搬进 document_attempts。
+
+    不补的话，升级前就读过的页面仍会被反复抓取（实测 871/976 篇处于这种状态），
+    前 7 天白读的功夫要等新台账慢慢积累才止血。last_at 用真实抓取时间，
+    所以「早就读过」的页面会自然过期，不会被误锁。
+
+    两个边界：
+      - 只补**还在重读窗口内**的记录。窗口外的记录就算补进去，查询时也会因为
+        `last_at` 太旧而被过滤掉，纯属往库里写死数据。
+      - 最多补 20000 条。台账补写发生在建连接时，大库上无上限的 INSERT…SELECT
+        会让第一个请求等上几秒。这里不排序：`ORDER BY fetched_at` 会强制对全表
+        排序（实测 976 行就从 7ms 涨到 63ms），而窗口过滤本身已经把量收住了。
+    """
+    try:
+        claimed = c.execute(
+            "INSERT OR IGNORE INTO maintenance(name,done_at) VALUES('attempts_backfill',?)",
+            (time.time(),),
+        ).rowcount
+        if not claimed:
+            return
+        window = max(1.0, float(config.get("doc_retry_days", 7))) * 86400
+        since = time.time() - window
+        c.execute(
+            "INSERT INTO document_attempts(url,topic,attempts,yielded,first_at,last_at)"
+            " SELECT d.url, d.topic, 1, 0, d.fetched_at, d.fetched_at FROM documents d"
+            " WHERE d.ok=1 AND d.url<>'' AND d.topic<>'' AND d.fetched_at>=?"
+            "   AND NOT EXISTS (SELECT 1 FROM learned_documents l"
+            "                   WHERE l.url=d.url AND l.topic=d.topic)"
+            " LIMIT 20000"
+            " ON CONFLICT(url,topic) DO NOTHING",
+            (since,),
+        )
+    except Exception:  # noqa: BLE001  台账只是加速，坏了不该挡住建连接
+        pass
+
+
+#: 主库文件被整体替换（备份恢复）后自增。各线程下次取连接时若发现代次
+#: 落后，就丢弃旧连接重建，避免继续往被 os.replace 换掉的旧 inode 上写。
+_db_generation = 0
+_db_generation_lock = threading.Lock()
+_wal_initialized = False
+
+
+def bump_db_generation() -> None:
+    """通知所有线程：主库已被替换，下次取连接必须重建。
+
+    换库同时意味着所有「从库派生」的进程内缓存都已失效：向量矩阵与主题索引
+    按 rowid 指向旧库的行、检索结果缓存是旧库的结果、stats / 分析聚合按版本号
+    键控。原来这里只换连接，备份恢复后检索仍拿旧向量去新库按 rowid 取行（结果
+    张冠李戴），版本号也不前进——前端据 ver 判断「库没变」，整轮跳过刷新，
+    与恢复接口返回的「页面数据将在数秒内自动刷新」相矛盾。
+    """
+    global _db_generation, _wal_initialized
+    with _db_generation_lock:
+        _db_generation += 1
+        # 备份快照是 journal_mode=DELETE 的单文件，换库后必须重新设 WAL。
+        _wal_initialized = False
+    _invalidate()
+    _bump_search_cache()
+    _bump_version()
+    try:
+        # 词法索引是独立文件，只按行数判断漂移；行数相同的两份库会被误认为一致
+        from . import search_index
+        search_index.mark_stale()
+    except Exception:  # noqa: BLE001  索引坏了不该挡住换库
         pass
 
 
 def conn() -> sqlite3.Connection:
     """每个线程独立连接。SQLite 连接不能跨线程共享，否则并发写会事务冲突。"""
+    global _wal_initialized
+    # 代次只快照一次：bump_db_generation 可能在建连期间发生，若比较与
+    # 赋值分别读全局，就会把「新连接」登记成旧代次（或反之）而反复重建。
+    gen_now = _db_generation
     c = getattr(_local, "c", None)
-    if c is None:
+    gen = getattr(_local, "gen", -1)
+    if c is None or gen != gen_now:
+        if c is not None:
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001  旧连接已失效，关不掉也不影响重建
+                pass
         c = sqlite3.connect(config.DB_FILE, check_same_thread=False, timeout=30.0)
         c.row_factory = sqlite3.Row
-        c.execute("PRAGMA journal_mode=WAL")
+        with _db_generation_lock:
+            wal_ready = _wal_initialized
+        if not wal_ready:
+            c.execute("PRAGMA journal_mode=WAL")
+            with _db_generation_lock:
+                _wal_initialized = True
         c.execute("PRAGMA synchronous=NORMAL")
         c.execute("PRAGMA busy_timeout=20000")
         c.executescript(SCHEMA)
         _upgrade(c)
         c.commit()
         _local.c = c
+        _local.gen = gen_now
     return c
 
 
@@ -119,10 +506,17 @@ def conn() -> sqlite3.Connection:
 def log_event(kind: str, message: str, payload: dict | None = None) -> None:
     try:
         c = conn()
+        now = time.time()
         c.execute(
             "INSERT INTO events(ts, kind, message, payload) VALUES (?,?,?,?)",
-            (time.time(), kind, message, json.dumps(payload or {}, ensure_ascii=False)),
+            (now, kind, message, json.dumps(payload or {}, ensure_ascii=False)),
         )
+        # A6：同一事务里更新 (天,kind) 计数，跨阈值产出一条聚合告警。
+        # 台账是旁路能力，失败绝不能影响主日志写入。
+        try:
+            event_ops.note(c, kind, message, now)
+        except Exception:  # noqa: BLE001
+            pass
         c.commit()
     except Exception:
         pass
@@ -155,9 +549,345 @@ def recent_events(limit: int = 100) -> list[dict]:
 # --------------------------------------------------------------------------
 # 文档去重
 # --------------------------------------------------------------------------
-def doc_seen(url: str) -> bool:
-    row = conn().execute("SELECT ok FROM documents WHERE url=?", (url,)).fetchone()
-    return bool(row and row["ok"])
+def doc_seen(url: str, topic: str | None = None) -> bool:
+    # A readable page is not necessarily learned. Scope completion to the topic.
+    sql = "SELECT 1 FROM learned_documents WHERE url=?"
+    args = [url]
+    if topic is not None:
+        sql += " AND topic=?"
+        args.append(topic)
+    return bool(conn().execute(sql, args).fetchone())
+
+
+def mark_learned(url: str, topic: str) -> None:
+    c = conn()
+    with c:
+        c.execute("INSERT OR REPLACE INTO learned_documents VALUES (?,?,?)", (url, topic, time.time()))
+
+
+# --------------------------------------------------------------------------
+# 摄取台账：这篇资料在这个方向下「读过并提炼过」了没有
+# --------------------------------------------------------------------------
+# 与 learned_documents 的分工：
+#   learned_documents  = 真的产出了知识（语义是「学到了」，问答/统计都看它）
+#   document_attempts  = 读过了、提炼过了（语义是「这次别再花一遍钱」）
+#
+# 为什么必须分开：抓取成功但提炼出 0 条的页面（营销页、目录页、讲得太浅的教程）
+# 不进 learned_documents，于是下一轮又被当成新资料抓一遍、提炼一遍。
+# 实测库里有 871/976 个成功抓取的页面处于这种状态；某个方向 67 个 URL
+# 被重复抓了 475 次、跑了 400 多轮，只换回 48 条知识。台账就是用来止血的。
+def _counts(value) -> dict[str, int]:
+    """接受 {url: n} 或 URL 列表，统一成 {url: n}。
+
+    老调用方只传 URL 列表（等价于每条 1）；新调用方从 evolve 传按 URL 聚合的
+    真实计数，才能记出「12 候选 → 5 核对 → 2 入库」。
+    """
+    out: dict[str, int] = {}
+    if not value:
+        return out
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k:
+                try:
+                    out[str(k)] = max(0, int(v))
+                except (TypeError, ValueError):
+                    pass
+    else:
+        for k in value:
+            if k:
+                out[str(k)] = out.get(str(k), 0) + 1
+    return out
+
+
+def record_attempts(urls: list[str], topic: str, *, yielded: list[str] | tuple = (),
+                    learned: list[str] | tuple = (), candidates=None,
+                    verified=None, ingested=None) -> None:
+    """记录一批「已提炼过」的资料，并把三段漏斗分别落列（D8）。
+
+    * `candidates`：模型提炼出的候选数（核对前）
+    * `verified`  ：通过证据核对的候选数
+    * `ingested`  ：去重后**真正写进 knowledge 表**的条数
+    * `yielded`   ：有没有实际入库（布尔标记，供旧界面兼容）
+    * `learned`   ：真正产出了知识的 URL，同时写进 learned_documents
+
+    原实现把 ``good = {p["source_url"] for p in all_cands}`` —— 核对后、
+    去重前的**全部候选**——同时喂给 yielded 和 learned，于是被驳回或被判
+    dup 的候选，其来源仍被记成「产出了知识」，产出率系统性偏高，且
+    learned_documents 会把「只提炼出重复知识」的页面标成已学。
+
+    两张表放进同一个事务：分两次提交时，进程在中间退出会留下「台账说读过了、
+    已学表却没有」的错位，之后这篇资料既不会被跳过、也不会被当成已学，
+    统计和跳过逻辑各自看到一半事实。
+    """
+    clean = [u for u in dict.fromkeys(urls) if u]
+    got = [u for u in dict.fromkeys(learned) if u]
+    cand, ver, ing = _counts(candidates), _counts(verified), _counts(ingested)
+    if not clean and not got:
+        return
+    # 没传新口径时保持向后兼容：旧调用方传的 yielded 仍决定产出标记。
+    good = set(ing) if ingested is not None else set(yielded)
+    now = time.time()
+    # 与 add_points_batch / 清理任务共用同一把写锁：两个线程同时开事务，
+    # SQLite 会以 database is locked 报错，而台账写失败虽已降级，
+    # 但没必要让它频繁失败（用户会在日志里看到一堆警告）。
+    with _lock:
+        c = conn()
+        _write_attempts(c, clean, topic, good, now, got, cand, ver, ing)
+
+
+def _write_attempts(c, clean, topic, good, now, got, cand=None, ver=None, ing=None) -> None:
+    cand, ver, ing = cand or {}, ver or {}, ing or {}
+    with c:
+        if clean:
+            rows = [(u, topic, 1 if u in good else 0,
+                     int(cand.get(u, 0)), int(ver.get(u, 0)), int(ing.get(u, 0)),
+                     now, now) for u in clean]
+            try:
+                c.executemany(
+                    "INSERT INTO document_attempts(url,topic,attempts,yielded,"
+                    "candidates,verified,ingested,first_at,last_at)"
+                    " VALUES (?,?,1,?,?,?,?,?,?)"
+                    " ON CONFLICT(url,topic) DO UPDATE SET"
+                    " attempts=attempts+1,"
+                    " yielded=MAX(yielded, excluded.yielded),"
+                    " candidates=candidates+excluded.candidates,"
+                    " verified=verified+excluded.verified,"
+                    " ingested=ingested+excluded.ingested,"
+                    " last_at=excluded.last_at",
+                    rows,
+                )
+            except sqlite3.OperationalError:
+                # 极简测试库或尚未迁移的老库：退回六列写法，台账不丢。
+                c.executemany(
+                    "INSERT INTO document_attempts(url,topic,attempts,yielded,first_at,last_at)"
+                    " VALUES (?,?,1,?,?,?)"
+                    " ON CONFLICT(url,topic) DO UPDATE SET"
+                    " attempts=attempts+1,"
+                    " yielded=MAX(yielded, excluded.yielded),"
+                    " last_at=excluded.last_at",
+                    [(u, topic, 1 if u in good else 0, now, now) for u in clean],
+                )
+        if got:
+            c.executemany(
+                "INSERT OR REPLACE INTO learned_documents(url,topic,learned_at) VALUES (?,?,?)",
+                [(u, topic, now) for u in got],
+            )
+
+
+def attempted_urls(urls: list[str], topic: str, *, days: float | None = None) -> set[str]:
+    """这批 URL 里，哪些在 days 天内已经提炼过（调用方据此跳过，不再抓取+提炼）。
+
+    一次查询批量判断：原来每个候选都要单独 `doc_seen()` 打一次库，
+    一轮 24 个候选就是 24 次往返。
+    """
+    clean = [u for u in dict.fromkeys(urls) if u]
+    if not clean or not topic:
+        return set()
+    if days is None:
+        days = float(config.get("doc_retry_days", 7))
+    if float(days) <= 0:
+        # 显式「关掉台账」：原来靠 since=now 让查询永远查不到，语义含糊，
+        # 换台机器时钟精度不同就可能漏出一条。
+        return set()
+    since = time.time() - float(days) * 86400
+    out: set[str] = set()
+    c = conn()
+    # SQLite 的变量上限是 999，分批查（正常一轮只有几十个）
+    for i in range(0, len(clean), 500):
+        part = clean[i:i + 500]
+        marks = ",".join("?" * len(part))
+        for r in c.execute(
+            f"SELECT url FROM document_attempts WHERE topic=? AND last_at>=? AND url IN ({marks})",
+            (topic, since, *part),
+        ):
+            out.add(r["url"])
+    return out
+
+
+def docs_learned(urls: list[str], topic: str) -> set[str]:
+    """这批 URL 里哪些已经产出过知识（learned_documents）。
+
+    与 `doc_seen()` 同义，只是批量：一轮几十个候选逐个 `doc_seen()` 就是几十次
+    数据库往返，而它们的查询形状完全一样，合并成一次 IN 查询即可。
+    """
+    clean = [u for u in dict.fromkeys(urls) if u]
+    if not clean or not topic:
+        return set()
+    out: set[str] = set()
+    c = conn()
+    for i in range(0, len(clean), 500):
+        part = clean[i:i + 500]
+        marks = ",".join("?" * len(part))
+        for r in c.execute(
+            f"SELECT url FROM learned_documents WHERE topic=? AND url IN ({marks})",
+            (topic, *part),
+        ):
+            out.add(r["url"])
+    return out
+
+
+#: 台账保留天数。超过这个时间的记录删掉：内容早该重读了，留着只会让表只增不减。
+ATTEMPT_KEEP_DAYS = 180
+_PRUNE_INTERVAL = 86400.0
+
+
+def prune_attempts(keep_days: int = ATTEMPT_KEEP_DAYS) -> int:
+    """删掉过期台账，返回删除行数（每天最多跑一次，见 _daily_maintenance）。"""
+    cutoff = time.time() - max(30, int(keep_days)) * 86400
+    c = conn()
+    with c:
+        return c.execute("DELETE FROM document_attempts WHERE last_at < ?", (cutoff,)).rowcount
+
+
+#: 每天最多清掉多少行。批量清而不是一次清空：清理发生在建连接时，
+#: 20 万行一次删要 186ms，会直接压到第一个请求上；而正常使用每天只新增
+#: 千行量级，每天清 5000 行足够把表压在稳定规模，单次开销也只有几毫秒。
+_PRUNE_BATCH = 5000
+
+
+def _daily_maintenance(c: sqlite3.Connection) -> None:
+    """每天做一次的清理（有上限、可累积：历史积压分几天清完）。"""
+    try:
+        now = time.time()
+        row = c.execute("SELECT done_at FROM maintenance WHERE name='attempts_prune'").fetchone()
+        if row and now - (row[0] or 0) < _PRUNE_INTERVAL:
+            return
+        c.execute(
+            "DELETE FROM document_attempts WHERE rowid IN ("
+            " SELECT rowid FROM document_attempts WHERE last_at < ? LIMIT ?)",
+            (now - ATTEMPT_KEEP_DAYS * 86400, _PRUNE_BATCH),
+        )
+        c.execute("INSERT OR REPLACE INTO maintenance(name,done_at) VALUES('attempts_prune',?)", (now,))
+        # A6：events / learning_queries / sessions 按天搬进 ops_archive（无损）。
+        # 主表因此有上界，历史仍留在同一个库里可复查；批量上限避免首次启动卡死。
+        if bool(config.get("event_archive_enabled", True)):
+            event_ops.archive(c=c, dry_run=False,
+                              keep_days=int(config.get("event_keep_days", 30) or 30),
+                              batch=event_ops.ARCHIVE_BATCH)
+    except Exception:  # noqa: BLE001  清理失败不该挡住建连接
+        pass
+
+
+def acquisition_report(limit: int = 10) -> dict:
+    """获取效率概览 + D8 三段漏斗（attempted / verified / ingested）。
+
+    口径定义（写进接口，不再靠猜）：
+
+    * ``documents``：送进模型提炼过的资料数（去重后的 URL×方向）
+    * ``candidates``：模型提炼出的候选知识点总数（核对前）
+    * ``verified``  ：通过逐字引文/独立核查的候选数
+    * ``ingested``  ：去重后真正写入 knowledge 表的条数
+    * ``yield_rate``：**以实际入库为准**，= 有 ingested>0 的资料数 / documents
+    * ``funnel_rate``：= ingested / candidates，衡量「从候选到落库」的损耗
+
+    ``candidate_yield_rate`` 保留旧口径（任何候选即算产出）仅供对照；
+    旧口径正是评审 D8 指出的系统性偏高来源，不能当主指标。
+
+    老库升级时补进来的历史记录（只补「抓过但没产出」的那些）按无产出计，
+    所以升级初期会明显偏低，跑几轮之后才回归真实水平。
+    """
+    limit = max(1, min(int(limit), 50))
+    c = conn()
+    def _agg(sql: str, args: tuple = ()) -> dict:
+        try:
+            r = c.execute(sql, args).fetchone()
+            return dict(r) if r is not None else {}
+        except sqlite3.OperationalError:
+            return {}
+
+    total = _agg(
+        "SELECT COUNT(*) n, COALESCE(SUM(yielded),0) y, COALESCE(SUM(attempts),0) a,"
+        " COALESCE(SUM(candidates),0) c, COALESCE(SUM(verified),0) v,"
+        " COALESCE(SUM(ingested),0) i,"
+        " COALESCE(SUM(CASE WHEN ingested>0 THEN 1 ELSE 0 END),0) produced"
+        " FROM document_attempts"
+    )
+    rows = c.execute(
+        "SELECT topic, COUNT(*) n, COALESCE(SUM(yielded),0) y,"
+        " COALESCE(SUM(candidates),0) c, COALESCE(SUM(verified),0) v,"
+        " COALESCE(SUM(ingested),0) i FROM document_attempts"
+        " GROUP BY topic ORDER BY n DESC LIMIT ?", (limit,)
+    ).fetchall() if total else []
+    docs = int(total.get("n") or 0)
+    yielded = int(total.get("y") or 0)
+    candidates = int(total.get("c") or 0)
+    verified = int(total.get("v") or 0)
+    ingested = int(total.get("i") or 0)
+    produced = int(total.get("produced") or 0)
+    # 老库升级 / 旧调用方没有三段漏斗数据时，ingested 恒为 0。此时若直接按
+    # produced/docs 算，产出率会一夜之间掉成 0%——这是口径切换造成的假象，
+    # 不是知识获取真的停了。明确标成 legacy 口径回退，等新链路跑出第一批
+    # candidates/ingested 数据后自动切到主指标。
+    legacy_only = (candidates == 0 and ingested == 0)
+    basis = "legacy_yielded" if legacy_only else "actual_ingested"
+    rate = (yielded if legacy_only else produced) / docs if docs else 0.0
+    return {
+        "documents": docs,
+        "yielded": yielded,
+        "attempts": int(total.get("a") or 0),
+        "candidates": candidates,
+        "verified": verified,
+        "ingested": ingested,
+        "produced_documents": produced,
+        # 主指标：只认实际入库；无新口径数据时回退（见 basis）
+        "yield_rate": round(rate, 3),
+        "funnel_rate": round(ingested / candidates, 3) if candidates else 0.0,
+        "candidate_yield_rate": round(yielded / docs, 3) if docs else 0.0,
+        "metric_basis": basis,
+        "funnel": {"attempted": docs, "candidates": candidates,
+                   "verified": verified, "ingested": ingested},
+        "retry_days": config.get("doc_retry_days", 7),
+        "topics": [
+            {"topic": r["topic"], "documents": int(r["n"] or 0),
+             "yielded": int(r["y"] or 0), "candidates": int(r["c"] or 0),
+             "verified": int(r["v"] or 0), "ingested": int(r["i"] or 0)}
+            for r in rows
+        ],
+    }
+
+
+def attempt_stats(topic: str | None = None) -> dict:
+    """台账概览（给界面显示「这个方向已经读过多少篇」）。"""
+    sql = ("SELECT COUNT(*) n, COALESCE(SUM(yielded),0) y, COALESCE(SUM(attempts),0) a,"
+           " COALESCE(SUM(candidates),0) c, COALESCE(SUM(verified),0) v,"
+           " COALESCE(SUM(ingested),0) i FROM document_attempts")
+    args: tuple = ()
+    if topic:
+        sql += " WHERE topic=?"
+        args = (topic,)
+    try:
+        row = conn().execute(sql, args).fetchone()
+        return {"documents": row["n"] or 0, "yielded": row["y"] or 0,
+                "attempts": row["a"] or 0, "candidates": row["c"] or 0,
+                "verified": row["v"] or 0, "ingested": row["i"] or 0}
+    except sqlite3.OperationalError:
+        row = conn().execute(
+            "SELECT COUNT(*) n, SUM(yielded) y, SUM(attempts) a FROM document_attempts"
+            + (" WHERE topic=?" if topic else ""), args).fetchone()
+        return {"documents": row["n"] or 0, "yielded": row["y"] or 0,
+                "attempts": row["a"] or 0, "candidates": 0, "verified": 0, "ingested": 0}
+
+
+def recent_queries(topic: str) -> list[str]:
+    return [r[0] for r in conn().execute(
+        "SELECT query FROM learning_queries WHERE topic=? ORDER BY used_at DESC LIMIT 24", (topic,)
+    )]
+
+
+def recent_gaps(topic: str) -> list[str]:
+    row = conn().execute("SELECT note FROM sessions WHERE direction=? AND note!='' ORDER BY started_at DESC LIMIT 1", (topic,)).fetchone()
+    try:
+        items = json.loads(row[0]) if row else []
+        return [s for s in items if isinstance(s, str)][:8] if isinstance(items, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def remember_queries(topic: str, queries: list[str]) -> None:
+    c = conn()
+    with c:
+        c.executemany("INSERT OR REPLACE INTO learning_queries VALUES (?,?,?)",
+                      [(topic, q, time.time()) for q in queries])
 
 
 def mark_doc(url: str, title: str, topic: str, chars: int, ok: bool) -> None:
@@ -188,14 +918,23 @@ class _VecStore:
     已有行之后，所以对外给出的 view 不会被后来的追加改写。
     """
 
-    __slots__ = ("ids", "_buf", "n")
+    __slots__ = ("ids", "_buf", "n", "_idset")
 
     def __init__(self, dim: int, cap: int = 0) -> None:
         self.ids: list[int] = []
         self._buf = np.zeros((max(cap, 1024), dim), dtype=np.float32)
         self.n = 0
+        #: rowid 集合（首次追加时懒建）。写路径是「提交 → 追加」两步，若另一线程
+        #: 恰好在两步之间重建了缓存，重建已读到这一行，追加就会再塞一份：
+        #: 同一 rowid 在矩阵里出现两次，top-k 少一条、相似邻居重复列出。
+        self._idset: set[int] | None = None
 
     def add(self, rowid: int, unit: np.ndarray) -> None:
+        if self._idset is None:
+            self._idset = set(self.ids)
+        if rowid in self._idset:
+            return
+        self._idset.add(rowid)
         if self.n == self._buf.shape[0]:
             grown = np.zeros((self._buf.shape[0] * 2, self._buf.shape[1]),
                              dtype=np.float32)
@@ -214,8 +953,20 @@ def _invalidate() -> None:
     with _cache_lock:
         _vec_cache = None
     _bump_topic_index()
+    _invalidate_light()
+
+
+def _invalidate_light() -> None:
+    """只作废「按库版本键控」的小缓存，保留向量矩阵与主题索引。
+
+    软删 / 状态迁移只改 status 列：向量、rowid、主题都没变，生命周期掩码
+    （_excluded_rowids）随版本号刷新即可把它排除。原来一律 _invalidate()，
+    下一次检索就要把整张表的 embedding 重读、重归一化（实测 2.5 万条 333ms）。
+    """
     # 近重复扫描按库版本缓存；测试换库时版本号会归零，必须显式清掉
     _dup_cache.update(ver=-1, thr=None, topic=None, val=None)
+    _dup_cache["epoch"] = _dup_cache.get("epoch", 0) + 1
+    _excluded_cache.update(ver=-1, ids=None)
     # 主题索引 / 向量缓存失效时，stats 的 SQL 部分也已与库不一致，一并作废
     _STATS_CACHE["db"] = None
 
@@ -308,7 +1059,9 @@ def _normalize(m: np.ndarray) -> np.ndarray:
 _topic_index: dict[str, set[int]] | None = None
 _topic_index_lock = threading.Lock()
 #: near_duplicates() 的版本键缓存：扫描是 O(Σ 主题内点数²)，库不变就不必重算。
-_dup_cache: dict = {"ver": -1, "thr": None, "topic": None, "val": None}
+_dup_cache: dict = {"ver": -1, "thr": None, "topic": None, "val": None, "epoch": 0}
+#: 近重复扫描专用锁：只串行化「同时打开整理面板」的重复扫描，不挡任何写入。
+_dup_lock = threading.Lock()
 # 压测/对照用：置 True 时 search(topic=) 退回「每次 DB 查询 + 矩阵复制」的旧路径
 _DISABLE_TOPIC_INDEX = False
 
@@ -344,6 +1097,39 @@ def _bump_topic_index() -> None:
     global _topic_index
     with _topic_index_lock:
         _topic_index = None
+
+
+# --------------------------------------------------------------------------
+# 生命周期过滤：归档 / 争议 / 已被取代的知识点不参与检索与训练
+# --------------------------------------------------------------------------
+# 软删之后行仍在表里、向量也还在缓存矩阵里，所以必须在相似度排序前用掩码
+# 排除，而不是等 SQL 取回结果再丢掉 —— 后者会让 top-k 被无效行占满、结果不足 k 条。
+# 排除集按库版本缓存；没有归档行时返回空集，热路径零额外开销。
+_excluded_cache: dict = {"ver": -1, "ids": None}
+_excluded_lock = threading.Lock()
+
+
+def _excluded_rowids() -> set[int]:
+    with _excluded_lock:
+        ver = version()
+        if _excluded_cache["ver"] != ver or _excluded_cache["ids"] is None:
+            try:
+                ids = {r[0] for r in conn().execute(
+                    "SELECT rowid FROM knowledge WHERE "
+                    "COALESCE(status,'legacy') IN ('archived','disputed','superseded')"
+                )}
+            except Exception:  # noqa: BLE001  老库 / 简化测试表
+                ids = set()
+            _excluded_cache.update(ver=ver, ids=ids)
+        return _excluded_cache["ids"]
+
+
+def active_mask(rowids: list[int]) -> "np.ndarray | None":
+    """布尔掩码：True 表示可检索。无排除行时返回 None（少一次矩阵运算）。"""
+    excluded = _excluded_rowids()
+    if not excluded:
+        return None
+    return np.array([rid not in excluded for rid in rowids], dtype=bool)
 
 
 def similarity(
@@ -390,6 +1176,9 @@ def similarity(
 # 知识库一旦变更就整体失效，保证结果永远和「冷算」一致。
 _search_cache: dict[tuple, list[dict]] = {}
 _search_cache_lock = threading.Lock()
+#: 作废代次。检索在开算前记下它，写回时代次变了就不写：否则「检索算到一半 →
+#: 另一线程提交写入并清空缓存 → 本次把旧结果写回」会让旧结果一直命中到下一次写入。
+_search_cache_gen = 0
 
 _perf = {
     "search_calls": 0,
@@ -418,8 +1207,10 @@ def record_status_poll(ms: float) -> None:
 
 def _bump_search_cache() -> None:
     """知识库变更后让检索结果缓存整体失效（结果已和库不一致）。"""
+    global _search_cache_gen
     with _search_cache_lock:
         _search_cache.clear()
+        _search_cache_gen += 1
 
 
 # --------------------------------------------------------------------------
@@ -453,8 +1244,11 @@ def _search_cache_get(query: str, topic: str | None, k: int) -> list[dict] | Non
     return _search_cache.get((query, topic, k))
 
 
-def _search_cache_put(query: str, topic: str | None, k: int, value: list[dict]) -> None:
+def _search_cache_put(query: str, topic: str | None, k: int, value: list[dict],
+                      gen: int | None = None) -> None:
     with _search_cache_lock:
+        if gen is not None and gen != _search_cache_gen:
+            return  # 计算期间缓存已被作废：这份结果可能早于那次写入，不能写回
         if len(_search_cache) > 2000:  # 防止内存无限增长
             _search_cache.clear()
         _search_cache[(query, topic, k)] = value
@@ -530,33 +1324,10 @@ def add_point(
     if not np.isfinite(norm) or norm == 0:
         raise ValueError("知识点向量的长度必须是有限正数")
 
-    # 推理在锁外；检查、插入与缓存失效必须串行，防止并发重复入库。
-    with _lock:
-        if dedup:
-            rowids, mat = _all_vectors(len(vec))
-            for rid, score in similarity(vec, rowids, mat, k=1, normalized=True):
-                if score >= config.get("dedup_threshold", 0.93):
-                    return None
-
-        pid = uuid.uuid4().hex[:16]
-        c = conn()
-        with c:
-            c.execute(
-                "INSERT INTO knowledge(id,topic,claim,detail,source_url,source_title,source_kind,"
-                "tags,confidence,embedding,session_id,book_id,created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (pid, topic, claim, detail, source_url, source_title, source_kind,
-                 json.dumps(list(tags), ensure_ascii=False), confidence,
-                 _to_blob(vec), session_id, book_id, time.time()),
-            )
-            rowid = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
-        # 增量追加，而不是把整份缓存作废（见 _append_vector）
-        _append_vector(rowid, vec)
-        # 检索结果缓存 / 主题索引已与库不一致，整体失效
-        _bump_search_cache()
-        _bump_topic_index()
-        _bump_version()
-        return pid
+    result = add_points_batch([dict(topic=topic, claim=claim, detail=detail, source_url=source_url,
+        source_title=source_title, source_kind=source_kind, tags=list(tags), confidence=confidence, vec=vec)],
+        session_id=session_id, book_id=book_id, dedup=dedup)
+    return result.get("ids", [None])[0] if result["added"] else None
 
 
 def add_points_batch(
@@ -566,29 +1337,26 @@ def add_points_batch(
     book_id: str = "",
     dedup: bool = True,
 ) -> dict:
-    """批量写入知识点：等价于逐条 add_point，但只做一次全库相似度 + 一次事务。
+    """统一批量入库：文本身份 + 全库/批内余弦查重，完整度优先合并。
 
-    逐条 add_point 在导入一本 240 点的书时，每写一条都做一次「全库向量相似度」
-    （N×D 矩阵乘一次只为了比一个查询向量），还要各自 commit 一次。导 240 条就是
-    240 次全矩阵乘 + 240 次事务提交，且随库内条数 N 线性变慢。
-
-    这里把所有候选的向量摞成 Q×D 矩阵：
-      - 全库去重：sims = mat @ Q.T（一次 N×D 乘 D×Q），取每列最大值 = 该候选与库内
-        最佳匹配，>= dedup_threshold 就丢 —— 与逐条 similarity(k=1) 完全等价；
-      - 批内去重：intra = Q @ Q.T 的上三角，取 i<j 的最大值，等价于「后写的候选与前
-        面已接受的候选比」；
-      - 接受的候选一次性 INSERT（单个事务），再逐个增量追加进向量缓存。
-
-    正确性：去重阈值、向量构造方式（claim + ' ' + detail[:400]）都与 add_point 一致，
-    只是把 N 次矩阵乘压成 2 次、N 次提交压成 1 次。
+    一次计算候选向量和相似度矩阵；查重、内容更新、来源记录和插入在同一事务中。
+    单条入口也调用这里，避免两个入口的去重与合并规则分叉。
     """
     valid: list[dict] = []
+    rejected = 0
     need_embed: list[int] = []
     texts: list[str] = []
     for p in points:
         claim = (p.get("claim") or "").strip()
         if len(claim) < 8:
             continue
+        # 单一入库网关：证据抽取、逐字校验、locator、模型版本、初始状态
+        # 都在这里定，网页 / 书库 / 炼化三条路径不可能再各写一套。
+        prepared = evidence.prepare_candidate(p)
+        if prepared is None:
+            rejected += 1          # 捏造引文，或开启了 require_evidence 却没引文
+            continue
+        p = prepared
         vec = p.get("vec")
         if vec is None:
             detail = (p.get("detail") or "")[:400]
@@ -603,7 +1371,8 @@ def add_points_batch(
         valid.append(p)
 
     if not valid:
-        return {"added": 0, "dup": 0, "skipped": 0, "accepted": []}
+        return {"added": 0, "dup": 0, "skipped": rejected, "rejected": rejected,
+                "accepted": []}
 
     # 没带向量的，批量算一次（与 add_point 内部 emb[0] 实现一致，且已被验证与
     # 逐条结果逐位相同）
@@ -627,85 +1396,30 @@ def add_points_batch(
         if v is None:
             continue
         arr = np.asarray(v, dtype=np.float32)
-        if arr.ndim != 1 or not arr.size or not np.isfinite(arr).all():
+        if (arr.ndim != 1 or not arr.size or not np.isfinite(arr).all()
+                or not np.isfinite(np.linalg.norm(arr)) or np.linalg.norm(arr) == 0):
             continue
         qvecs.append(arr)
         keep.append(p)
     if not qvecs:
-        return {"added": 0, "dup": 0, "skipped": len(valid), "accepted": []}
+        return {"added": 0, "dup": 0, "skipped": len(valid) + rejected,
+                "rejected": rejected, "accepted": []}
 
-    Q = _normalize(np.stack(qvecs, axis=0))  # Q×D 单位向量
-    Qq = Q.shape[0]
-    threshold = float(config.get("dedup_threshold", 0.93))
-
-    with _lock:
-        if dedup:
-            rowids, mat = _all_vectors(Q.shape[1])
-            # 全库去重：每列最大值 = 该候选与库内最佳匹配，等价 similarity(k=1)
-            existing_max = np.full(Qq, -1.0)
-            if rowids:
-                existing_max = (mat @ Q.T).max(axis=0)  # 一次 N×D @ D×Q
-            # 批内去重：用整批相似度矩阵（一次 Q×Q）做「顺序接受」，
-            # 严格复刻逐条 add_point 的语义——只跟「已接受」的候选比，
-            # 而不是跟全部候选比（否则会把「靠近会被丢弃的候选」的条目误删）。
-            intra = Q @ Q.T if Qq > 1 else np.zeros((1, 1))
-            accept = existing_max < threshold
-            accepted_idx: list[int] = []
-            for j in range(Qq):
-                if not accept[j]:
-                    continue
-                # 与前面已接受的候选比（intra 对称，取 intra[j, i]）
-                m = -1.0
-                for i in accepted_idx:
-                    v = float(intra[j, i])
-                    if v > m:
-                        m = v
-                if m >= threshold:
-                    accept[j] = False
-                else:
-                    accepted_idx.append(j)
-        else:
-            accept = np.ones(Qq, dtype=bool)
-
-        c = conn()
-        accepted_ids: list[str] = []
-        accepted_claims: list[str] = []
-        accepted_vecs: list[list[float]] = []
-        accepted_points: list[dict] = []
-        with c:
-            for i, p in enumerate(keep):
-                if not accept[i]:
-                    continue
-                c.execute(
-                    "INSERT INTO knowledge(id,topic,claim,detail,source_url,source_title,source_kind,"
-                    "tags,confidence,embedding,session_id,book_id,created_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (uuid.uuid4().hex[:16], _norm_topic(p.get("topic", "")), p["claim"],
-                     p.get("detail", ""), p.get("source_url", ""), p.get("source_title", ""),
-                     p.get("source_kind", "web"),
-                     json.dumps(list(p.get("tags") or []), ensure_ascii=False),
-                     max(0.1, min(1.0, float(p.get("confidence", 0.6)))),
-                     _to_blob(qvecs[i].tolist()), session_id, book_id, time.time()),
-                )
-                accepted_ids.append(int(c.execute("SELECT last_insert_rowid()").fetchone()[0]))
-                accepted_claims.append(p["claim"])
-                accepted_vecs.append(qvecs[i].tolist())
-                accepted_points.append(p)
-        # 一次性提交后，把接受的向量增量追加进缓存（顺序与 rowid 一致）
-        for rid, v in zip(accepted_ids, accepted_vecs):
-            _append_vector(rid, v)
-        # 检索结果缓存 / 主题索引已与库不一致，整体失效
-        _bump_search_cache()
-        _bump_topic_index()
-        _bump_version()
-
-    return {
-        "added": len(accepted_ids),
-        "dup": int((~accept).sum()),
-        "skipped": 0,
-        "accepted": accepted_claims,
-        "accepted_points": accepted_points,
-    }
+    from .knowledge_dedup import ingest
+    result = ingest(keep, qvecs, session_id=session_id, book_id=book_id, dedup=dedup)
+    result["skipped"] = len(valid) - len(keep)
+    result["rejected"] = rejected
+    # A3：词法索引是主库的派生数据，写入后必须同步。去重合并会改写既有行的
+    # claim/detail，但调用方拿不到被合并行的 id，所以那种情况声明索引过期。
+    try:
+        from . import search_index
+        if result.get("ids"):
+            search_index.sync_many(result["ids"])
+        if result.get("dup"):
+            search_index.mark_stale()
+    except Exception:  # noqa: BLE001  索引坏了不能吞掉本轮已入库的知识
+        pass
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -723,6 +1437,7 @@ def search(
         return []
     t0 = time.perf_counter()
     cacheable = vec is None  # 带了外部向量的查询不参与缓存（向量即身份，无法用 query 定位）
+    gen = _search_cache_gen  # 必须在读任何向量 / 行之前记下
     if cacheable:
         hit = _search_cache_get(query, topic, k)
         if hit is not None:
@@ -731,10 +1446,15 @@ def search(
                 _perf["search_hits"] += 1
             return hit
     if vec is None:
-        vec = llm.embed([query])[0]
+        try:
+            vec = llm.embed([query])[0]
+        except Exception as e:  # noqa: BLE001  Ollama 抖动不应让检索整体 500
+            log_event("warn", f"检索向量化失败，本次降级为空结果：{type(e).__name__} {str(e)[:100]}")
+            return []
     rowids, mat = _all_vectors(len(vec))
     if not rowids:
         return []
+    life = active_mask(rowids)
     if topic:
         if _DISABLE_TOPIC_INDEX:
             # 旧路径：每次打 DB 查询 + 整块矩阵复制（对照用，压测时启用）
@@ -745,23 +1465,27 @@ def search(
             mat = mat[indices]
             if not rowids:
                 return []
-            hits = similarity(vec, rowids, mat, k=k, normalized=True)
+            hits = similarity(vec, rowids, mat, k=k, normalized=True,
+                              allowed_mask=active_mask(rowids))
         else:
             # 新路径：内存主题索引 + 布尔掩码，零 DB 往返、零矩阵复制
             allowed = _topic_index_get(topic)
             if not allowed:
                 return []
             mask = np.array([rid in allowed for rid in rowids], dtype=bool)
+            if life is not None:
+                mask = mask & life
             hits = similarity(vec, rowids, mat, k=k, normalized=True, allowed_mask=mask)
     else:
-        hits = similarity(vec, rowids, mat, k=k, normalized=True)
+        hits = similarity(vec, rowids, mat, k=k, normalized=True, allowed_mask=life)
     if not hits:
         return []
     top_ids = [rid for rid, _ in hits]
     score_map = dict(hits)
     placeholders = ",".join("?" * len(top_ids))
-    # 必须显式选出 rowid，SELECT * 不包含它
-    sql = f"SELECT rowid AS _rid, * FROM knowledge WHERE rowid IN ({placeholders})"
+    # 必须显式选出 rowid，SELECT * 不包含它；ACTIVE_FILTER 是掩码之外的二次保险
+    sql = (f"SELECT rowid AS _rid, * FROM knowledge "
+           f"WHERE rowid IN ({placeholders}) AND {evidence.ACTIVE_FILTER}")
     params: list[Any] = list(top_ids)
     if topic:
         sql += " AND topic=?"
@@ -782,7 +1506,7 @@ def search(
     out.sort(key=lambda x: -x["score"])
     out = out[:k]
     if cacheable:
-        _search_cache_put(query, topic, k, out)
+        _search_cache_put(query, topic, k, out, gen)
     with _perf_lock:
         _perf["search_calls"] += 1
         _perf["search_ms"] += (time.perf_counter() - t0) * 1000
@@ -790,12 +1514,27 @@ def search(
 
 
 def keyword_search(query: str, k: int = 10) -> list[dict]:
+    """关键词兜底：优先 FTS5/BM25（有相关度分数），不可用时退回 LIKE。
+
+    原实现是 ``claim LIKE '%q%' OR detail LIKE '%q%'``：全表扫描、不分词、
+    无相关度、score 恒为 0，且排序只能按 created_at。现在精确术语/型号
+    由 trigram 索引召回并按 BM25 打分；只有「索引不可用或查询太短」时才
+    走原来的 LIKE，保证离线/老 SQLite 环境行为不退化。
+    """
     k = max(0, min(int(k), 1000))
     if not query.strip() or k == 0:
         return []
+    try:
+        from . import search_index
+        hits = search_index.bm25_search(query, k=k)
+        if hits:
+            return hits
+    except Exception:  # noqa: BLE001  索引是加速手段，不是正确性依赖
+        pass
     like = f"%{query}%"
     rows = conn().execute(
-        "SELECT * FROM knowledge WHERE claim LIKE ? OR detail LIKE ? ORDER BY created_at DESC LIMIT ?",
+        f"SELECT * FROM knowledge WHERE (claim LIKE ? OR detail LIKE ?) "
+        f"AND {evidence.ACTIVE_FILTER} ORDER BY created_at DESC LIMIT ?",
         (like, like, k),
     ).fetchall()
     out = []
@@ -815,11 +1554,11 @@ def keyword_search(query: str, k: int = 10) -> list[dict]:
 # 统计与列表
 # --------------------------------------------------------------------------
 def count_points(topic: str | None = None) -> int:
-    sql = "SELECT COUNT(*) FROM knowledge"
-    params = ()
+    sql = f"SELECT COUNT(*) FROM knowledge WHERE {evidence.ACTIVE_FILTER}"
+    params: list[Any] = []
     if topic:
-        sql += " WHERE topic=?"
-        params = (topic,)
+        sql += " AND topic=?"
+        params.append(topic)
     return conn().execute(sql, params).fetchone()[0]
 
 
@@ -859,14 +1598,15 @@ _DISABLE_STATS_CACHE = False
 def _compute_stats_db() -> dict:
     """stats 里只依赖库内容的部分（6 条 SQL）。版本键缓存，库不变就跳过。"""
     c = conn()
-    total = c.execute("SELECT COUNT(*) n FROM knowledge").fetchone()["n"]
+    af = evidence.ACTIVE_FILTER
+    total = c.execute(f"SELECT COUNT(*) n FROM knowledge WHERE {af}").fetchone()["n"]
     docs = c.execute("SELECT COUNT(*) n FROM documents WHERE ok=1").fetchone()["n"]
     topics = c.execute(
-        "SELECT topic, COUNT(*) n FROM knowledge GROUP BY topic ORDER BY n DESC LIMIT 30"
+        f"SELECT topic, COUNT(*) n FROM knowledge WHERE {af} GROUP BY topic ORDER BY n DESC LIMIT 30"
     ).fetchall()
     today = time.time() - 86400
     new24 = c.execute(
-        "SELECT COUNT(*) n FROM knowledge WHERE created_at > ?", (today,)
+        f"SELECT COUNT(*) n FROM knowledge WHERE created_at > ? AND {af}", (today,)
     ).fetchone()["n"]
     sessions = c.execute("SELECT COUNT(*) n FROM sessions").fetchone()["n"]
     res = c.execute("SELECT COUNT(*) n FROM resources WHERE status='done'").fetchone()["n"]
@@ -918,6 +1658,43 @@ def stats() -> dict:
     }
 
 
+def recent_claims(topics: list[str], per_topic: int = 3) -> dict[str, list[str]]:
+    """每个主题最近 N 条结论，一次查询取回（方向汇总按方向列代表结论）。
+
+    方向多的时候逐个 topic 查是 N 次往返；这里用窗口函数一次拿全。
+    老版本 SQLite（<3.25，没有窗口函数）退回逐主题查询，结果语义一致。
+    """
+    topics = [t for t in dict.fromkeys(topics) if t]
+    if not topics:
+        return {}
+    per_topic = max(1, min(int(per_topic), 20))
+    out: dict[str, list[str]] = {}
+    marks = ",".join("?" * len(topics))
+    sql = (
+        "SELECT topic, claim FROM ("
+        " SELECT topic, claim,"
+        " ROW_NUMBER() OVER (PARTITION BY topic ORDER BY created_at DESC) AS rn"
+        f" FROM knowledge WHERE topic IN ({marks})"
+        ") WHERE rn <= ?"
+    )
+    try:
+        for r in conn().execute(sql, (*topics, per_topic)).fetchall():
+            out.setdefault(r["topic"], []).append(r["claim"])
+        # 没有命中的主题也要有条目：否则调用方得同时处理「键不存在」和
+        # 「空列表」两种缺失形态，兜底分支和窗口函数分支的行为也会不一致。
+        for topic in topics:
+            out.setdefault(topic, [])
+        return out
+    except sqlite3.Error:
+        pass
+    for topic in topics:
+        try:
+            out[topic] = [p["claim"] for p in list_points(topic, limit=per_topic)]
+        except Exception:
+            out[topic] = []
+    return out
+
+
 def list_points(topic: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
     # 夹紧分页参数：SQLite 的 LIMIT -1 会返回全表
     try:
@@ -929,10 +1706,10 @@ def list_points(topic: str | None = None, limit: int = 50, offset: int = 0) -> l
     except (TypeError, ValueError):
         offset = 0
 
-    sql = "SELECT id,topic,claim,detail,source_url,source_title,source_kind,tags,confidence,created_at FROM knowledge"
+    sql = f"SELECT {_POINT_COLUMNS} FROM knowledge WHERE {evidence.ACTIVE_FILTER}"
     params: list[Any] = []
     if topic:
-        sql += " WHERE topic=?"
+        sql += " AND topic=?"
         params.append(topic)
     sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
     params += [limit, offset]
@@ -951,17 +1728,29 @@ def list_points(topic: str | None = None, limit: int = 50, offset: int = 0) -> l
 def get_point(pid: str) -> dict | None:
     """按 id 取单条知识点全文（不含向量），供详情面板使用。"""
     row = conn().execute(
-        "SELECT id,topic,claim,detail,source_url,source_title,source_kind,tags,"
-        "confidence,created_at FROM knowledge WHERE id=?",
-        (pid,),
+        f"SELECT {_POINT_COLUMNS} FROM knowledge WHERE id=?", (pid,),
     ).fetchone()
+    from . import cleanup, governance
     if not row:
-        return None
-    d = dict(row)
+        d = cleanup.archived_point(pid)
+        if not d:
+            return None
+    else:
+        d = dict(row)
     try:
-        d["tags"] = json.loads(d.get("tags") or "[]")
+        if not isinstance(d.get("tags"), list):
+            d["tags"] = json.loads(d.get("tags") or "[]")
     except Exception:
         d["tags"] = []
+    d["duplicate_sources"] = cleanup.sources(pid)
+    d["merged_sources"] = [json.loads(r[0]) for r in conn().execute(
+        "SELECT row_json FROM knowledge_provenance WHERE point_id=?", (pid,))]
+    # 纠错闭环：详情面板要能看见「改过什么、被反馈过什么」，否则状态机不可审计
+    try:
+        d["revisions"] = governance.revisions_for(pid, limit=10)
+        d["feedback"] = governance.feedback_for(pid, limit=10)
+    except Exception:  # noqa: BLE001  老库缺表时详情仍可用
+        d["revisions"], d["feedback"] = [], []
     return d
 
 
@@ -997,114 +1786,28 @@ def similar_points(pid: str, k: int = 5) -> list[dict]:
     return _attach_similar_rows(picked)
 
 
-def near_duplicates(
-    threshold: float = 0.90, limit: int = 30, topic: str | None = None,
-    per_topic_cap: int = 400,
-) -> dict:
-    """找「很像但没被去重挡掉」的知识点对，供人工整理。
-
-    去重阈值（默认 0.92 上下）只挡几乎一字不差的重复；0.85~0.92 这一带
-    往往是同一结论的不同说法，检索时会互相挤占名额，让 top-k 里塞满近义项。
-    这里把这一带挑出来给用户过目。
-
-    实现要点：
-      - 只在**同一主题内**比（跨主题的近重复几乎不存在，却要付全部平方代价），
-        用内存里的主题索引取 rowid 集合，零额外 SQL。
-      - 每个主题按 rowid 取最近的 per_topic_cap 条：大主题全量两两比是
-        O(n²)，1 万条就是 1 亿次点积（十几秒）；单主题封顶 400 条时
-        全部主题合计也只有百万级，实测几十毫秒。
-      - 结果按库版本缓存：知识库没变过，扫出来必然一样。
-    """
-    try:
-        thr = round(float(threshold), 4)
-    except (TypeError, ValueError):
-        thr = 0.90
-    thr = max(0.5, min(thr, 0.9999))
-    try:
-        limit = max(1, min(int(limit), 200))
-    except (TypeError, ValueError):
-        limit = 30
-
-    ver = version()
-    if (
-        _dup_cache["val"] is not None
-        and _dup_cache["ver"] == ver
-        and _dup_cache["thr"] == thr
-        and _dup_cache["topic"] == topic
-    ):
-        val = _dup_cache["val"]
-        return {"pairs": val["pairs"][:limit], "scanned": val["scanned"],
-                "threshold": thr, "ver": ver, "capped": val["capped"]}
-
-    dim_row = conn().execute(
-        "SELECT length(embedding)/4 dim FROM knowledge WHERE embedding IS NOT NULL LIMIT 1"
-    ).fetchone()
-    if not dim_row or not dim_row["dim"]:
-        return {"pairs": [], "scanned": 0, "threshold": thr, "ver": ver, "capped": 0}
-    dim = int(dim_row["dim"])
-    rowids, mat = _all_vectors(dim)
-    if not rowids:
-        return {"pairs": [], "scanned": 0, "threshold": thr, "ver": ver, "capped": 0}
-    pos = {rid: i for i, rid in enumerate(rowids)}
-
-    topics = [topic] if topic else list(_topic_index_all().keys())
-    pairs: list[tuple[float, int, int]] = []
-    scanned = 0
-    capped = 0
-    for t in topics:
-        rids = sorted(_topic_index_get(t))
-        if len(rids) < 2:
-            continue
-        if len(rids) > per_topic_cap:
-            rids = rids[-per_topic_cap:]  # 取最近入库的一批
-            capped += 1
-        idx = [pos[r] for r in rids if r in pos]
-        if len(idx) < 2:
-            continue
-        scanned += len(idx)
-        sub = mat[idx]
-        sim = sub @ sub.T
-        # 只看上三角：i<j 的序与「逐对比较」一致，避免重复对与自比
-        iu = np.triu_indices(len(idx), 1)
-        w = sim[iu]
-        hit = w >= thr
-        if not hit.any():
-            continue
-        for a, b, s in zip(iu[0][hit].tolist(), iu[1][hit].tolist(), w[hit].tolist()):
-            pairs.append((float(s), rowids[idx[a]], rowids[idx[b]]))
-
-    pairs.sort(key=lambda x: -x[0])
-    pairs = pairs[: 200]  # 缓存里只留前 200 对，够前端翻
-    uniq = list(dict.fromkeys(rid for _, a, b in pairs for rid in (a, b)))
-    by_rid: dict[int, dict] = {}
-    if uniq:
-        ph = ",".join("?" * len(uniq))
-        for r in conn().execute(
-            f"SELECT rowid AS _rid, id,topic,claim,detail,source_url,source_title,"
-            f"source_kind,tags,confidence,created_at FROM knowledge "
-            f"WHERE rowid IN ({ph})",
-            uniq,
-        ).fetchall():
-            rec = dict(r)
-            rec.pop("_rid", None)
-            try:
-                rec["tags"] = json.loads(rec.get("tags") or "[]")
-            except Exception:
-                rec["tags"] = []
-            by_rid[r["_rid"]] = rec
-
-    out_pairs = []
-    for s, a, b in pairs:
-        if a in by_rid and b in by_rid:
-            out_pairs.append({
-                "sim": round(s, 4),
-                "a": by_rid[a],
-                "b": by_rid[b],
-            })
-    val = {"pairs": out_pairs, "scanned": scanned, "capped": capped}
-    _dup_cache.update(ver=ver, thr=thr, topic=topic, val=val)
-    return {"pairs": out_pairs[:limit], "scanned": scanned,
-            "threshold": thr, "ver": ver, "capped": capped}
+def near_duplicates(threshold: float = .90, limit: int = 30, topic: str | None = None,
+                    per_topic_cap: int = 400, offset: int = 0) -> dict:
+    """Full-library representative pairs, matching the cleanup preview exactly."""
+    from . import cleanup
+    thr = max(.5, min(1., float(threshold)))
+    limit, offset = max(1, min(200, int(limit))), max(0, int(offset))
+    # 不能持全局写锁 _lock：preview 是数十秒级的 O(Σ 主题内点数²) 扫描，R131 已把
+    # cleanup.preview 自身移出锁外，这里再包一层会让学习入库、书库导入、删除
+    # 全部排队。改用专用锁 + 「扫描前的版本号」做键：扫描期间若有写入，版本号
+    # 前进，下次调用自然重算；epoch 防止换库（_invalidate）后写回旧库的结果。
+    with _dup_lock:
+        ver, epoch = version(), _dup_cache.get("epoch", 0)
+        plan = _dup_cache["val"]
+        if (plan is None or _dup_cache["ver"] != ver or
+                _dup_cache["thr"] != thr or _dup_cache["topic"] != topic):
+            plan = cleanup.preview(thr, topic)
+            if _dup_cache.get("epoch", 0) == epoch:
+                _dup_cache.update(ver=ver, thr=thr, topic=topic, val=plan)
+    pairs = [{"sim": p["sim"], "a": p["keep"], "b": p["drop"]}
+             for p in plan["items"][offset:offset + limit]]
+    return {"pairs": pairs, "scanned": plan["scanned"], "threshold": thr,
+            "ver": ver, "capped": 0, "total": plan["removed"], "offset": offset, "invalid": plan["invalid"]}
 
 
 def _attach_similar_rows(picked: list[tuple[int, float]]) -> list[dict]:
@@ -1113,9 +1816,8 @@ def _attach_similar_rows(picked: list[tuple[int, float]]) -> list[dict]:
         return []
     placeholders = ",".join("?" * len(picked))
     rows = conn().execute(
-        f"SELECT rowid AS _rid, id,topic,claim,detail,source_url,source_title,"
-        f"source_kind,tags,confidence,created_at FROM knowledge "
-        f"WHERE rowid IN ({placeholders})",
+        f"SELECT rowid AS _rid, {_POINT_COLUMNS} FROM knowledge "
+        f"WHERE rowid IN ({placeholders}) AND {evidence.ACTIVE_FILTER}",
         [rid for rid, _ in picked],
     ).fetchall()
     by_rid = {r["_rid"]: dict(r) for r in rows}
@@ -1134,15 +1836,51 @@ def _attach_similar_rows(picked: list[tuple[int, float]]) -> list[dict]:
     return out
 
 
-def delete_point(pid: str) -> bool:
+def delete_point(pid: str, *, hard: bool = False, reason: str = "",
+                 actor: str = "user") -> bool:
+    """默认软删：标记 archived，保留原文与向量，可从详情面板恢复。
+
+    物理删除只在显式 hard=True 时使用（例如合规要求的彻底清除）。
+    以前的 DELETE 会让「纠错」和「撤销」在物理上都不可能，也是清理模块
+    必须自己维护 cleanup_archive 的根因。
+    """
     with _lock:
         c = conn()
         with c:
-            c.execute("DELETE FROM knowledge WHERE id=?", (pid,))
-        _invalidate()
+            if hard:
+                c.execute("DELETE FROM knowledge WHERE id=?", (pid,))
+            else:
+                row = c.execute("SELECT * FROM knowledge WHERE id=?", (pid,)).fetchone()
+                if row is None:
+                    return False
+                try:
+                    from . import governance
+                    governance._snapshot(c, pid, dict(row), "status",
+                                         actor=actor, reason=reason or "delete")
+                except Exception:  # noqa: BLE001  归档快照失败不该挡住删除
+                    pass
+                c.execute(
+                    "UPDATE knowledge SET status='archived',archived_at=?,updated_at=?,"
+                    "reviewed_at=? WHERE id=?",
+                    (time.time(), time.time(), time.time(), pid),
+                )
+        if hard:
+            # 物理删除：rowid 从表里消失，向量矩阵与主题索引都必须重建
+            _invalidate()
+            _bump_topic_index()
+        else:
+            # 软删只改 status：向量 / rowid / 主题都没变，版本号前进后
+            # 生命周期掩码会把它排除，无需让下一次检索全量重读 embedding。
+            _invalidate_light()
         _bump_search_cache()
-        _bump_topic_index()
         _bump_version()
+    # 物理删除后索引里不能留孤儿行；软删不改文本，ACTIVE_FILTER 会挡住。
+    if hard:
+        try:
+            from . import search_index
+            search_index.sync_many([pid])
+        except Exception:  # noqa: BLE001
+            pass
     return True
 
 
@@ -1177,16 +1915,24 @@ def _make_instruction(claim: str) -> str:
 
 
 def export_training_pairs(topic: str | None = None, limit: int = 5000) -> list[dict]:
-    """把知识点导出为「指令-回答」训练样本。"""
+    """把知识点导出为「指令-回答」训练样本，每行带可回溯的 provenance。
+
+    两处刻意的行为变化：
+      * 排除 archived / disputed / superseded —— 已判定有问题的知识不该进权重。
+      * 排序把「有原文依据」放在自报 confidence 之前。自报分在真实库里
+        98% 落在 0.8~0.99，几乎不携带信息，让它当第一排序键等于随机挑样。
+    """
     sql = (
-        "SELECT topic,claim,detail,source_title FROM knowledge "
-        "WHERE LENGTH(claim) > 12"
+        "SELECT id,topic,claim,detail,source_title,source_url,evidence,"
+        "evidence_hash,evidence_locator,status,revision,verification,created_at "
+        f"FROM knowledge WHERE LENGTH(claim) > 12 AND {evidence.ACTIVE_FILTER}"
     )
     params: list[Any] = []
     if topic:
         sql += " AND topic=?"
         params.append(topic)
-    sql += " ORDER BY confidence DESC, created_at DESC LIMIT ?"
+    sql += (" ORDER BY (CASE WHEN COALESCE(evidence,'')<>'' THEN 1 ELSE 0 END) DESC, "
+            "confidence DESC, created_at DESC LIMIT ?")
     params.append(limit)
     rows = conn().execute(sql, params).fetchall()
     pairs = []
@@ -1202,6 +1948,16 @@ def export_training_pairs(topic: str | None = None, limit: int = 5000) -> list[d
                 "output": answer,
                 "source": r["source_title"] or "",
                 "topic": r["topic"] or "",
+                "provenance": {
+                    "point_id": r["id"],
+                    "revision": int(r["revision"] or 1),
+                    "status": r["status"] or "legacy",
+                    "verification": r["verification"] or "",
+                    "source_url": r["source_url"] or "",
+                    "evidence_hash": r["evidence_hash"] or "",
+                    "evidence_locator": r["evidence_locator"] or "",
+                    "schema_version": evidence.SCHEMA_VERSION,
+                },
             }
         )
     return pairs
@@ -1221,9 +1977,24 @@ def start_session(direction: str) -> str:
     return sid
 
 
+def _assert_identifiers(keys) -> None:
+    """动态 SQL 的列名只接受简单标识符，挡住任何注入形态。
+
+    这些 UPDATE 的列名由 **kw 决定、用 f-string 拼进 SQL；值虽然全部参数化，
+    列名本身没有。只放行 `[A-Za-z_][A-Za-z0-9_]*`，任何含引号 / 空格 / 分号
+    的键都会被拒绝，而不是拼进语句里执行。
+    """
+    import re
+
+    for k in keys:
+        if not isinstance(k, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            raise ValueError(f"非法列名：{k!r}")
+
+
 def update_session(sid: str, **kw) -> None:
     if not kw:
         return
+    _assert_identifiers(kw)
     cols = ",".join(f"{k}=?" for k in kw)
     c = conn()
     c.execute(f"UPDATE sessions SET {cols} WHERE id=?", (*kw.values(), sid))
@@ -1255,6 +2026,7 @@ def add_resource(
 def update_resource(rid: str, **kw) -> None:
     if not kw:
         return
+    _assert_identifiers(kw)
     cols = ",".join(f"{k}=?" for k in kw)
     c = conn()
     c.execute(f"UPDATE resources SET {cols} WHERE id=?", (*kw.values(), rid))
@@ -1273,3 +2045,183 @@ def resource_exists(repo: str) -> bool:
         "SELECT 1 FROM resources WHERE repo=? AND status IN ('done','downloading')", (repo,)
     ).fetchone()
     return bool(row)
+
+
+# --------------------------------------------------------------------------
+# 方向轮换（学习方向自动更换）
+# --------------------------------------------------------------------------
+def curriculum_start_run(
+    seed: str, rounds_per_direction: int, total_limit: int, subdirection_count: int
+) -> str:
+    rid = uuid.uuid4().hex[:12]
+    c = conn()
+    c.execute(
+        "INSERT INTO curriculum_runs"
+        "(id,seed,status,rounds_per_direction,total_limit,subdirection_count,started_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (rid, seed, "running", rounds_per_direction, total_limit, subdirection_count, time.time()),
+    )
+    c.commit()
+    return rid
+
+
+def curriculum_add_directions(run_id: str, items: list[dict]) -> None:
+    """items: [{"id","direction","seq"}]，重复写入按主键忽略。
+
+    run_id 为空说明调用方没先建任务；这类行永远查不回来（按 run_id 查），
+    写进去只会变成孤儿数据，直接拒绝。
+    """
+    if not run_id or not items:
+        return
+    c = conn()
+    with c:
+        c.executemany(
+            "INSERT OR IGNORE INTO curriculum_directions"
+            "(id,run_id,direction,seq,status,rounds,points,first_round,last_round,added_at)"
+            " VALUES (?,?,?,?,?,0,0,0,0,?)",
+            [
+                (it["id"], run_id, it["direction"], int(it.get("seq", 0)),
+                 it.get("status", "pending"), time.time())
+                for it in items
+            ],
+        )
+
+
+def curriculum_update_direction(did: str, **kw) -> None:
+    if not kw:
+        return
+    _assert_identifiers(kw)
+    cols = ",".join(f"{k}=?" for k in kw)
+    c = conn()
+    c.execute(f"UPDATE curriculum_directions SET {cols} WHERE id=?", (*kw.values(), did))
+    c.commit()
+
+
+def curriculum_update_run(rid: str, **kw) -> None:
+    if not kw:
+        return
+    _assert_identifiers(kw)
+    cols = ",".join(f"{k}=?" for k in kw)
+    c = conn()
+    c.execute(f"UPDATE curriculum_runs SET {cols} WHERE id=?", (*kw.values(), rid))
+    c.commit()
+
+
+def curriculum_save_batch(did: str, rid: str, **fields) -> None:
+    """把「方向进度 + 任务总轮次」放进同一个事务写。
+
+    两条 UPDATE 各自提交时，进程在中间退出会留下「方向记了 5 轮、任务记了 0 轮」
+    的错位进度；合成一个事务要么都成、要么都不成。未知字段忽略，避免拼错列名炸掉。
+    """
+    if not did or not rid:
+        return
+    allowed = ("rounds", "points", "last_round", "sessions", "session_total",
+               "status", "first_round")
+    dcols = {k: v for k, v in fields.items() if k in allowed}
+    total = fields.get("total_rounds")
+    c = conn()
+    with c:
+        if dcols:
+            _assert_identifiers(dcols)
+            cols = ",".join(f"{k}=?" for k in dcols)
+            c.execute(f"UPDATE curriculum_directions SET {cols} WHERE id=?", (*dcols.values(), did))
+        if total is not None:
+            c.execute("UPDATE curriculum_runs SET total_rounds=? WHERE id=?", (total, rid))
+
+
+def curriculum_save_switch(rid: str, prev: dict | None, nxt: dict, switch: dict) -> None:
+    """换向的三处写入放进同一个事务：关闭旧方向、激活新方向、记切换历史。
+
+    分三次提交时，进程在中间退出会留下「切换历史写了、但没有任何方向是 active」
+    的状态：恢复后界面显示在学某个方向，实际 current 是空的。
+    """
+    if not rid or not nxt.get("id"):
+        return
+    c = conn()
+    with c:
+        if prev and prev.get("id"):
+            c.execute(
+                "UPDATE curriculum_directions SET status=?, rounds=?, points=?, last_round=?"
+                " WHERE id=?",
+                (prev.get("status", "done"), int(prev.get("rounds") or 0),
+                 int(prev.get("points") or 0), int(prev.get("last_round") or 0), prev["id"]),
+            )
+        c.execute(
+            "UPDATE curriculum_directions SET status='active', first_round=? WHERE id=?",
+            (int(nxt.get("first_round") or 0), nxt["id"]),
+        )
+        c.execute(
+            "INSERT INTO curriculum_switches(run_id,ts,from_direction,to_direction,reason,at_round)"
+            " VALUES (?,?,?,?,?,?)",
+            (rid, time.time(), switch.get("from", ""), switch.get("to", ""),
+             switch.get("reason", ""), int(switch.get("at_round") or 0)),
+        )
+
+
+def curriculum_log_switch(
+    run_id: str, from_direction: str, to_direction: str, reason: str, at_round: int
+) -> None:
+    c = conn()
+    c.execute(
+        "INSERT INTO curriculum_switches(run_id,ts,from_direction,to_direction,reason,at_round)"
+        " VALUES (?,?,?,?,?,?)",
+        (run_id, time.time(), from_direction, to_direction, reason, int(at_round)),
+    )
+    c.commit()
+
+
+def curriculum_list_directions(run_id: str) -> list[dict]:
+    rows = conn().execute(
+        "SELECT * FROM curriculum_directions WHERE run_id=? ORDER BY seq, added_at", (run_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def curriculum_list_switches(run_id: str, limit: int = 50) -> list[dict]:
+    rows = conn().execute(
+        "SELECT * FROM curriculum_switches WHERE run_id=? ORDER BY id DESC LIMIT ?",
+        (run_id, max(1, min(limit, 500))),
+    ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def curriculum_get_run(rid: str) -> dict | None:
+    row = conn().execute("SELECT * FROM curriculum_runs WHERE id=?", (rid,)).fetchone()
+    return dict(row) if row else None
+
+
+def curriculum_last_run() -> dict | None:
+    row = conn().execute(
+        "SELECT * FROM curriculum_runs ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def curriculum_runs(limit: int = 20) -> list[dict]:
+    rows = conn().execute(
+        "SELECT * FROM curriculum_runs ORDER BY started_at DESC LIMIT ?",
+        (max(1, min(limit, 100)),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def curriculum_prune(keep: int = 100) -> int:
+    """只保留最近 keep 次任务，连同子方向与切换记录一起清掉，返回删除的任务数。
+
+    每次轮换都会写一条任务 + N 条子方向 + 若干切换记录；长期使用后这些表
+    只增不减，界面上的「最近任务」又只看前 5 条，留着没有意义。
+    """
+    keep = max(1, min(int(keep), 1000))
+    c = conn()
+    rows = c.execute(
+        "SELECT id FROM curriculum_runs ORDER BY started_at DESC LIMIT -1 OFFSET ?", (keep,)
+    ).fetchall()
+    stale = [r["id"] for r in rows]
+    if not stale:
+        return 0
+    with c:
+        for rid in stale:
+            c.execute("DELETE FROM curriculum_directions WHERE run_id=?", (rid,))
+            c.execute("DELETE FROM curriculum_switches WHERE run_id=?", (rid,))
+            c.execute("DELETE FROM curriculum_runs WHERE id=?", (rid,))
+    return len(stale)

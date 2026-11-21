@@ -325,6 +325,21 @@ def suggestions(limit: int = 4) -> list[dict]:
     except Exception:
         pass
 
+    # 7) A6：把 2 万行 warn 压成一条可见告警，而不是让用户自己翻日志
+    try:
+        from . import event_ops
+        active = event_ops.alerts(limit=3)
+        if active:
+            a = active[0]
+            add(
+                "warn", "!", "运行告警已聚合",
+                f"{a['day']} 的 {a['kind']} 累计 {a['n']} 次：{(a.get('sample') or '')[:60]}。"
+                "可在 /api/events/rollups 查看按天分类计数。",
+                "events", "看日志",
+            )
+    except Exception:  # noqa: BLE001  聚合表是旁路能力，坏了不该影响建议
+        pass
+
     # 常驻：降低「接下来干嘛」的心智负担
     add(
         "info", "✎", "随时可以问它",
@@ -369,6 +384,31 @@ def search_explain(query: str, k: int = 8) -> dict:
 _SNAP_CACHE: dict = {"ver": -1, "ts": 0.0, "val": None}
 _SNAP_TTL = 30.0
 
+# 事实质量指标要读 6 条聚合 SQL（其中几条扫全表），不能跟着前端轮询每轮重跑。
+# 与 snapshot 同为「库内容 + 核查记录」的确定函数，按 memory.version() 缓存，
+# 外加 30s TTL 兜底：万一某条新写入路径漏了 _bump_version()，最多陈旧 30 秒。
+_QUALITY_CACHE: dict = {"ver": -1, "ts": 0.0, "val": None}
+
+
+def quality_snapshot(fresh: bool = False) -> dict:
+    """可核查的事实质量指标；schema 尚未迁移时返回 available=False 供调用方降级。"""
+    now = time.time()
+    ver = memory.version()
+    if (
+        not fresh
+        and _QUALITY_CACHE["val"] is not None
+        and _QUALITY_CACHE["ver"] == ver
+        and (now - _QUALITY_CACHE["ts"]) < _SNAP_TTL
+    ):
+        return _QUALITY_CACHE["val"]
+    try:
+        from . import governance
+        val = governance.quality_metrics()
+    except Exception as exc:  # noqa: BLE001
+        val = {"available": False, "reason": str(exc)}
+    _QUALITY_CACHE.update(ver=ver, ts=now, val=val)
+    return val
+
 
 def snapshot(fresh: bool = False) -> dict:
     """一次性返回分析视图所需的全部数据。"""
@@ -407,8 +447,8 @@ def snapshot(fresh: bool = False) -> dict:
 def health() -> dict:
     """把分散的统计收成一个总分 + 四个维度的短板，供总览「健康度」卡片使用。
 
-    纯算术：输入全部取自已按版本缓存的 snapshot 组件，不新增任何 SQL，
-    轮询时随缓存一起命中。每个维度给出 0-100 分值、一句人话详情；
+    规模/多样性/新鲜度仍取自按版本缓存的 snapshot；「事实依据」维度取自
+    quality_snapshot()（同样按版本缓存）。每个维度给出 0-100 分值、一句人话详情；
     weakest 单独拎出来，前端直接拿它做「最该补什么」的引导按钮。
     空库时返回 empty=True，由前端给新手上路引导。
     """
@@ -438,15 +478,47 @@ def health() -> dict:
         "view": "learn", "btn": "去学习" if total < 120 else "去补充",
     }]
 
-    # ② 可信度：直方图是精确分桶计数，加权桶心中点即精确平均
+    # ② 事实依据：不再用模型自报 confidence 打分。
+    # 生产库里 98% 的 confidence 落在 0.8~0.99，无论结论对错这个维度都恒为满分，
+    # 完全无法区分质量。改用可核查的事实：引文覆盖率 + 逐字校验/独立核查通过率，
+    # 再减去负反馈与来源失效的惩罚。key 保留 confidence 以兼容前端与既有 API 契约。
     tot_n = sum(b["n"] for b in conf)
     avg_conf = (sum(b["n"] * (b["lo"] + b["hi"]) / 2 for b in conf) / tot_n) if tot_n else 0.0
-    dims.append({
-        "key": "confidence", "label": "可信度", "score": clamp((avg_conf - 0.3) / 0.5 * 100),
-        "detail": f"平均 {avg_conf:.2f}",
-        "hint": "可信度偏低，去「检验所学」追问确认" if avg_conf < 0.6 else "可信度健康",
-        "view": "chat", "btn": "去检验" if avg_conf < 0.6 else "去提问",
-    })
+    q = quality_snapshot()
+    if q.get("available"):
+        coverage = float(q.get("evidence_coverage") or 0)
+        literal = q.get("literal_pass_rate")
+        indep = q.get("independent_verify_pass_rate")
+        rates = [float(x) for x in (literal, indep) if x is not None]
+        # 没开展过核查时不能白送 40 分：按覆盖率折算一半，避免「无数据 = 满分」。
+        verified = (sum(rates) / len(rates) * 40) if rates else coverage * 20
+        penalty = min(20, 50 * float(q.get("negative_feedback_rate") or 0)
+                      + 50 * float(q.get("source_failure_rate") or 0))
+        fact_score = clamp(coverage * 60 + verified - penalty)
+        parts = []
+        if literal is not None:
+            parts.append(f"逐字校验 {float(literal) * 100:.0f}%")
+        if indep is not None:
+            parts.append(f"独立核查 {float(indep) * 100:.0f}%")
+        if not parts:
+            parts.append("尚未开展核查")
+        dims.append({
+            "key": "confidence", "label": "事实依据", "score": fact_score,
+            "detail": (f"引文覆盖 {coverage * 100:.1f}% · " + " · ".join(parts)
+                        + f"（自报分均值 {avg_conf:.2f}，不计分）"),
+            "hint": ("多数知识没有原文依据，去知识库补证据或开启 require_evidence"
+                     if coverage < 0.5 else "证据覆盖尚可，继续做独立核查"),
+            "view": "knowledge", "btn": "去核查" if coverage < 0.5 else "去看",
+        })
+    else:
+        # schema 还没迁移（或指标查询失败）：退回旧算法，但明确标注它是自报分。
+        dims.append({
+            "key": "confidence", "label": "可信度(自报)",
+            "score": clamp((avg_conf - 0.3) / 0.5 * 100),
+            "detail": f"模型自报均值 {avg_conf:.2f} · 事实质量指标不可用",
+            "hint": "事实质量指标不可用，请重启服务完成数据迁移",
+            "view": "knowledge", "btn": "去看",
+        })
 
     # ③ 信源多样性：种类数（4 类拿满 60 分）+ 集中度（最高占比越低越多 40 分）
     n_src = len(sources)
@@ -482,7 +554,7 @@ def health() -> dict:
     weakest = min(dims, key=lambda d: d["score"])
     return {
         "ver": ver, "empty": False, "score": score, "level": level,
-        "dims": dims, "weakest": weakest,
+        "dims": dims, "weakest": weakest, "quality": q,
     }
 
 
@@ -493,6 +565,7 @@ def _reset_caches() -> None:
     必须在换库后清一次，否则上一例的缓存会带着旧版本号误命中。
     """
     _SNAP_CACHE.update(ver=-1, ts=0.0, val=None)
+    _QUALITY_CACHE.update(ver=-1, ts=0.0, val=None)
     _GRAPH_CACHE.update(ver=-1, edge_min=None, val=None)
     _TMAP_CACHE.update(ver=-1, val=None)
     _SUGG_CACHE.update(key=None, val=None)

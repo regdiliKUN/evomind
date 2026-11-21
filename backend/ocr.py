@@ -13,6 +13,7 @@
 支持断点续做：已识别的页会跳过，中断后重跑不会重复消耗时间。
 """
 from __future__ import annotations
+from . import tasks
 
 import base64
 import importlib.util
@@ -188,13 +189,73 @@ def _patch_rapidocr_prefix() -> None:
     ru.UpdateParameters._evomind_patched = True
 
 
+def _rapid_backend() -> str:
+    """检测装的是哪一代 RapidOCR。
+
+    1.x 的包名是 rapidocr-onnxruntime，但它的 Requires-Python 卡在 <3.13，
+    Python 3.13 的虚拟环境装不上；2.x 改名为 rapidocr 且换了 API。
+    两代都要能用，否则「扫描件 OCR」在 3.13 上直接不可用。
+    """
+    import importlib.util
+
+    for name, tag in (("rapidocr_onnxruntime", "onnxruntime"), ("rapidocr", "rapidocr")):
+        try:
+            if importlib.util.find_spec(name) is not None:
+                return tag
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+class _Rapid2Compat:
+    """把 rapidocr 2.x 的返回值适配成 1.x 的 `(items, elapse)`。
+
+    2.x 返回 RapidOCROutput(boxes/txts/scores)，上层 `ocr_rapid()` 是按
+    1.x 的 `res, _ = engine(img)` 写的。这里只做形状转换，识别逻辑一行不改。
+    """
+
+    def __init__(self, inner, device: str, providers: list[str]) -> None:
+        self._inner = inner
+        self.device = device
+        self.providers = providers
+
+    def __call__(self, img):
+        out = self._inner(img)
+        # boxes 是 numpy 数组，不能用 `or ()` 兜底（数组真值判断会抛异常）
+        boxes = out.boxes if out.boxes is not None else ()
+        texts = out.txts if out.txts is not None else ()
+        scores = out.scores if out.scores is not None else ()
+        items = [(b, t, s) for b, t, s in zip(boxes, texts, scores)]
+        return items, float(getattr(out, "elapse", 0.0) or 0.0)
+
+
 def _new_rapid():
     """构造一个 RapidOCR 实例（不做缓存）。"""
-    _patch_rapidocr_prefix()
-    from rapidocr_onnxruntime import RapidOCR
+    backend = _rapid_backend()
+    if not backend:
+        raise RuntimeError(
+            "未安装 OCR 引擎。Python 3.13 请装新版：pip install rapidocr"
+        )
 
     want = str(config.get("ocr_device", "auto") or "auto").lower()
     cuda = want != "cpu" and _cuda_available()
+
+    if backend == "rapidocr":
+        # 2.x：构造参数是 params 字典，键名带命名空间
+        from rapidocr import RapidOCR
+
+        params: dict[str, Any] = {}
+        if cuda:
+            params["EngineConfig.onnxruntime.use_cuda"] = True
+        engine = _Rapid2Compat(RapidOCR(params=params or None),
+                               "gpu" if cuda else "cpu",
+                               ["CUDAExecutionProvider"] if cuda else ["CPUExecutionProvider"])
+        _device_info.update(device=engine.device, providers=engine.providers)
+        return engine
+
+    _patch_rapidocr_prefix()
+    from rapidocr_onnxruntime import RapidOCR
+
     kwargs: dict[str, Any] = {
         "det_use_cuda": cuda, "det_model_path": "",
         "cls_use_cuda": cuda, "cls_model_path": "",
@@ -383,7 +444,9 @@ def ocr_vision(img_bytes: bytes, model: str = "") -> str:
         "options": {"temperature": 0.1, "num_predict": 3000},
     }
     r = httpx.post(
-        f"{config.get('ollama_host') or 'http://127.0.0.1:11434'}/api/chat",
+        # 配置键是 ollama_url；原来写 ollama_host 永远取不到值，用户改了端口
+        # 或换了远程 Ollama，这里仍会去打默认端口。
+        f"{(config.get('ollama_url') or 'http://127.0.0.1:11434').rstrip('/')}/api/chat",
         json=body,
         timeout=300,
     )
@@ -394,7 +457,7 @@ def ocr_vision(img_bytes: bytes, model: str = "") -> str:
 
 def vision_available() -> tuple[bool, str]:
     """检查本地是否有支持视觉的模型。"""
-    host = config.get("ollama_url") or "http://127.0.0.1:11434"
+    host = (config.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
     name = config.get("vision_model") or VISION_MODEL
     try:
         r = httpx.post(f"{host}/api/show", json={"model": name}, timeout=8)
@@ -490,8 +553,14 @@ def parse_pages_checked(spec: str, total: int) -> tuple[list[int], str]:
 # --------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------
-def ocr_page(book_id: str, page_no: int, engine: str = "rapid", dpi: int = DEFAULT_DPI) -> dict:
-    """识别单页并落库。已存在且未编辑的会覆盖。"""
+@tasks.exclusive("单页OCR")
+def ocr_page(book_id: str, page_no: int, engine: str = "rapid", dpi: int = DEFAULT_DPI,
+             *, overwrite_edited: bool = False) -> dict:
+    """识别单页并落库。已存在且未编辑的会覆盖；人工校对过的页面受保护。
+
+    ``overwrite_edited=True`` 只由 /redo 显式传入：用户主动点「换引擎重识别」
+    时才有资格覆盖校对稿；批量 OCR / 默认调用一律保留人工校对结果。
+    """
     from . import library
 
     init_db()
@@ -499,30 +568,40 @@ def ocr_page(book_id: str, page_no: int, engine: str = "rapid", dpi: int = DEFAU
     row = c.execute("SELECT path, title FROM books WHERE id=?", (book_id,)).fetchone()
     if not row:
         return {"ok": False, "msg": "书目不存在"}
-    doc = pymupdf.open(row["path"])
-    if page_no >= doc.page_count:
-        return {"ok": False, "msg": "页码超出范围"}
+    # 每次识别都会打开 PDF：显式 with，越界 early-return 也不留文件句柄
+    # （与 render_png 同一口径，Windows 上不关会持续占用书目文件）。
+    with pymupdf.open(row["path"]) as doc:
+        if page_no >= doc.page_count:
+            return {"ok": False, "msg": "页码超出范围"}
 
-    t0 = time.time()
-    img_bytes, arr = render_page(doc, page_no, dpi, need_png=(engine == "vision"))
-    if engine == "vision":
-        text = ocr_vision(img_bytes)
-    else:
-        text = ocr_rapid(arr)
-    elapsed = time.time() - t0
+        t0 = time.time()
+        img_bytes, arr = render_page(doc, page_no, dpi, need_png=(engine == "vision"))
+        if engine == "vision":
+            text = ocr_vision(img_bytes)
+        else:
+            text = ocr_rapid(arr)
+        elapsed = time.time() - t0
 
-    c.execute(
-        "INSERT INTO ocr_pages(book_id,page_no,text,engine,chars,elapsed,edited,created_at)"
-        " VALUES (?,?,?,?,?,?,0,?)"
-        " ON CONFLICT(book_id,page_no) DO UPDATE SET"
-        " text=excluded.text, engine=excluded.engine, chars=excluded.chars,"
-        " elapsed=excluded.elapsed, edited=0",
-        (book_id, page_no, text, engine, len(text), elapsed, time.time()),
-    )
-    c.commit()
+        sql = (
+            "INSERT INTO ocr_pages(book_id,page_no,text,engine,chars,elapsed,edited,created_at)"
+            " VALUES (?,?,?,?,?,?,0,?)"
+            " ON CONFLICT(book_id,page_no) DO UPDATE SET"
+            " text=excluded.text, engine=excluded.engine, chars=excluded.chars,"
+            " elapsed=excluded.elapsed, edited=0"
+        )
+        if not overwrite_edited:
+            sql += " WHERE ocr_pages.edited=0"
+        saved = c.execute(
+            sql,
+            (book_id, page_no, text, engine, len(text), elapsed, time.time()),
+        )
+        c.commit()
+    if saved.rowcount == 0:
+        return {"ok": False, "msg": "该页已人工校对，请用『换引擎重识别』显式覆盖"}
     return {"ok": True, "page": page_no, "chars": len(text), "elapsed": round(elapsed, 1), "text": text}
 
 
+@tasks.exclusive("OCR")
 def ocr_book_async(
     book_id: str,
     *,
@@ -566,6 +645,8 @@ def ocr_book_async(
     except Exception:  # noqa: BLE001
         pass
 
+    doc_holder: dict = {}
+
     def go() -> None:
         from . import library
 
@@ -579,6 +660,7 @@ def ocr_book_async(
             return
         try:
             doc = pymupdf.open(row["path"])
+            doc_holder["doc"] = doc
         except Exception as e:  # noqa: BLE001
             _emit(on_event, "error", f"打不开文件：{str(e)[:80]}")
             with _task_lock:
@@ -677,7 +759,8 @@ def ocr_book_async(
                         " VALUES (?,?,?,?,?,?,0,?)"
                         " ON CONFLICT(book_id,page_no) DO UPDATE SET"
                         " text=excluded.text, engine=excluded.engine, chars=excluded.chars,"
-                        " elapsed=excluded.elapsed, edited=0",
+                        " elapsed=excluded.elapsed, edited=0"
+                        " WHERE ocr_pages.edited=0",
                         (book_id, pno, text, engine, len(text), el, time.time()),
                     )
                     wc.commit()
@@ -765,13 +848,26 @@ def ocr_book_async(
         except Exception as e:  # noqa: BLE001
             _emit(on_event, "error", f"识别异常终止：{str(e)[:100]}")
         finally:
+            # go() 已 join 全部 producer/worker，此时关闭 PDF 是安全的；
+            # 旧实现连早期 error return 都不关，整本书跑完前句柄一直被占用。
+            d = doc_holder.pop("doc", None)
+            if d is not None:
+                try:
+                    d.close()
+                except Exception:  # noqa: BLE001
+                    pass
             with _task_lock:
                 _task.update(running=False, stage="idle")
 
-    threading.Thread(target=_safe_go, daemon=True).start()
+    try:
+        threading.Thread(target=_safe_go, daemon=True).start()
+    except Exception:
+        _task.update(running=False, batch=False, stage="idle")
+        raise
     return {"ok": True}
 
 
+@tasks.exclusive("OCR")
 def ocr_batch_async(
     book_ids: list[str],
     *,
@@ -833,8 +929,10 @@ def ocr_batch_async(
                 time.sleep(0.8)
                 if _task.get("stop"):
                     break
-            done = i
+            done += 1
             with _task_lock:
+                # batch_done 仍是「已处理」口径（含跳过的书），
+                # done 才是最终播报的「完成」本数。
                 _task["batch_done"] = i
             _emit(on_event, "info", f"批量进度 {i}/{len(ids)}")
 
@@ -852,7 +950,11 @@ def ocr_batch_async(
             with _task_lock:
                 _task.update(running=False, batch=False, stage="idle", stop=False)
 
-    threading.Thread(target=_safe_go, daemon=True).start()
+    try:
+        threading.Thread(target=_safe_go, daemon=True).start()
+    except Exception:
+        _task.update(running=False, batch=False, stage="idle")
+        raise
     return {"ok": True, "msg": f"已开始批量识别 {len(ids)} 本"}
 
 
@@ -934,6 +1036,7 @@ def ocr_stats(book_id: str) -> dict:
     return {"pages": r["n"], "chars": r["ch"], "edited": r["ed"]}
 
 
+@tasks.exclusive("图片OCR")
 def ocr_image_bytes(data: bytes, engine: str = "rapid") -> dict:
     """识别用户上传的单张图片（快速体验用）。"""
     import numpy as np

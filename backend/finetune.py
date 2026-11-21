@@ -9,11 +9,15 @@
 Windows 上更稳），7B 模型在 24GB 卡上约 17GB 峰值。
 """
 from __future__ import annotations
+from . import tasks
 
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -78,19 +82,30 @@ def check_env() -> dict:
     return dict(val)
 
 
+def _python_exe() -> str:
+    """子进程用当前解释器；打包成 exe 时退回项目自带 venv。"""
+    if getattr(sys, "frozen", False):
+        return str(Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "python.exe")
+    return sys.executable
+
+
 INSTALL_CMD = (
-    "pip install torch --index-url https://download.pytorch.org/whl/cu124 && "
-    "pip install transformers peft datasets accelerate sentencepiece protobuf"
+    "pip install 'torch>=2.4,<3.0' --index-url https://download.pytorch.org/whl/cu124 && "
+    "pip install 'transformers>=4.40,<6.0' 'peft>=0.10,<1.0' "
+    "'datasets>=2.0,<4.0' 'accelerate>=0.30,<2.0' "
+    "'sentencepiece>=0.2,<1.0' 'protobuf>=4.21,<8.0' 'safetensors>=0.4,<1.0'"
 )
 
 
 def install_env(on_event: Event | None = None) -> dict:
     """安装微调依赖（体积较大，约 3GB）。"""
-    py = str(Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "python.exe")
+    py = _python_exe()
     steps = [
-        ["-m", "pip", "install", "torch", "--index-url", "https://download.pytorch.org/whl/cu124"],
-        ["-m", "pip", "install", "transformers", "peft", "datasets", "accelerate",
-         "sentencepiece", "protobuf", "safetensors"],
+        ["-m", "pip", "install", "torch>=2.4,<3.0", "--index-url",
+         "https://download.pytorch.org/whl/cu124"],
+        ["-m", "pip", "install", "transformers>=4.40,<6.0", "peft>=0.10,<1.0",
+         "datasets>=2.0,<4.0", "accelerate>=0.30,<2.0",
+         "sentencepiece>=0.2,<1.0", "protobuf>=4.21,<8.0", "safetensors>=0.4,<1.0"],
     ]
     for cmd in steps:
         _emit(on_event, "info", f"安装：{' '.join(cmd[2:])}")
@@ -256,7 +271,12 @@ def build_dataset(
                         {"role": "system", "content": DATASET_SYSTEM},
                         {"role": "user", "content": p["instruction"]},
                         {"role": "assistant", "content": p["output"]},
-                    ]
+                    ],
+                    # 行级溯源：纠错 / 归档之后能反查「权重里这一条来自哪个知识点、
+                    # 哪个 revision」。扩写样本没有原始点，也显式标注来源，不留空档。
+                    "provenance": p.get("provenance") or {
+                        "origin": "expanded", "point_id": "", "revision": 0,
+                    },
                 },
                 ensure_ascii=False,
             ) + "\n")
@@ -265,6 +285,7 @@ def build_dataset(
     return {"ok": True, "path": str(path), "count": len(pairs)}
 
 
+@tasks.exclusive("微调任务")
 def build_dataset_async(
     topic: str | None = None,
     *,
@@ -295,7 +316,11 @@ def build_dataset_async(
             with _lock:
                 _state["running"] = False
 
-    threading.Thread(target=go, daemon=True).start()
+    try:
+        threading.Thread(target=go, daemon=True).start()
+    except Exception:
+        _state["running"] = False
+        raise
     return {"ok": True, "msg": "已开始生成训练集"}
 
 
@@ -318,10 +343,11 @@ def train(
     epochs: int | None = None,
     lr: float | None = None,
     on_event: Event | None = None,
+    _reserved: bool = False,
 ) -> dict:
     global _state
     with _lock:
-        if _state["running"]:
+        if _state["running"] and not _reserved:
             return {"ok": False, "msg": "已有训练任务在跑"}
         _state = {"running": True, "stage": "loading", "progress": 0.0, "log": []}
 
@@ -364,14 +390,13 @@ def train(
 
         _emit(on_event, "stage", f"加载基座模型 {base}")
         _state["stage"] = "loading_model"
-        tok = AutoTokenizer.from_pretrained(base, trust_remote_code=True)
+        tok = AutoTokenizer.from_pretrained(base)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         model = AutoModelForCausalLM.from_pretrained(
             base, torch_dtype=dtype, device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True,
         )
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
@@ -524,7 +549,7 @@ def train(
             from peft import PeftModel
 
             base_model = AutoModelForCausalLM.from_pretrained(
-                base, torch_dtype=torch.float16, trust_remote_code=True,
+                base, torch_dtype=torch.float16,
                 device_map="cpu" if not torch.cuda.is_available() else None,
             )
             pm = PeftModel.from_pretrained(base_model, str(adapter_dir))
@@ -574,17 +599,28 @@ def train(
         return {"ok": False, "msg": str(e)}
 
 
+@tasks.exclusive("微调任务")
 def train_async(dataset_path: str, on_event: Event | None = None, **kw) -> dict:
+    with _lock:
+        if _state["running"]:
+            return {"ok": False, "msg": "已有微调任务在跑"}
+        _state.update(running=True, stage="starting", progress=0., result=None)
     def _go() -> None:
         try:
-            r = train(dataset_path, on_event=on_event, **kw)
+            r = train(dataset_path, on_event=on_event, _reserved=True, **kw)
             # 存结果供前端轮询取：训练结束但页面不知道跑成没跑成
             _state["result"] = r
         except Exception as e:  # noqa: BLE001
             _state["result"] = {"ok": False, "msg": str(e)}
             _emit(on_event, "error", f"训练失败：{str(e)[:120]}")
+        finally:
+            _state["running"] = False
 
-    threading.Thread(target=_go, daemon=True).start()
+    try:
+        threading.Thread(target=_go, daemon=True).start()
+    except Exception:
+        _state["running"] = False
+        raise
     return {"ok": True, "msg": "训练已在后台启动"}
 
 
@@ -619,6 +655,141 @@ def list_outputs() -> list[dict]:
     return out
 
 
+# --------------------------------------------------------------------------
+# GGUF 导出：llama.cpp 转换脚本的版本固定
+# --------------------------------------------------------------------------
+#: 导出 GGUF 时会在本机执行 llama.cpp 仓库里的 Python 脚本。原先浅克隆的是
+#: 上游 HEAD，等于「每次导出都执行一份未经审视的最新远程代码」，与已移除的
+#: trust_remote_code 同类风险。现在只取固定 tag，并且克隆后用 `git rev-parse HEAD`
+#: 比对固定提交：tag 被改指向、镜像被篡改都会在执行前被拦下。
+#: b12359 即上游 v1.0.0 发布对应的提交（2026-11-20 用 `git ls-remote` 实网核对）。
+LLAMA_CPP_REPO = "https://github.com/ggml-org/llama.cpp"
+LLAMA_CPP_REF = "b12359"
+LLAMA_CPP_SHA = "b1b770d90d94cad9e9ea5b993bdbc383a522fb28"
+
+#: 转换脚本的 Python 依赖。脚本默认优先用仓库自带（已随固定提交校验）的 gguf-py，
+#: pip 包只是兜底；仍加上下界，避免半年后重装拿到破坏性大版本。
+GGUF_PIP_SPECS = ("gguf>=0.10,<1.0", "sentencepiece>=0.2,<1.0", "protobuf>=4.21,<8.0")
+
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
+
+
+def _llama_cpp_pin() -> tuple[str, str]:
+    """返回 (tag/分支, 期望提交 sha)。
+
+    允许用配置键 `llama_cpp_ref` / `llama_cpp_sha`（或环境变量
+    `EVOMIND_LLAMA_CPP_REF` / `EVOMIND_LLAMA_CPP_SHA`）换版本，但必须两者一起给：
+    只给 ref 不给 sha 等于又退回「信任远端当前指向」，直接拒绝。
+    """
+    ref = str(config.get("llama_cpp_ref") or os.environ.get("EVOMIND_LLAMA_CPP_REF") or "").strip()
+    sha = str(config.get("llama_cpp_sha") or os.environ.get("EVOMIND_LLAMA_CPP_SHA") or "").strip().lower()
+    if not ref and not sha:
+        return LLAMA_CPP_REF, LLAMA_CPP_SHA
+    if not ref or not sha:
+        raise ValueError("自定义 llama.cpp 版本时必须同时提供 llama_cpp_ref 与 llama_cpp_sha（40 位提交哈希）")
+    if not _SHA_RE.fullmatch(sha):
+        raise ValueError("llama_cpp_sha 必须是 40 位十六进制提交哈希")
+    if not _REF_RE.fullmatch(ref) or ".." in ref:
+        raise ValueError("llama_cpp_ref 只能包含字母、数字与 . _ / -，且不能以符号开头")
+    return ref, sha
+
+
+def _git_head(path: Path) -> str | None:
+    """目录里 git 检出的 HEAD 提交；不是 git 仓库、git 不可用或受控文件被改过时返回 None。"""
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if head.returncode != 0:
+            return None
+        # 只认干净检出：受控文件被改过就与 HEAD 不再对应，sha 一致也不可信
+        dirty = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if dirty.returncode != 0 or (dirty.stdout or "").strip():
+            return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (head.stdout or "").strip().lower() or None
+
+
+def _rmtree(path: Path) -> None:
+    """删除目录；git 的 pack 文件在 Windows 上是只读的，需先去掉只读位再重试。"""
+    if not path.exists():
+        return
+
+    def _retry(func, target, *_):  # noqa: ANN001
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_retry)
+    else:  # pragma: no cover - 3.10/3.11
+        shutil.rmtree(path, onerror=_retry)
+
+
+def _ensure_llama_cpp(on_event: Event | None = None) -> Path:
+    """取得与固定提交一致的 llama.cpp 检出目录；不一致就绝不执行其中脚本。
+
+    先克隆到旁边的临时目录、校验通过才替换旧目录：网络失败或校验失败时
+    旧目录原样保留（但本次不会执行它），不会先删掉用户手放的内容再失败。
+    """
+    ref, sha = _llama_cpp_pin()
+    target = config.DATA / "llama.cpp"
+    if target.exists():
+        head = _git_head(target)
+        if head == sha and (target / "convert_hf_to_gguf.py").exists():
+            return target
+        _emit(on_event, "info",
+              f"本地 llama.cpp（{(head or '非干净 git 检出')[:12]}）与固定版本 {ref} 不符，重新获取…")
+    else:
+        _emit(on_event, "info", f"下载 llama.cpp 转换脚本（固定版本 {ref}）…")
+
+    staging = target.with_name(target.name + ".part")
+    _rmtree(staging)
+    try:
+        p = subprocess.run(
+            ["git", "-c", "advice.detachedHead=false", "clone", "--depth", "1",
+             "--branch", ref, "--", LLAMA_CPP_REPO, str(staging)],
+            capture_output=True, text=True, timeout=900,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("未找到 git，无法下载 llama.cpp 转换脚本") from e
+    except subprocess.TimeoutExpired as e:
+        _rmtree(staging)
+        raise RuntimeError("下载 llama.cpp 超时（15 分钟）") from e
+    if p.returncode != 0:
+        _rmtree(staging)
+        raise RuntimeError(f"下载 llama.cpp {ref} 失败：{(p.stderr or '').strip()[-200:]}")
+    head = _git_head(staging)
+    if head != sha:
+        _rmtree(staging)
+        raise RuntimeError(
+            f"llama.cpp 版本校验失败：{ref} 实际指向 {(head or '未知')[:12]}，"
+            f"与固定提交 {sha[:12]} 不符。已删除下载内容并中止，未执行其中任何脚本"
+        )
+    if not (staging / "convert_hf_to_gguf.py").exists():
+        _rmtree(staging)
+        raise RuntimeError(f"llama.cpp {ref} 中缺少 convert_hf_to_gguf.py，已中止")
+    if target.exists():
+        if (target / ".git").exists():
+            _rmtree(target)  # 本程序早先克隆的未固定版本
+        else:
+            # 不是本程序克隆的（可能是用户手放的），挪到一边而不是删掉
+            aside = target.with_name(f"{target.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+            target.rename(aside)
+            _emit(on_event, "warn", f"原 llama.cpp 目录不是 git 检出，已移到 {aside.name}")
+    staging.rename(target)
+    _emit(on_event, "ok", f"llama.cpp 已就绪：{ref}（{sha[:12]}，已校验）")
+    return target
+
+
 def export_gguf(merged_dir: str, on_event: Event | None = None) -> dict:
     """把合并后的模型转成 GGUF 并注册进 Ollama（尽力而为）。"""
     src = Path(merged_dir)
@@ -626,17 +797,10 @@ def export_gguf(merged_dir: str, on_event: Event | None = None) -> dict:
         return {"ok": False, "msg": "目录不存在"}
     try:
         _emit(on_event, "info", "尝试通过 llama.cpp 转换 GGUF…")
-        llm_cpp = config.DATA / "llama.cpp"
-        if not (llm_cpp / "convert_hf_to_gguf.py").exists():
-            _emit(on_event, "info", "下载 llama.cpp 转换脚本…")
-            subprocess.run(
-                ["git", "clone", "--depth", "1",
-                 "https://github.com/ggml-org/llama.cpp", str(llm_cpp)],
-                capture_output=True, timeout=900, check=True,
-            )
-        py = str(Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "python.exe")
+        llm_cpp = _ensure_llama_cpp(on_event)
+        py = _python_exe()
         subprocess.run(
-            [py, "-m", "pip", "install", "-q", "gguf", "sentencepiece", "protobuf"],
+            [py, "-m", "pip", "install", "-q", *GGUF_PIP_SPECS],
             capture_output=True, timeout=600,
         )
         f16 = config.DATA / "finetune" / (src.name + ".f16.gguf")

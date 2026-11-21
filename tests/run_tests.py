@@ -177,6 +177,8 @@ def test_memory():
     def add_document_and_seen():
         u = f"http://test.local/{marker}"
         memory.mark_doc(u, "标题", "测试方向", 500, True)
+        assert memory.doc_seen(u) is False
+        memory.mark_learned(u, "测试方向")
         assert memory.doc_seen(u) is True
         return "写入后可查到"
 

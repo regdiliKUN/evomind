@@ -7,6 +7,7 @@
   4. 一本书按章节切块，逐块提炼知识点，入同一个 knowledge 表，靠 book_id 回溯
 """
 from __future__ import annotations
+from . import tasks
 
 import hashlib
 import json
@@ -19,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import config, fetcher, llm, memory
+from . import config, evidence, fetcher, httpc, llm, memory
 
 Event = Callable[[str, str, dict], None]
 
@@ -335,7 +336,21 @@ def _iter_files(root: Path) -> Iterator[os.DirEntry]:
             continue
 
 
+@tasks.exclusive("书库扫描")
 def scan(dirs: list[str] | None = None, on_event: Event | None = None) -> dict:
+    try:
+        return _scan(dirs, on_event)
+    finally:
+        _task.update(running=False, stage="idle")
+
+
+@tasks.exclusive("书库扫描")
+def scan_async(dirs: list[str] | None = None, on_event: Event | None = None) -> dict:
+    _launch_task(lambda: _scan(dirs, on_event), "scan", 0, on_event)
+    return {"ok": True}
+
+
+def _scan(dirs: list[str] | None = None, on_event: Event | None = None) -> dict:
     """扫描目录，把发现的文件登记进 books 表（不解析内容）。"""
     init_db()
     c = memory.conn()
@@ -463,6 +478,8 @@ def _split_chapters(text: str, fallback_title: str) -> list[dict]:
 
 
 MAX_TEXT_BYTES = 200 * 1024 * 1024   # 单个文本文件读取上限
+MAX_URL_DOWNLOAD_BYTES = 200 * 1024 * 1024   # 链接导入的电子书下载上限
+_UNSAFE_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _NL_RE = re.compile(r"\r\n|\r")      # 补回文本模式的换行归一（见 _read_text_file）
 
 
@@ -826,11 +843,15 @@ def parse_book(book_id: str, on_event: Event | None = None) -> dict:
 EXTRACT_SYSTEM = """你是知识提炼器。从书籍正文中抽取可独立成立的知识点。
 
 要求：
+- 同一事实只输出一次；同义表述与重复段落合并，术语与句式保持一致。保留全部必要条件、例外和关键数字，不拆出冗余子结论。
 - claim：一句话结论，具体可验证，不要「很重要」「需要注意」这类空话
 - detail：2-4 句补充，保留关键数字、条件、步骤、判据
 - 只提炼正文里真实出现的内容，绝不编造
 - 操作步骤类的知识，claim 写成「做 X 时应该 Y，因为 Z」的形式
-- 与主题无关的目录、致谢、版权页一律丢弃"""
+- 与主题无关的目录、致谢、版权页一律丢弃
+- evidence：从正文中【逐字摘录】支持该结论的原文片段（20~200字），
+  不得改写、概括、翻译或补写；确实找不到就留空字符串。
+  编造的引文会被程序逐字比对识破，并把整条结论一并丢弃"""
 
 EXTRACT_USER = """## 主题
 {topic}
@@ -842,7 +863,7 @@ EXTRACT_USER = """## 主题
 {text}
 
 输出 JSON：
-{{"points": [{{"claim": "...", "detail": "...", "tags": ["..."], "relevance": 0.0, "confidence": 0.0}}]}}
+{{"points": [{{"claim": "...", "detail": "...", "evidence": "...", "tags": ["..."], "relevance": 0.0, "confidence": 0.0}}]}}
 最多 6 条，按 relevance 从高到低。"""
 
 
@@ -902,7 +923,58 @@ def import_book(
     topic = " ".join((topic or book["topic"] or f"书库 · {book['title']}").split())
     c.execute("UPDATE books SET status='importing', topic=? WHERE id=?", (topic, book_id))
     c.commit()
+    # 从这里起书目处于 importing。任何异常（模型输出形状不对、写库失败……）
+    # 原来都会直接逃出去，书目一直卡在 importing 直到下次重启——前端只给
+    # pending / ready 提供勾选框，期间既不能重试也不能重导。异常时按启动恢复
+    # 同一口径就地归位，再把异常原样抛给调用方。
+    try:
+        return _extract_into_library(c, book_id, book, p, topic, raw_text, chapters,
+                                     max_chunks, on_event)
+    except BaseException:
+        _settle_failed_import(book_id)
+        raise
 
+
+def _settle_failed_import(book_id: str) -> None:
+    """导入中途异常：与 recover_stale_states 同口径把 importing 归位。"""
+    try:
+        c = memory.conn()
+        n = c.execute("SELECT COUNT(*) n FROM knowledge WHERE book_id=?",
+                      (book_id,)).fetchone()["n"]
+        c.execute(
+            "UPDATE books SET points_count=?,"
+            " status=CASE WHEN ?>0 THEN 'done' WHEN COALESCE(chars,0)>0 THEN 'ready'"
+            " ELSE 'pending' END,"
+            " imported_at=CASE WHEN ?>0 THEN ? ELSE imported_at END"
+            " WHERE id=? AND status='importing'",
+            (n, n, n, time.time(), book_id),
+        )
+        c.commit()
+    except Exception:  # noqa: BLE001  归位失败就留给启动时的 recover_stale_states
+        pass
+
+
+def _llm_points(data: Any) -> list[dict]:
+    """模型输出容错：{"points":[...]} / 裸列表 / 其他形状，只保留 dict 条目。
+
+    chat_json 只保证是合法 JSON，不保证形状；原来 data.get / pt.get 遇到
+    列表或字符串条目直接 AttributeError，整本书的候选随之作废。
+    """
+    if isinstance(data, dict):
+        pts = data.get("points")
+    elif isinstance(data, list):
+        pts = data
+    else:
+        pts = None
+    if not isinstance(pts, list):
+        return []
+    return [pt for pt in pts if isinstance(pt, dict)][:6]
+
+
+def _extract_into_library(c, book_id: str, book: dict, p: Path, topic: str,
+                          raw_text: str, chapters: list[dict] | None,
+                          max_chunks: int, on_event: Event | None) -> dict:
+    """import_book 的提炼入库阶段（调用前书目已置 importing）。"""
     if not raw_text:
         c.execute("UPDATE books SET status='ready', error='正文为空' WHERE id=?", (book_id,))
         c.commit()
@@ -965,10 +1037,13 @@ def import_book(
                 on_event, "stage",
                 f"《{book['title']}》{b['chapter'][:30]} · {done_blocks}/{used} 块",
             )
-            # 先把这一块里够格的候选挑出来，好一次性把向量算完
-            cands: list[tuple[str, str, float, Any]] = []
-            for pt in (data.get("points") or [])[:6]:
-                claim = (pt.get("claim") or "").strip()
+            # 先把这一块里够格的候选挑出来，好一次性把向量算完。
+            # 书库路径以前完全没有证据校验（真实库 17,489 条 book 知识带引文数为 0），
+            # 现在与网页路径共用 evidence.evidence_supported 的逐字比对口径。
+            block_text = b["text"][:9000]
+            cands: list[tuple[str, str, float, Any, str]] = []
+            for pt in _llm_points(data):
+                claim = str(pt.get("claim") or "").strip()
                 if len(claim) < 12:
                     continue
                 try:
@@ -978,9 +1053,12 @@ def import_book(
                     rel, conf = 0.5, 0.6
                 if rel < min_rel:
                     continue
-                detail = (pt.get("detail") or "").strip()[:1200]
+                ev = str(pt.get("evidence") or "").strip()[:2000]
+                if ev and not evidence.evidence_supported(ev, block_text):
+                    continue  # 捏造引文：宁可丢结论，也不让假证据入库
+                detail = str(pt.get("detail") or "").strip()[:1200]
                 cands.append((claim, detail, max(0.1, min(1.0, conf)),
-                              pt.get("tags") or []))
+                              pt.get("tags") or [], ev))
             if not cands:
                 continue
 
@@ -991,7 +1069,7 @@ def import_book(
             except Exception:  # noqa: BLE001  向量化失败就退回让 add_point 自己算
                 vecs = []
 
-            for i, (claim, detail, conf, tags) in enumerate(cands):
+            for i, (claim, detail, conf, tags, ev) in enumerate(cands):
                 all_cands.append({
                     "topic": topic,
                     "claim": claim,
@@ -1002,6 +1080,9 @@ def import_book(
                     "tags": tags,
                     "confidence": conf,
                     "vec": vecs[i] if i < len(vecs) else None,
+                    "evidence": ev,
+                    "_source_text": block_text,
+                    "_ingest_path": "library:book",
                 })
 
     if all_cands:
@@ -1016,9 +1097,15 @@ def import_book(
         except Exception as e:  # noqa: BLE001
             _emit(on_event, "warn", f"批量入库失败：{str(e)[:60]}")
 
+    # points_count 是「这本书在库里的知识点数」（列表/详情/恢复逻辑都按这个口径），
+    # 不是「本次新增数」：重导一本已导入的书时语义去重会挡掉几乎所有候选，
+    # 原来直接写 total_points 会把它清成 0，界面显示「0 条知识」。
+    in_library = c.execute(
+        "SELECT COUNT(*) n FROM knowledge WHERE book_id=?", (book_id,)
+    ).fetchone()["n"]
     c.execute(
         "UPDATE books SET status='done', points_count=?, imported_at=? WHERE id=?",
-        (total_points, time.time(), book_id),
+        (in_library, time.time(), book_id),
     )
     c.commit()
     _emit(on_event, "ok", f"《{book['title']}》导入完成，新增 {total_points} 条知识点")
@@ -1045,6 +1132,7 @@ def _book_meta(ids: list[str]) -> dict[str, tuple[int, str]]:
     return out
 
 
+@tasks.exclusive("书库任务")
 def parse_books_async(book_ids: list[str], *, on_event: Event | None = None) -> dict:
     """后台批量解析：只提取正文、更新状态，不做 LLM 提炼。
 
@@ -1070,7 +1158,7 @@ def parse_books_async(book_ids: list[str], *, on_event: Event | None = None) -> 
 
     def go() -> None:
         _task.update(running=True, kind="parse", total=len(ids), done=0,
-                     stage="parsing", points=0, stop=False, current="")
+                     stage="parsing", points=0, current="")
         # 按体积升序：小书先跑，进度很快就能动起来。
         # 一上来就啃 300MB 的图集，看起来像卡死，实际在慢慢解析。
         meta = _book_meta(ids)
@@ -1101,10 +1189,11 @@ def parse_books_async(book_ids: list[str], *, on_event: Event | None = None) -> 
         _emit(on_event, "ok",
               f"批量解析完成：可读 {ok} 本，扫描版 {scan} 本，失败 {bad} 本")
 
-    threading.Thread(target=go, daemon=True).start()
+    _launch_task(go, "parse", len(ids), on_event)
     return {"ok": True, "msg": f"已开始解析 {len(ids)} 本（只提取正文，不做提炼）"}
 
 
+@tasks.exclusive("书库任务")
 def import_books_async(
     book_ids: list[str],
     *,
@@ -1138,7 +1227,7 @@ def import_books_async(
 
     def go() -> None:
         _task.update(running=True, kind="import", total=len(book_ids), done=0,
-                     stage="importing", points=0, stop=False, current="")
+                     stage="importing", points=0, current="")
         # 同样按体积升序，避免第一本是大图集导致进度长时间停在 0
         meta = _book_meta(list(book_ids))
         total_pts = 0
@@ -1157,8 +1246,24 @@ def import_books_async(
         _task.update(running=False, stage="idle", done=len(book_ids))
         _emit(on_event, "ok", f"批量导入完成：{len(book_ids)} 本，共 {total_pts} 条知识点")
 
-    threading.Thread(target=go, daemon=True).start()
+    _launch_task(go, "import", len(book_ids), on_event)
     return {"ok": True}
+
+
+def _launch_task(go, kind, total, on_event):
+    _task.update(running=True, kind=kind, total=total, done=0, stop=False, stage="starting")
+    def guarded():
+        try:
+            go()
+        except Exception as e:
+            _emit(on_event, "error", f"书库任务异常：{str(e)[:120]}")
+        finally:
+            _task.update(running=False, stage="idle")
+    try:
+        threading.Thread(target=guarded, daemon=True).start()
+    except Exception:
+        _task.update(running=False, stage="idle")
+        raise
 
 
 def stop_task() -> dict:
@@ -1169,6 +1274,7 @@ def stop_task() -> dict:
 # --------------------------------------------------------------------------
 # 链接导入
 # --------------------------------------------------------------------------
+@tasks.exclusive("书库任务")
 def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict:
     """从用户提供的链接获取内容并入库。
 
@@ -1180,6 +1286,10 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         return {"ok": False, "msg": "只支持 http/https 链接"}
+    try:
+        httpc.assert_public_url(url)
+    except ValueError as e:
+        return {"ok": False, "msg": str(e)}
 
     _emit(on_event, "info", f"获取链接内容：{url[:80]}")
 
@@ -1187,25 +1297,50 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
     lower = url.lower().split("?")[0]
     ext = Path(lower).suffix
     if ext in DOC_FORMATS or ext in TEXT_FORMATS:
+        target_dir = config.DATA / "library"
+        # 文件名取 URL 末段，只替换 Windows 文件名里的非法字符：
+        # ':' 会让 write 落进 NTFS 备用数据流，'<>|"*?' 会让 open() 直接失败。
+        # 合法名字保持原样，同一链接重复导入仍得到同一个 book_id。
+        name = _UNSAFE_NAME_RE.sub("_", Path(lower).name) or f"download{ext}"
+        dest = target_dir / f"{hashlib.md5(url.encode()).hexdigest()[:10]}_{name}"
+        tmp = dest.with_name(dest.name + ".part")
         try:
             import httpx
 
+            target_dir.mkdir(parents=True, exist_ok=True)
             with httpx.Client(
                 timeout=120, follow_redirects=True, trust_env=False,
                 headers={"User-Agent": config.get("user_agent")},
+                # 第 21 轮只补了入口校验，挡不住 302 到内网；这里复用
+                # 共享客户端同款 request hook，覆盖重定向后的每一跳。
+                event_hooks=httpc.public_url_hooks(),
+                # 连接层再钉住已校验的 IP，堵上 hook 与实际建连之间的 DNS rebinding 间隙。
+                transport=httpc.public_transport(),
             ) as c:
-                r = c.get(url)
-                if r.status_code != 200:
-                    return {"ok": False, "msg": f"下载失败 HTTP {r.status_code}"}
-                if len(r.content) > 200 * 1024 * 1024:
-                    return {"ok": False, "msg": "文件超过 200MB，拒绝下载"}
-                target_dir = config.DATA / "library"
-                target_dir.mkdir(parents=True, exist_ok=True)
-                name = Path(lower).name or f"download{ext}"
-                dest = target_dir / f"{hashlib.md5(url.encode()).hexdigest()[:10]}_{name}"
-                dest.write_bytes(r.content)
+                # 流式落盘：原来 c.get() 先把整个响应读进内存再判 200MB，
+                # 一个 2GB 的「.pdf」链接就能在判断之前把内存吃光。
+                with c.stream("GET", url) as r:
+                    if r.status_code != 200:
+                        return {"ok": False, "msg": f"下载失败 HTTP {r.status_code}"}
+                    declared = r.headers.get("content-length", "")
+                    if declared.isdigit() and int(declared) > MAX_URL_DOWNLOAD_BYTES:
+                        return {"ok": False, "msg": "文件超过 200MB，拒绝下载"}
+                    size = 0
+                    with tmp.open("wb") as fh:
+                        for chunk in r.iter_bytes(65536):
+                            size += len(chunk)
+                            if size > MAX_URL_DOWNLOAD_BYTES:
+                                return {"ok": False, "msg": "文件超过 200MB，拒绝下载"}
+                            fh.write(chunk)
+            os.replace(tmp, dest)
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "msg": f"下载失败：{str(e)[:120]}"}
+        finally:
+            # 超限中止 / 网络中断 / 写盘失败都不留半截文件；成功 replace 后 tmp 已不存在
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         bid = hashlib.md5(str(dest).encode("utf-8")).hexdigest()[:16]
         c = memory.conn()
@@ -1238,29 +1373,30 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
                 break
             blocks.append({"chapter": ch["title"], "text": chunk})
 
-    def _extract(b: dict) -> dict | None:
+    def _extract(b: dict) -> tuple[dict | None, dict]:
         try:
             return llm.chat_json(
                 EXTRACT_SYSTEM,
                 EXTRACT_USER.format(topic=topic, title=title,
                                     chapter=b["chapter"][:60], text=b["text"][:9000]),
                 temperature=0.2,
-            )
+            ), b
         except Exception as e:  # noqa: BLE001
             _emit(on_event, "warn", f"提炼失败（内部已重试）：{str(e)[:60]}")
-            return None
+            return None, b
 
     min_rel = float(config.get("min_relevance", 0.45))
     # 收集所有候选，最后一次性批量入库（只做一次全库相似度 + 一次事务），
     # 替代原来逐条 add_point（每条一次矩阵乘 + 一次 commit）。
     all_cands: list[dict] = []
     with ThreadPoolExecutor(max_workers=2) as ex:
-        for data in ex.map(_extract, blocks):
+        for data, b in ex.map(_extract, blocks):
             if data is None:
                 continue
-            cands: list[tuple[str, str, float, Any]] = []
-            for pt in (data.get("points") or [])[:6]:
-                claim = (pt.get("claim") or "").strip()
+            block_text = b["text"][:9000]
+            cands: list[tuple[str, str, float, Any, str]] = []
+            for pt in _llm_points(data):
+                claim = str(pt.get("claim") or "").strip()
                 if len(claim) < 12:
                     continue
                 try:
@@ -1270,9 +1406,12 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
                     rel, conf = 0.5, 0.6
                 if rel < min_rel:
                     continue
-                detail = (pt.get("detail") or "").strip()[:1200]
+                ev = str(pt.get("evidence") or "").strip()[:2000]
+                if ev and not evidence.evidence_supported(ev, block_text):
+                    continue
+                detail = str(pt.get("detail") or "").strip()[:1200]
                 cands.append((claim, detail, max(0.1, min(1.0, conf)),
-                              pt.get("tags") or []))
+                              pt.get("tags") or [], ev))
             if not cands:
                 continue
             # 向量一次算一批，别一条一条往返
@@ -1280,12 +1419,15 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
                 vecs = llm.embed([f"{c[0]} {c[1][:400]}" for c in cands])
             except Exception:  # noqa: BLE001
                 vecs = []
-            for i, (claim, detail, conf, tags) in enumerate(cands):
+            for i, (claim, detail, conf, tags, ev) in enumerate(cands):
                 all_cands.append({
                     "topic": topic, "claim": claim, "detail": detail,
                     "source_url": url, "source_title": title,
                     "source_kind": "web", "tags": tags, "confidence": conf,
                     "vec": vecs[i] if i < len(vecs) else None,
+                    "evidence": ev,
+                    "_source_text": block_text,
+                    "_ingest_path": "library:url",
                 })
 
     total = 0
@@ -1403,16 +1545,32 @@ def library_stats() -> dict:
 
 
 def delete_book(book_id: str, purge_points: bool = False) -> dict:
+    purged: list[str] = []
     with memory._lock:
         c = memory.conn()
         row = c.execute("SELECT path, source_type FROM books WHERE id=?", (book_id,)).fetchone()
         with c:
             if purge_points:
+                purged = [r[0] for r in c.execute(
+                    "SELECT id FROM knowledge WHERE book_id=?", (book_id,))]
                 c.execute("DELETE FROM knowledge WHERE book_id=?", (book_id,))
             c.execute("DELETE FROM book_chapters WHERE book_id=?", (book_id,))
             c.execute("DELETE FROM books WHERE id=?", (book_id,))
-        if purge_points:
+        if purged:
+            # 与 memory.delete_point(hard=True) 同一套失效：原来只清了向量缓存，
+            # 检索结果缓存仍会把已删的知识点返回给问答（RAG 引用到不存在的条目），
+            # 按写入版本号缓存的分析聚合 / 主题索引也停在删除前。
             memory._invalidate()
+            memory._bump_search_cache()
+            memory._bump_topic_index()
+            memory._bump_version()
+    if purged:
+        # 物理删除后词法索引不能留孤儿行（锁外做，sync_many 自带索引锁）
+        try:
+            from . import search_index
+            search_index.sync_many(purged)
+        except Exception:  # noqa: BLE001
+            pass
 
     # 链接导入的文件是我们自己下载到 data/library 的，删书目时一并清掉，
     # 否则这个目录只增不减。用户自己书库里的文件绝不碰。

@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -12,10 +13,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+# detect_models_dir() 会优先读 OLLAMA_MODELS；这里只保留跨平台默认值，
+# 不再携带开发机私有盘符（绿色包分发到别的机器后它们恒为无效路径）。
 CANDIDATE_MODEL_DIRS = [
-    Path("I:/ollama/models"),
-    Path("D:/ollama/models"),
-    Path("E:/ollama/models"),
     Path.home() / ".ollama" / "models",
 ]
 
@@ -59,7 +59,7 @@ def port_open(port: int, host: str = "127.0.0.1") -> bool:
 def ensure_ollama() -> bool:
     from backend import llm
 
-    if llm.healthy():
+    if llm.tags(fresh=True)[0]:
         log("[OK] Ollama 已在运行")
         return True
 
@@ -119,6 +119,44 @@ def is_evomind(port: int) -> bool:
         return False
 
 
+def open_ui(url: str):
+    """独立窗口（Edge/Chrome 应用模式）打开控制台；不可用或 EVOMIND_UI=browser 时用默认浏览器。
+
+    返回窗口进程（可 wait 到用户关窗）；退回浏览器时返回 None。
+    """
+    from backend import appwindow, config
+
+    if appwindow.wants_window():
+        proc = appwindow.open_window(url, config.DATA / "appwindow")
+        if proc is not None:
+            log("[OK] 已打开 EvoMind 窗口（关闭窗口即退出）")
+            return proc
+        log("[i] 没找到 Edge / Chrome，改用默认浏览器打开")
+    try:
+        webbrowser.open(url)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _ui_when_ready(server, port: int, url: str) -> None:
+    """等服务起来再开窗口；用户关掉窗口后让服务优雅退出。"""
+    for _ in range(300):  # 最多 30 秒
+        if server.started:
+            break
+        time.sleep(0.1)
+    proc = open_ui(url)
+    if proc is None:
+        return
+    from backend import appwindow, config
+
+    if not appwindow.wait_closed(config.DATA / "appwindow"):
+        log("[i] 未检测到窗口启动，服务保持运行（Ctrl+C 停止）")
+        return
+    log("[i] 窗口已关闭，正在退出…")
+    server.should_exit = True
+
+
 def has_model(models: list[str], name: str) -> bool:
     """判断模型是否已安装，忽略 tag。
 
@@ -138,14 +176,16 @@ def main() -> None:
     # 单实例保护：已经有实例在跑就不要再起一个。
     # 两个实例会共用同一个 SQLite，但内存里的任务锁互相看不见，
     # 结果就是 OCR 和导入能在两个进程里同时跑，互相抢 GPU、抢数据库。
-    if port_open(8765) and is_evomind(8765):
+    # 只探 8765 会漏判：pick_port() 在端口被占用时顺延到 8766..8784，
+    # 于是第二个实例照样起来，和第一个抢同一份 SQLite 与 GPU。
+    running = next((p for p in range(8765, 8785)
+                    if port_open(p) and is_evomind(p)), None)
+    if running:
+        url = f"http://127.0.0.1:{running}"
         log("[i] EvoMind 已经在运行，直接打开现有窗口")
-        log("    地址：http://127.0.0.1:8765")
-        try:
-            if not os.environ.get("EVOMIND_NO_BROWSER"):
-                webbrowser.open("http://127.0.0.1:8765")
-        except Exception:
-            pass
+        log(f"    地址：{url}")
+        if not os.environ.get("EVOMIND_NO_BROWSER"):
+            open_ui(url)
         return
 
     if not ensure_ollama():
@@ -169,18 +209,17 @@ def main() -> None:
     log(f"\n[OK] 控制台地址：{url}")
     log("[..] 按 Ctrl+C 停止服务\n")
 
-    try:
-        if not os.environ.get("EVOMIND_NO_BROWSER"):
-            webbrowser.open(url)
-    except Exception:
-        pass
+    import uvicorn
+    from backend.main import app
 
-    from backend.main import run
-
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    if not os.environ.get("EVOMIND_NO_BROWSER"):
+        threading.Thread(target=_ui_when_ready, args=(server, port, url), daemon=True).start()
     try:
-        run(port=port)
+        server.run()
     except KeyboardInterrupt:
-        log("\n已停止。")
+        pass
+    log("\n已停止。")
 
 
 if __name__ == "__main__":

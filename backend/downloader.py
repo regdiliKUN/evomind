@@ -14,10 +14,9 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
-import httpx
-
-from . import config, llm, memory, search
+from . import config, httpc, llm, memory, search
 
 Event = Callable[[str, str, dict], None]
 
@@ -31,10 +30,21 @@ def _endpoint() -> str:
     return config.get("hf_endpoint") or "https://huggingface.co"
 
 
-def _headers() -> dict[str, str]:
+TRUSTED_HF_HOSTS = frozenset({"huggingface.co", "hf-mirror.com"})
+
+
+def _headers(base: str | None = None) -> dict[str, str]:
+    """只在可信 HF 域名上附带凭据。
+
+    原实现无条件加 Authorization，而 hf_endpoint 可配置成任意地址；配合
+    repo_size_gb 的镜像回退循环，Token 会被发给第三方主机。
+    """
+    from urllib.parse import urlsplit
+
     h = {"User-Agent": config.get("user_agent")}
     tok = config.get("hf_token") or os.environ.get("HF_TOKEN")
-    if tok:
+    host = (urlsplit(base or "").hostname or "").lower()
+    if tok and host in TRUSTED_HF_HOSTS:
         h["Authorization"] = f"Bearer {tok}"
     return h
 
@@ -43,34 +53,55 @@ def _headers() -> dict[str, str]:
 # 体积估算
 # --------------------------------------------------------------------------
 def repo_size_gb(repo: str, kind: str = "model") -> float:
-    """通过 HF API 计算仓库总体积（GB）。失败返回 -1。"""
+    """通过 HF API 计算仓库总体积（GB）。失败返回 -1 并留痕。"""
     seg = "models" if kind in ("hf_model", "model") else "datasets"
-    for base in [_endpoint()] + HF_ENDPOINTS:
+    # _endpoint() 默认就是 huggingface.co，直接拼接会把同一地址请求两遍。
+    endpoints = list(dict.fromkeys([_endpoint()] + HF_ENDPOINTS))
+    last_err = ""
+    for base in endpoints:
         try:
-            with httpx.Client(timeout=20, headers=_headers(), trust_env=False) as c:
-                r = c.get(f"{base}/api/{seg}/{repo}", params={"blobs": "true"})
+            # 统一走共享客户端：follow_redirects=True 覆盖 HF 的 302，request
+            # hook 校验重定向后的每一跳；Authorization 按请求级 headers 下发，
+            # 不会变成共享连接池里的全局头（不同镜像端点凭据策略不同）。
+            with httpc.borrow_client("fetch", timeout=20) as c:
+                r = c.get(f"{base}/api/{seg}/{quote(repo, safe='/')}",
+                          params={"blobs": "true"}, headers=_headers(base))
                 if r.status_code != 200:
+                    last_err = f"{base} HTTP {r.status_code}"
                     continue
                 total = 0
                 for s in r.json().get("siblings", []):
                     total += s.get("size") or 0
                 if total == 0:
+                    last_err = f"{base} 空清单"
                     continue
                 return round(total / (1024 ** 3), 2)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{base} {type(e).__name__}: {str(e)[:100]}"
             continue
+    try:
+        memory.log_event("warn", f"HF 体积探测失败：{repo} · {last_err or '所有端点均无结果'}")
+    except Exception:  # noqa: BLE001  台账不可用时仍返回保守值
+        pass
     return -1.0
 
 
 def repo_has_gguf(repo: str) -> bool:
+    base = _endpoint()
     try:
-        with httpx.Client(timeout=20, headers=_headers(), trust_env=False) as c:
-            r = c.get(f"{_endpoint()}/api/models/{repo}")
+        with httpc.borrow_client("fetch", timeout=20) as c:
+            r = c.get(f"{base}/api/models/{quote(repo, safe='/')}",
+                      headers=_headers(base))
             if r.status_code != 200:
+                memory.log_event("warn", f"HF GGUF 探测失败：{repo} · HTTP {r.status_code}")
                 return False
             names = [s.get("rfilename", "") for s in r.json().get("siblings", [])]
             return any(n.lower().endswith(".gguf") for n in names)
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        try:
+            memory.log_event("warn", f"HF GGUF 探测失败：{repo} · {type(e).__name__} {str(e)[:100]}")
+        except Exception:  # noqa: BLE001
+            pass
         return False
 
 
@@ -100,7 +131,11 @@ def budget_check(size_gb: float, on_event: Event | None = None) -> tuple[bool, s
 # --------------------------------------------------------------------------
 def _target_dir(repo: str, kind: str) -> Path:
     base = config.MODELS if kind in ("hf_model", "model", "ollama") else config.DATASETS
-    return base / repo.replace("/", "__")
+    # Windows 上反斜杠也是分隔符：只替换 "/" 会让 "..\\..\\x" 逃出目录。
+    # 按两套分隔符切分，丢掉空段与 . / ..，再重新拼接并限长。
+    parts = [p for p in re.split(r"[\\/]+", repo) if p not in ("", ".", "..")]
+    name = "__".join(parts)[:120] or "unnamed"
+    return base / name
 
 
 def download_hf(
@@ -163,6 +198,13 @@ def download_hf(
                         {"repo": repo, "pct": pct},
                     )
 
+        # _headers() 已把 Authorization 限制在可信主机；snapshot_download
+        # 走 huggingface_hub 自己的请求链路，token 会原样发往 endpoint。
+        # 自定义镜像 / 第三方端点不得收到 HF Token。
+        from urllib.parse import urlsplit
+
+        ep = _endpoint()
+        trusted = (urlsplit(ep).hostname or "").lower() in TRUSTED_HF_HOSTS
         local = snapshot_download(
             repo_id=repo,
             repo_type="dataset" if seg == "datasets" else "model",
@@ -170,8 +212,8 @@ def download_hf(
             local_dir_use_symlinks=False,
             max_workers=int(config.get("download_workers", 2)),
             ignore_patterns=["*.md", "*.txt", "*.png", "*.jpg", ".gitattributes"] if seg == "models" else None,
-            endpoint=_endpoint(),
-            token=config.get("hf_token") or None,
+            endpoint=ep,
+            token=(config.get("hf_token") or None) if trusted else None,
         )
 
         actual = round(

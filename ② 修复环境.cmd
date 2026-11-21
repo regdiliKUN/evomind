@@ -32,7 +32,7 @@ if not exist ".venv" %PY% -m venv .venv
 
 echo   Installing dependencies...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
-".venv\Scripts\python.exe" -m pip install fastapi "uvicorn[standard]" httpx beautifulsoup4 lxml trafilatura numpy huggingface_hub
+".venv\Scripts\python.exe" -m pip install -r requirements.txt
 
 echo.
 echo   Done. Now run the start script again.

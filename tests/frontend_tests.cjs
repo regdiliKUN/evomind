@@ -8,10 +8,24 @@ const vm = require("node:vm");
 function consoleApp(fetch) {
   const nodes = new Map();
   const element = () => {
+    const cls = new Set();
     const el = {
       value: "", dataset: {}, style: {}, className: "", textContent: "", _html: "", writes: 0,
       children: [], scrollTop: 0, scrollHeight: 0,
-      addEventListener() {}, classList: { toggle() {} },
+      listeners: {}, addEventListener(name, fn) { el.listeners[name] = fn; },
+      // 真实语义的 classList：弹层用 .open 判定开合
+      classList: {
+        toggle(n, force) { const on = force === undefined ? !cls.has(n) : !!force; if (on) cls.add(n); else cls.delete(n); return on; },
+        add(...n) { n.forEach((x) => cls.add(x)); },
+        remove(...n) { n.forEach((x) => cls.delete(x)); },
+        contains(n) { return cls.has(n); },
+      },
+      attrs: {}, setAttribute(k, v) { el.attrs[k] = String(v); }, getAttribute(k) { return el.attrs[k]; },
+      removeAttribute(k) { delete el.attrs[k]; }, hasAttribute(k) { return k in el.attrs; },
+      // 焦点：focus() 改写 document.activeElement；_qsa 供弹层焦点陷阱取可聚焦子元素
+      focus() { document.activeElement = el; },
+      _qsa: [], querySelectorAll() { return el._qsa; },
+      contains(n) { return n === el || el._qsa.includes(n); },
       appendChild(c) { el.children.push(c); el._html += c._html || ""; return c; },
       removeChild(c) { const i = el.children.indexOf(c); if (i >= 0) el.children.splice(i, 1); return c; },
       remove() {},
@@ -26,6 +40,8 @@ function consoleApp(fetch) {
       },
     };
     Object.defineProperty(el, "firstChild", { get() { return el.children[0]; } });
+    // 复制按钮读 innerText：用去标签后的文本近似即可
+    Object.defineProperty(el, "innerText", { get() { return el._html.replace(/<[^>]+>/g, ""); } });
     // innerHTML 走 setter：测试据此判断「这一轮到底有没有重建 DOM」。
     // 置空（""）时同步清掉 children，模拟真实 DOM 的替换语义。
     Object.defineProperty(el, "innerHTML", {
@@ -34,9 +50,19 @@ function consoleApp(fetch) {
     });
     return el;
   };
+  // document 级监听按事件名记成数组，测试用 dispatch() 触发（visibilitychange / keydown / error）
+  const docListeners = {};
   const document = {
     hidden: false,
-    addEventListener() {},
+    activeElement: null,
+    body: null,
+    addEventListener(name, fn) { (docListeners[name] = docListeners[name] || []).push(fn); },
+    dispatch(name, evt = {}) {
+      let prevented = false;
+      const e = { preventDefault() { prevented = true; }, ...evt };
+      (docListeners[name] || []).forEach((fn) => fn(e));
+      return prevented;
+    },
     querySelector(selector) {
       if (!nodes.has(selector)) nodes.set(selector, element());
       return nodes.get(selector);
@@ -46,24 +72,181 @@ function consoleApp(fetch) {
   };
   // EventSource 记为可控实例：测试据此手动触发 onopen / onmessage / onerror
   const esRef = { current: null };
+  const copied = [];
+  const timers = [];
   const ctx = vm.createContext({
     document, fetch, URLSearchParams, console, Date,
+    navigator: { clipboard: { writeText: async (v) => {
+      if (copied.fail) throw new Error("denied");
+      copied.push(v);
+    } } },
     location: { hash: "#chat" }, window: { addEventListener() {} },
     EventSource: class {
       constructor(url) { this.url = url; esRef.current = this; }
       addEventListener() {} close() {}
     },
-    setInterval() {}, setTimeout() {}, clearInterval() {}, clearTimeout() {},
+    // 计时器只登记、不自动执行：测试按需取出回调手动触发（防抖 / 轮询）
+    setInterval(fn, ms) { timers.push({ fn, ms, kind: "interval" }); return timers.length; },
+    setTimeout(fn, ms) { timers.push({ fn, ms, kind: "timeout" }); return timers.length; },
+    clearInterval(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
   });
   const source = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
   vm.runInContext(
-    source + "\nglobalThis.app = {state, loadKnowledge, refreshAll, loadAnalytics, renderMilestones, loadDashboard, appendDashEvent, renderLibDirs, renderLibDirSummary};",
+    source + "\nglobalThis.app = {state, loadKnowledge, refreshAll, loadAnalytics, renderMilestones, loadDashboard, appendDashEvent, renderLibDirs, renderLibDirSummary, refreshDirections, startLearning, loadRefinements, paintAuto, startRefinement, paintRefinement, paintRotation, paintRotationHistory, renderRotationSummary, loadRotation, fillRotationSettings, previewSimilarKnowledge, confirmSimilarCleanup, clearSimilarPreview, loadDuplicates, openOnboarding, closeOnboarding, openPoint, closePoint, openOcr, closeOcr, pollLibTask, paintLibTask, paintOcrLive, pollOcr, pollFinetune, ftPollOnce, renderMediaResults, dialogStack};",
     ctx
   );
-  return { app: ctx.app, document, nodes, es: esRef.current };
+  return { app: ctx.app, document, nodes, es: esRef.current, esRef, copied, timers };
 }
 
 const response = (items = []) => ({ ok: true, json: async () => ({ items, total: items.length }) });
+
+test("random choice leaves learning manual and preserves sixteen rounds", async () => {
+  const learnBodies = [];
+  const { app, document } = consoleApp(async (url, opts) => {
+    if (url === "/api/learn/directions") return { ok: true, json: async () => ({ items: ["ZBrush：DynaMesh", "ZBrush：ZRemesher"] }) };
+    if (url === "/api/learn/start") { learnBodies.push(JSON.parse(opts.body)); return { ok: true, json: async () => ({ ok: true }) }; }
+    return response();
+  });
+  document.querySelector("#direction-seed").value = "ZBrush";
+  document.querySelector("#rounds").value = "16";
+  await document.querySelector("#btn-random-learn").listeners.click();
+  assert.equal(learnBodies.length, 0, "random choice must not start a learning session");
+  assert.match(document.querySelector("#direction").value, /^ZBrush：/);
+  assert.equal(document.querySelector("#rounds").value, "16");
+  assert.equal(!!document.querySelector("#btn-start").disabled, false);
+  await app.startLearning();
+  assert.equal(learnBodies[0].rounds, 16);
+});
+
+test("one-click books ignores topic filters and guards repeated clicks", async () => {
+  let resolve, submissions = 0;
+  const { app, document } = consoleApp(async (url, opts) => {
+    if (url === "/api/refinements/books/start") {
+      submissions++;
+      assert.equal(opts.method, "POST");
+      assert.equal(opts.body, undefined);
+      return new Promise((r) => { resolve = r; });
+    }
+    if (url.startsWith("/api/refinements?")) return { ok: true, json: async () => ({ items: [], total: 0, state: { running: true, mode: "books", total: 500, done: 40, skipped: 40 } }) };
+    return response();
+  });
+  document.querySelector("#kb-topic").value = "some selected book";
+  const first = app.startRefinement(true);
+  await app.startRefinement(true);
+  resolve({ ok: true, json: async () => ({ ok: true, total: 500, pending: 460, skipped: 40 }) });
+  await first;
+  assert.equal(submissions, 1);
+  assert.equal(document.querySelector("#kb-topic").value, "");
+  assert.equal(document.querySelector("#btn-refine-books").disabled, true);
+  assert.equal(document.querySelector("#refine-progress").value, 8);
+});
+
+test("book refinement progress distinguishes saved, skipped, stopped and failed work", () => {
+  const { app, document } = consoleApp(async () => response());
+  app.paintRefinement({ running: false, mode: "books", stage: "stopped", total: 200, done: 80, skipped: 60, saved: 1 });
+  assert.match(document.querySelector("#refine-status").textContent, /再次一键可继续/);
+  assert.match(document.querySelector("#refine-status").textContent, /80\/200/);
+  assert.equal(document.querySelector("#refine-progress").value, 40);
+  assert.equal(document.querySelector("#btn-refine-books").disabled, false);
+  app.paintRefinement({ running: false, mode: "books", stage: "partial", total: 200, done: 200, failed: 2 });
+  assert.match(document.querySelector("#refine-status").textContent, /2 批失败/);
+});
+
+test("refinement history displays book names and exposes older result pages", async () => {
+  const { app, document } = consoleApp(async () => ({ ok: true, json: async () => ({ total: 45,
+    state: { running: false }, items: [{ topic: "shared topic", book_title: "Book <A>",
+      input_count: 60, items: [], sources: [], before_chars: 1000, after_chars: 100, created_at: 1 }],
+  }) }));
+  await app.loadRefinements();
+  assert.match(document.querySelector("#refine-results").innerHTML, /Book &lt;A&gt;/);
+  assert.match(document.querySelector("#refine-page").textContent, /1\/3页/);
+  assert.equal(document.querySelector("#btn-refine-next").disabled, false);
+});
+
+test("direction refresh returns choices and excludes the previous deck", async () => {
+  const bodies = [];
+  const { app, document } = consoleApp(async (url, opts) => {
+    bodies.push(JSON.parse(opts.body));
+    return { ok: true, json: async () => ({ items: ["ZBrush：DynaMesh", "ZBrush：ZRemesher"] }) };
+  });
+  document.querySelector("#direction-seed").value = "ZBrush";
+  await app.refreshDirections();
+  await app.refreshDirections();
+  assert.deepEqual(bodies[0].exclude, []);
+  assert.deepEqual(bodies[1].exclude, ["ZBrush：DynaMesh", "ZBrush：ZRemesher"]);
+  assert.match(document.querySelector("#direction-options").innerHTML, /DynaMesh/);
+});
+
+test("changing the seed during a refresh discards stale choices", async () => {
+  let resolve;
+  const { app, document } = consoleApp(() => new Promise((r) => { resolve = r; }));
+  document.querySelector("#direction-seed").value = "ZBrush";
+  const pending = app.refreshDirections();
+  document.querySelector("#direction-seed").value = "Blender";
+  resolve(response(["ZBrush：DynaMesh"]));
+  await pending;
+  assert.equal(document.querySelector("#direction-options").innerHTML, "");
+});
+
+test("failed learning admission retains the activity stream and unlocks start", async () => {
+  const { app, document } = consoleApp(async () => ({ ok: true, json: async () => ({ ok: false, msg: "busy" }) }));
+  document.querySelector("#direction").value = "ZBrush";
+  document.querySelector("#rounds").value = "3";
+  document.querySelector("#learn-stream").innerHTML = "previous activity";
+  await app.startLearning();
+  assert.equal(document.querySelector("#learn-stream").innerHTML, "previous activity");
+  assert.equal(document.querySelector("#btn-start").disabled, false);
+});
+
+test("rapid learning clicks submit only one request", async () => {
+  let count = 0, resolve;
+  const { app, document } = consoleApp(() => { count++; return new Promise((r) => { resolve = r; }); });
+  document.querySelector("#rounds").value = "3";
+  const first = app.startLearning("ZBrush：DynaMesh");
+  await app.startLearning("ZBrush：ZRemesher");
+  resolve({ ok: true, json: async () => ({ ok: true }) });
+  await first;
+  await app.startLearning("ZBrush：ZRemesher");
+  assert.equal(count, 1);
+  assert.equal(document.querySelector("#btn-start").disabled, true);
+});
+
+test("refinement rendering escapes content and preserves expanded history on polling", async () => {
+  const row = { topic: "<topic>", input_count: 5, before_chars: 100, after_chars: 30, created_at: 1,
+    items: [{ claim: "<script>bad</script>", detail: "short", source_ids: ["p1"] }],
+    sources: [{ id: "p1", claim: "original", source_url: "https://example.org" }] };
+  const { app, document } = consoleApp(async () => ({ ok: true, json: async () => ({ items: [row], state: { running: false } }) }));
+  await app.loadRefinements();
+  const el = document.querySelector("#refine-results");
+  assert.match(el.innerHTML, /&lt;script&gt;/);
+  assert.match(el.innerHTML, /data-pid="p1"/);
+  assert.match(el.innerHTML, /来源原文/);
+  const writes = el.writes;
+  await app.loadRefinements();
+  assert.equal(el.writes, writes);
+});
+
+test("continuous learning displays seconds and the configured round count", () => {
+  const { app, document } = consoleApp(async () => response());
+  app.paintAuto({ enabled: true, direction: "ZBrush", idle_seconds: 30, auto_rounds: 7, runs: 2 });
+  const text = document.querySelector("#auto-desc").innerHTML;
+  assert.match(text, /30 秒/);
+  assert.match(text, /7 轮/);
+  assert.doesNotMatch(text, /分钟/);
+});
+
+test("topic choices use all topics even when the current page only contains one", async () => {
+  const { app, document } = consoleApp(async () => ({ ok: true, json: async () => ({
+    items: [{ claim: "new", topic: "new topic", created_at: 1 }],
+    topics: [{ topic: "old topic" }, { topic: "new topic" }], total: 2,
+  }) }));
+  document.querySelector("#kb-topic").value = "old topic";
+  await app.loadKnowledge();
+  assert.match(document.querySelector("#kb-topic").innerHTML, /old topic/);
+  assert.match(document.querySelector("#kb-topic").innerHTML, /new topic/);
+  assert.equal(document.querySelector("#kb-topic").value, "old topic");
+});
 
 test("polling retains the submitted search and topic, and clearing resets the query", async () => {
   const urls = [];
@@ -354,4 +537,518 @@ test("书库目录：无目录时给出添加引导而不是空白", () => {
   app.renderLibDirs([]);
   assert.match(document.querySelector("#lib-dir-summary").innerHTML, /添加一个书库目录/);
   assert.match(document.querySelector("#lib-dir-list").innerHTML, /还没有添加目录/);
+});
+
+test("轮换面板：显示当前方向、剩余轮次与子方向状态", () => {
+  const { app, document } = consoleApp(async () => response());
+  app.paintRotation({
+    active: true, paused: false, stage: "learning", seed: "光固化 3D 打印",
+    current: "光固化 3D 打印：收缩补偿模型", rounds_in_current: 40,
+    rounds_per_direction: 100, total_rounds_done: 40, total_round_limit: 300,
+    direction_index: 1, direction_total: 6, progress: 0.1333,
+    plan: [
+      { direction: "光固化 3D 打印：收缩补偿模型", status: "active", rounds: 40, points: 12 },
+      { direction: "光固化 3D 打印：层厚与曝光", status: "pending", rounds: 0, points: 0 },
+      { direction: "Blender 拓扑重网格", status: "rejected", rounds: 0, points: 0, note: "越界" },
+    ],
+  });
+  const status = document.querySelector("#rot-status").innerHTML;
+  assert.match(status, /还剩 60 轮/);
+  assert.match(status, /40\/300/);
+  assert.match(status, /子方向 1\/6/);
+  assert.equal(document.querySelector("#btn-rot-start").disabled, true);
+  assert.equal(document.querySelector("#btn-rot-pause").disabled, false);
+  assert.equal(document.querySelector("#btn-rot-resume").disabled, true);
+  assert.equal(document.querySelector("#btn-rot-stop").disabled, false);
+  assert.equal(document.querySelector("#rot-bar").hidden, false);
+  assert.match(document.querySelector("#rot-plan-list").innerHTML, /rot-item active/);
+  assert.match(document.querySelector("#rot-plan-list").innerHTML, /越界已丢弃/);
+});
+
+test("轮换面板：暂停态与结束后不再可暂停", () => {
+  const { app, document } = consoleApp(async () => response());
+  app.paintRotation({
+    active: true, paused: true, stage: "paused", seed: "量子计算",
+    current: "量子计算：表面码纠错", rounds_in_current: 20, rounds_per_direction: 100,
+    total_rounds_done: 120, total_round_limit: 300, plan: [],
+  });
+  assert.equal(document.querySelector("#rot-tag").textContent, "已暂停");
+  assert.equal(document.querySelector("#btn-rot-pause").disabled, true);
+  assert.equal(document.querySelector("#btn-rot-resume").disabled, false);
+
+  app.paintRotation({
+    active: false, paused: false, stage: "done", seed: "量子计算",
+    total_rounds_done: 300, total_round_limit: 300, stop_reason: "total_rounds", plan: [],
+  });
+  assert.equal(document.querySelector("#rot-tag").textContent, "已完成");
+  assert.equal(document.querySelector("#btn-rot-start").disabled, false);
+  assert.equal(document.querySelector("#btn-rot-stop").disabled, true);
+});
+
+test("轮换启动：校验范围后按配置提交参数", async () => {
+  const bodies = [];
+  const { app, document } = consoleApp(async (url, opts) => {
+    if (url === "/api/rotation/start") {
+      bodies.push(JSON.parse(opts.body));
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+    if (url === "/api/rotation") {
+      return { ok: true, json: async () => ({ active: true, seed: "光固化 3D 打印", plan: [] }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  });
+  document.querySelector("#rot-seed").value = "光固化 3D 打印";
+  document.querySelector("#rot-per").value = "50";
+  document.querySelector("#rot-total").value = "120";
+  document.querySelector("#rot-count").value = "5";
+  document.querySelector("#rot-window").value = "3";
+  document.querySelector("#rot-boundary").value = "1";
+  await document.querySelector("#btn-rot-start").listeners.click();
+  assert.equal(bodies.length, 1);
+  assert.deepEqual(bodies[0], {
+    seed: "光固化 3D 打印", rounds_per_direction: 50, total_rounds: 120, subdirection_count: 5,
+  });
+
+  document.querySelector("#rot-count").value = "1";
+  await document.querySelector("#btn-rot-start").listeners.click();
+  assert.equal(bodies.length, 1, "子方向数量越界时不得提交");
+});
+
+test("轮换汇总：逐方向列出轮次与新增条数", () => {
+  const { app, document } = consoleApp(async () => response());
+  app.renderRotationSummary({
+    seed: "光固化 3D 打印", total_rounds: 300, total_limit: 300, rounds_per_direction: 100,
+    points_total: 88, switch_count: 2,
+    switches: [{ from: "", to: "收缩补偿模型" }, { from: "收缩补偿模型", to: "层厚与曝光" }],
+    directions: [
+      { direction: "收缩补偿模型", rounds: 100, points: 40, highlights: ["收缩率随层厚变化"] },
+      { direction: "层厚与曝光", rounds: 100, points: 30, highlights: [] },
+    ],
+  });
+  const html = document.querySelector("#rot-summary").innerHTML;
+  assert.match(html, /收缩补偿模型：100 轮 \/ 40 条/);
+  assert.match(html, /切换 2 次/);
+  assert.match(html, /收缩率随层厚变化/);
+  assert.equal(document.querySelector("#rot-summary").hidden, false);
+
+  app.renderRotationSummary({});
+  assert.equal(document.querySelector("#rot-summary").hidden, true);
+});
+
+test("轮换历史：列出最近任务的方向与轮次", () => {
+  const { app, document } = consoleApp(async () => response());
+  app.paintRotationHistory([
+    { seed: "光固化 3D 打印", status: "done", status_text: "已完成",
+      total_rounds: 300, total_limit: 300, started_at: 1700000000 },
+    { seed: "RAG 检索增强", status: "stopped", status_text: "已手动结束",
+      total_rounds: 40, total_limit: 200, started_at: 1700003600 },
+  ]);
+  const html = document.querySelector("#rot-history-list").innerHTML;
+  assert.match(html, /光固化 3D 打印/);
+  assert.match(html, /300\/300 轮 · 已完成/);
+  assert.match(html, /40\/200 轮 · 已手动结束/);
+  assert.equal(document.querySelector("#rot-history").hidden, false);
+
+  app.paintRotationHistory([]);
+  assert.equal(document.querySelector("#rot-history").hidden, true);
+});
+
+test("轮换汇总：可一键复制成文本", async () => {
+  const { app, document, copied } = consoleApp(async () => response());
+  app.renderRotationSummary({
+    seed: "光固化 3D 打印", total_rounds: 20, total_limit: 300, rounds_per_direction: 10,
+    points_total: 7, switch_count: 1, switches: [],
+    directions: [{ direction: "收缩补偿模型", rounds: 10, points: 7, highlights: ["收缩率随层厚变化"] }],
+  });
+  assert.equal(document.querySelector("#rot-summary-actions").hidden, false);
+  await document.querySelector("#btn-rot-copy").listeners.click();
+  assert.equal(copied.length, 1);
+  assert.match(copied[0], /方向轮换汇总/);
+  assert.match(copied[0], /收缩补偿模型/);
+});
+
+test("轮换面板：进度条与禁用按钮有可读的无障碍信息", () => {
+  const { app, document } = consoleApp(async () => response());
+  app.paintRotation({
+    active: false, paused: false, seed: "量子计算", total_rounds_done: 40,
+    total_round_limit: 300, plan: [],
+  });
+  const bar = document.querySelector("#rot-bar");
+  assert.equal(bar.getAttribute("role"), "progressbar");
+  assert.equal(bar.getAttribute("aria-valuemax"), "300");
+  assert.equal(bar.getAttribute("aria-valuenow"), "40");
+  assert.match(document.querySelector("#btn-rot-pause").title, /没有运行中的任务/);
+  assert.match(document.querySelector("#btn-rot-start").title, /开始自动轮换/);
+});
+
+test("轮换汇总：剪贴板不可用时给出替代提示", async () => {
+  const { app, document, copied } = consoleApp(async () => response());
+  copied.fail = true;
+  app.renderRotationSummary({
+    seed: "量子计算", total_rounds: 5, total_limit: 10, rounds_per_direction: 5,
+    points_total: 2, switch_count: 0, switches: [],
+    directions: [{ direction: "表面码纠错", rounds: 5, points: 2, highlights: [] }],
+  });
+  await document.querySelector("#btn-rot-copy").listeners.click();
+  const toasts = document.querySelector("#toasts").children;
+  assert.match(toasts[toasts.length - 1].textContent, /手动选中/);
+});
+
+test("轮换面板：重启后回退显示上一次任务", async () => {
+  const { app, document } = consoleApp(async (url) => {
+    if (url === "/api/rotation") {
+      return { ok: true, json: async () => ({
+        active: false, plan: [], stop_reason: "",
+        last_run: {
+          seed: "RAG 检索增强", total_rounds: 40, total_limit: 200,
+          directions: [{ direction: "分块策略与重叠窗口", rounds: 40, points: 5, status: "stopped" }],
+        },
+      }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  });
+  await app.loadRotation();
+  assert.match(document.querySelector("#rot-status").innerHTML, /上次任务/);
+  assert.match(document.querySelector("#rot-status").innerHTML, /40\/200 轮/);
+  assert.match(document.querySelector("#rot-plan-list").innerHTML, /分块策略与重叠窗口/);
+});
+
+test("轮换面板：状态轮询不会刷掉最近任务", () => {
+  const { app, document } = consoleApp(async () => response());
+  app.paintRotation({ active: true, plan: [], history: [
+    { seed: "RAG 检索增强", status: "done", status_text: "已完成",
+      total_rounds: 300, total_limit: 300, started_at: 1700000000 },
+  ] });
+  assert.equal(document.querySelector("#rot-history").hidden, false);
+  // /api/status 的 rotation 不带 history：不能因此清空
+  app.paintRotation({ active: true, plan: [], seed: "RAG 检索增强" });
+  assert.equal(document.querySelector("#rot-history").hidden, false);
+  assert.match(document.querySelector("#rot-history-list").innerHTML, /RAG 检索增强/);
+});
+
+test("轮换面板：可跳过当前方向，未选中时禁用", async () => {
+  const calls = [];
+  const { app, document } = consoleApp(async (url) => {
+    calls.push(url);
+    if (url === "/api/rotation") {
+      return { ok: true, json: async () => ({ active: true, current: "A", plan: [] }) };
+    }
+    return { ok: true, json: async () => ({ ok: true }) };
+  });
+  app.paintRotation({ active: true, paused: false, seed: "x", current: "光固化：A",
+    total_rounds_done: 3, total_round_limit: 10, plan: [] });
+  const skip = document.querySelector("#btn-rot-skip");
+  assert.equal(skip.disabled, false);
+  await skip.listeners.click();
+  assert.ok(calls.includes("/api/rotation/skip"), "点击应提交跳过请求");
+
+  app.paintRotation({ active: true, paused: false, seed: "x", current: "", plan: [] });
+  assert.equal(document.querySelector("#btn-rot-skip").disabled, true);
+});
+
+test("轮换：预览过的子方向随启动提交，换母方向后不再沿用", async () => {
+  const bodies = [];
+  const { app, document } = consoleApp(async (url, opts) => {
+    if (url === "/api/rotation/plan") {
+      return { ok: true, json: async () => ({ seed: "光固化 3D 打印", items: ["A 方向", "B 方向"] }) };
+    }
+    if (url === "/api/rotation/start") {
+      bodies.push(JSON.parse(opts.body));
+      return { ok: true, json: async () => ({ ok: true }) };
+    }
+    if (url === "/api/rotation") return { ok: true, json: async () => ({ active: true, plan: [] }) };
+    return { ok: true, json: async () => ({}) };
+  });
+  document.querySelector("#rot-seed").value = "光固化 3D 打印";
+  document.querySelector("#rot-count").value = "2";
+  document.querySelector("#rot-per").value = "5";
+  document.querySelector("#rot-total").value = "10";
+  document.querySelector("#rot-window").value = "3";
+  await document.querySelector("#btn-rot-plan").listeners.click();
+  await document.querySelector("#btn-rot-start").listeners.click();
+  assert.deepEqual(bodies[0].items, ["A 方向", "B 方向"], "同一次预览的方向应随启动提交");
+
+  document.querySelector("#rot-seed").value = "量子计算";
+  await document.querySelector("#btn-rot-start").listeners.click();
+  assert.equal(bodies[1].items, undefined, "换了母方向不能沿用旧预览");
+});
+
+test("轮换面板：非「自主进化」页不重建子方向列表", async () => {
+  const { app, document } = consoleApp(async (url) => {
+    if (url === "/api/status") {
+      return { ok: true, json: async () => ({
+        revision: "x", capabilities: [], config: {}, disk: {}, stats: {},
+        engine: { running: false, round: 0, total_rounds: 0, stage: "idle" },
+        rotation: { active: true, seed: "光固化 3D 打印", current: "A",
+          plan: [{ direction: "A", status: "active", rounds: 1, points: 1 }] },
+        refinement: { running: false }, auto: { enabled: false },
+        llm: { healthy: true, models: [], checking: false },
+        finetune: { ready: false }, finetune_state: {},
+      }) };
+    }
+    return { ok: true, json: async () => ({ items: [], total: 0 }) };
+  });
+  app.state.view = "dashboard";
+  await app.refreshAll();
+  const list = document.querySelector("#rot-plan-list");
+  const before = list.writes;
+  await app.refreshAll();
+  assert.equal(list.writes, before, "不可见的面板不该被重画");
+
+  app.state.view = "learn";
+  await app.refreshAll();
+  assert.ok(list.writes > before, "切到「自主进化」页应正常渲染");
+});
+
+test("轮换面板：模型不可用时显示等待与重试倒计时", () => {
+  const { app, document } = consoleApp(async () => response());
+  app.paintRotation({
+    active: true, paused: false, stage: "waiting_model",
+    seed: "光固化 3D 打印", current: "光固化 3D 打印：A", rounds_per_direction: 100,
+    total_rounds_done: 40, total_round_limit: 300, retry_in: 120, plan: [],
+  });
+  assert.equal(document.querySelector("#rot-tag").textContent, "等待模型");
+  const status = document.querySelector("#rot-status").innerText;
+  assert.match(status, /等待模型/);
+  assert.match(status, /120 秒后自动重试/);
+  // 等待不是暂停：暂停按钮仍可用，恢复按钮仍禁用
+  assert.equal(document.querySelector("#btn-rot-pause").disabled, false);
+  assert.equal(document.querySelector("#btn-rot-resume").disabled, true);
+});
+
+
+test("高相似度清理：先完整预览，确认后提交阈值、范围和快照", async () => {
+  const writes = [];
+  const point = {id:"a",topic:"CAD",claim:"<script>example</script>",detail:"完整内容",created_at:1};
+  const preview = {threshold:.9,topic:"CAD",token:"snapshot",removed:1,groups:1,items:[{keep:point,drop:{...point,id:"b"},sim:.96,reason:"更完整"}]};
+  const {app,document} = consoleApp(async (url, opts) => {
+    if (opts?.method === "POST") { writes.push({url,body:JSON.parse(opts.body)}); return {ok:true,json:async()=>({ok:true,removed:1,undo:{available:true}})}; }
+    if (url.startsWith("/api/knowledge/cleanup/preview")) return {ok:true,json:async()=>preview};
+    return response();
+  });
+  document.querySelector("#dup-threshold").value = "90";
+  document.querySelector("#kb-topic").value = "CAD";
+  await app.previewSimilarKnowledge();
+  assert.equal(writes.length,0,"预览不可删除知识点");
+  assert.match(document.querySelector("#dup-preview-list").innerHTML,/96.0%/);
+  assert.match(document.querySelector("#dup-preview-list").innerHTML,/&lt;script&gt;/);
+  assert.match(document.querySelector("#dup-preview-summary").textContent,/待清除 1 条/);
+  await app.confirmSimilarCleanup();
+  assert.equal(writes.length,1);
+  assert.deepEqual(writes[0].body,{threshold:.9,topic:"CAD",token:"snapshot"});
+  assert.equal(document.querySelector("#dup-preview").hidden,true);
+  assert.equal(document.querySelector("#btn-cleanup-undo").disabled,false);
+});
+
+test("高相似度清理：取消和阈值变化使预览失效，晚到的响应不会覆盖", async () => {
+  let resolvePreview;
+  let writes = 0;
+  const {app,document} = consoleApp(async (url,opts) => {
+    if(opts?.method === "POST") writes++;
+    if(url.startsWith("/api/knowledge/cleanup/preview")) return new Promise(resolve => {resolvePreview=resolve;});
+    return response();
+  });
+  const pending = app.previewSimilarKnowledge();
+  document.querySelector("#dup-threshold").value="99";
+  document.querySelector("#dup-threshold").listeners.input();
+  resolvePreview({ok:true,json:async()=>({threshold:.9,token:"old",removed:1,groups:1,items:[]})});
+  await pending;
+  await app.confirmSimilarCleanup();
+  assert.equal(writes,0);
+  assert.equal(document.querySelector("#dup-preview").hidden,true);
+  assert.equal(document.querySelector("#btn-confirm-similar").disabled,true);
+});
+
+/* ---- 第二十一轮：后台节流 / 弹层可访问性 / CSP 预备 / 防抖 ---- */
+const countingFetch = (hang = () => false) => {
+  const hits = {};
+  const pending = [];
+  const fetch = (url) => {
+    const key = String(url).split("?")[0];
+    hits[key] = (hits[key] || 0) + 1;
+    if (hang(key)) return new Promise((resolve) => pending.push(resolve));
+    return Promise.resolve({ ok: true, json: async () => ({ items: [], pages: [], stats: {}, running: false }) });
+  };
+  return { fetch, hits, pending };
+};
+const flush = () => new Promise((r) => setImmediate(r));
+
+test("后台标签页：书库/OCR/微调轮询都不发请求，切回前台立即补一拍并重连 SSE", async () => {
+  const { fetch, hits } = countingFetch();
+  const { app, document, esRef, timers } = consoleApp(fetch);
+  // 让三个轮询器都处于「已启动」状态
+  app.paintLibTask({ running: true, kind: "import", total: 4, done: 1 });
+  app.pollFinetune();
+  assert.ok(timers.some((t) => t.kind === "interval" && t.ms === 2500), "书库轮询已挂上");
+  const firstEs = esRef.current;
+  firstEs.onerror(); // SSE 断开，进入指数退避
+  await flush();
+  const before = { ...hits };
+  document.hidden = true;
+  await app.pollLibTask();
+  await app.pollOcr();
+  await app.ftPollOnce();
+  await app.refreshAll();
+  assert.deepEqual(hits, before, "后台标签页不应发出任何轮询请求");
+  document.hidden = false;
+  document.dispatch("visibilitychange");
+  await flush(); await flush();
+  assert.ok(hits["/api/status"] > (before["/api/status"] || 0), "切回前台立即刷新顶栏状态");
+  assert.ok(hits["/api/library/state"] > (before["/api/library/state"] || 0), "书库进度立即补一拍");
+  assert.ok(hits["/api/finetune/state"] > (before["/api/finetune/state"] || 0), "微调进度立即补一拍");
+  assert.notEqual(esRef.current, firstEs, "退避中的 SSE 立即重连，不等最长 30 秒");
+  assert.equal(app.state.sseRetry, 2000, "重连后退避重置");
+});
+
+test("慢轮询不叠加：上一拍没回来时下一拍跳过，回来后恢复", async () => {
+  const { fetch, hits, pending } = countingFetch((k) => k === "/api/ocr/state");
+  const { app } = consoleApp(fetch);
+  const first = app.pollOcr();
+  await app.pollOcr();
+  await app.pollOcr();
+  assert.equal(hits["/api/ocr/state"], 1);
+  pending.shift()({ ok: true, json: async () => ({ running: false, batch: false }) });
+  await first;
+  const second = app.pollOcr();
+  assert.equal(hits["/api/ocr/state"], 2);
+  pending.shift()({ ok: true, json: async () => ({ running: false, batch: false }) });
+  await second;
+});
+
+test("微调轮询：慢回包不会让「完成」提示弹两次", async () => {
+  const { fetch, pending } = countingFetch((k) => k === "/api/finetune/state");
+  const { app, document } = consoleApp(fetch);
+  app.pollFinetune();
+  const a = app.ftPollOnce();
+  const b = app.ftPollOnce();
+  assert.equal(pending.length, 1, "第二拍应被 busy 护栏挡下");
+  pending.shift()({ ok: true, json: async () => ({ running: false, result: { ok: true, merged: true } }) });
+  await a; await b;
+  assert.equal(document.querySelector("#toasts").children.length, 1);
+  // 收尾后计时器已清，再补拍也不会重复处理
+  await app.ftPollOnce();
+  assert.equal(pending.length, 0);
+});
+
+test("弹层：打开时焦点移入、背景 inert；Esc 关闭并把焦点还给触发按钮", () => {
+  const { app, document } = consoleApp(async () => response());
+  const trigger = document.querySelector("#btn-guide");
+  trigger.focus();
+  app.openOnboarding();
+  const bg = document.querySelector(".app");
+  assert.equal(document.activeElement, document.querySelector("#ob-next"), "焦点落在「下一步」");
+  assert.equal(bg.inert, true);
+  assert.equal(bg.getAttribute("aria-hidden"), "true");
+  // 输入法组字中的 Esc 只取消组字，不关弹层
+  document.dispatch("keydown", { key: "Escape", isComposing: true, target: document.activeElement });
+  assert.equal(document.querySelector("#onboarding").hidden, false);
+  const prevented = document.dispatch("keydown", { key: "Escape", target: document.activeElement });
+  assert.equal(prevented, true);
+  assert.equal(document.querySelector("#onboarding").hidden, true);
+  assert.equal(bg.inert, false);
+  assert.equal(bg.hasAttribute("aria-hidden"), false);
+  assert.equal(document.activeElement, trigger, "焦点还原到打开前的元素");
+  assert.equal(app.dialogStack.length, 0);
+});
+
+test("弹层：Tab / Shift+Tab 在 OCR 抽屉内首尾循环，文本框里的 Esc 不会丢掉校对", () => {
+  const { app, document } = consoleApp(async () => response());
+  const drawer = document.querySelector("#ocr-drawer");
+  const [a, b, c] = [document.createElement(), document.createElement(), document.createElement()];
+  drawer._qsa = [a, b, c];
+  app.openOcr({ id: "bk1", title: "某书", format: "pdf" });
+  assert.equal(drawer.classList.contains("open"), true);
+  assert.equal(document.activeElement, document.querySelector("#ocr-close"));
+  c.focus();
+  assert.equal(document.dispatch("keydown", { key: "Tab" }), true);
+  assert.equal(document.activeElement, a, "末尾 Tab 回到第一个");
+  assert.equal(document.dispatch("keydown", { key: "Tab", shiftKey: true }), true);
+  assert.equal(document.activeElement, c, "开头 Shift+Tab 跳到最后一个");
+  document.activeElement = document.createElement(); // 焦点意外跑到弹层外
+  document.dispatch("keydown", { key: "Tab" });
+  assert.equal(document.activeElement, a, "从外面 Tab 进来落在第一个");
+  b.focus();
+  assert.equal(document.dispatch("keydown", { key: "Tab" }), false, "中间元素交给浏览器默认顺序");
+  // 多行文本框里按 Esc：焦点退回抽屉，抽屉保持打开
+  document.dispatch("keydown", { key: "Escape", target: { tagName: "TEXTAREA" } });
+  assert.equal(drawer.classList.contains("open"), true);
+  assert.equal(document.activeElement, drawer);
+  assert.equal(drawer.getAttribute("tabindex"), "-1");
+  document.dispatch("keydown", { key: "Escape", target: drawer });
+  assert.equal(drawer.classList.contains("open"), false);
+  assert.equal(document.querySelector(".app").inert, false);
+});
+
+test("知识点详情：抽屉里连续切换条目，关闭时仍还原到最初的触发元素", async () => {
+  const { app, document } = consoleApp(async () => ({ ok: true, json: async () => ({ item: { id: "p", claim: "c" }, similar: [] }) }));
+  const trigger = document.createElement();
+  trigger.focus();
+  await app.openPoint("p1");
+  document.querySelector("#pt-body").focus(); // 焦点留在抽屉内部某处
+  await app.openPoint("p2");
+  assert.equal(app.dialogStack.length, 1, "同一个抽屉不重复入栈");
+  app.closePoint();
+  assert.equal(document.querySelector("#pt-drawer").hidden, true);
+  assert.equal(document.activeElement, trigger);
+  assert.equal(app.dialogStack.length, 0);
+});
+
+test("CSP 预备：前端不再有内联事件处理器，缩略图失败改由捕获阶段委托隐藏", () => {
+  const js = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
+  const html = fs.readFileSync(path.join(__dirname, "../web/index.html"), "utf8");
+  const inline = /\son[a-z]+\s*=\s*["']/gi;
+  assert.deepEqual(js.match(inline) || [], [], "app.js 生成的 HTML 不应含 onxxx=");
+  assert.deepEqual(html.match(inline) || [], [], "index.html 不应含 onxxx=");
+  const { app, document } = consoleApp(async () => response());
+  app.renderMediaResults([{ kind: "image", thumb: "https://img.example/a.png", url: "https://example.com/a", title: "图" }]);
+  const out = document.querySelector("#mm-results").innerHTML;
+  assert.match(out, /data-hide-on-error/);
+  const img = { tagName: "IMG", style: {}, hasAttribute: (k) => k === "data-hide-on-error" };
+  document.dispatch("error", { target: img });
+  assert.equal(img.style.visibility, "hidden");
+  const other = { tagName: "IMG", style: {}, hasAttribute: () => false };
+  document.dispatch("error", { target: other });
+  assert.equal(other.style.visibility, undefined, "未标记的图片不受影响");
+});
+
+test("近似阈值：连续键入只发一次扫描，预览立即作废，旧阈值的晚到结果不覆盖", async () => {
+  const { fetch, hits, pending } = countingFetch((k) => k === "/api/knowledge/duplicates");
+  const { app, document, timers } = consoleApp(fetch);
+  const inflight = app.loadDuplicates(0.9); // 旧阈值的扫描还在路上
+  const box = document.querySelector("#dup-threshold");
+  for (const v of ["8", "85", "85.5"]) {
+    box.value = v;
+    box.listeners.input();
+  }
+  assert.equal(hits["/api/knowledge/duplicates"], 1, "防抖窗口内不发新请求");
+  assert.equal(document.querySelector("#btn-confirm-similar").disabled, true, "预览立即作废");
+  pending.shift()({ ok: true, json: async () => ({ threshold: 0.9, pairs: [{ a: {}, b: {}, sim: 0.95 }], total: 1 }) });
+  await inflight;
+  assert.notEqual(document.querySelector("#dup-card").hidden, false, "旧阈值结果被丢弃");
+  const live = timers.filter((t) => t.ms === 350 && !t.cleared);
+  assert.equal(live.length, 1, "只保留最后一次键入的防抖计时器");
+  live[0].fn();
+  assert.equal(hits["/api/knowledge/duplicates"], 2);
+});
+
+test("OCR 批量进度：内容不变不重写 DOM，「查看」委托只绑一次且跟随当前书", () => {
+  const { app, document } = consoleApp(async () => response());
+  const hint = document.querySelector("#lib-task-hint");
+  const o = { batch: true, running: true, batch_total: 3, batch_done: 1, total: 10, done: 4, book_id: "b9", book_title: "书<九>" };
+  app.paintOcrLive(o);
+  const w = hint.writes;
+  app.paintOcrLive(o);
+  assert.equal(hint.writes, w, "同样的进度不重建 DOM");
+  assert.match(hint.innerHTML, /data-book="b9"/);
+  assert.match(hint.innerHTML, /书&lt;九&gt;/);
+  // 书库任务改写同一节点后，相同的 OCR 进度必须能重新写回
+  app.paintLibTask({ running: true, kind: "scan", total: 2, done: 1 });
+  app.paintOcrLive(o);
+  assert.equal(hint.writes, w + 1);
+  const peek = { dataset: { book: "b9", title: "书<九>" } };
+  let prevented = false;
+  hint.listeners.click({ target: { closest: (s) => (s === "#lib-ocr-peek" ? peek : null) }, preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(document.querySelector("#ocr-drawer").classList.contains("open"), true);
+  assert.equal(document.querySelector("#ocr-title").textContent, "书<九>");
 });

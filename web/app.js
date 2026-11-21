@@ -39,14 +39,35 @@ function toast(msg, kind = "") {
 }
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
+  // 无超时的 fetch 在后端卡住时会永远挂起，界面表现为「点了没反应」。
+  // 普通请求 30 秒；长任务可由调用方传 timeoutMs 或自己的 signal。
+  // 老浏览器与精简 DOM 沙箱可能没有 AbortController，此时退化为「无超时」，
+  // 功能不受影响——超时是增强项，不该成为请求能否发出的前提。
+  const canAbort = typeof AbortController === "function";
+  const ctrl = canAbort ? new AbortController() : null;
+  const timer = canAbort && typeof setTimeout === "function"
+    ? setTimeout(() => ctrl.abort(), opts.timeoutMs || 30000) : null;
+  let r;
+  try {
+    r = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      ...opts,
+      ...(canAbort ? { signal: opts.signal || ctrl.signal } : {}),
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
+    });
+  } finally {
+    if (timer !== null && typeof clearTimeout === "function") clearTimeout(timer);
+  }
   if (!r.ok) {
     let msg = `HTTP ${r.status}`;
-    try { msg = (await r.json()).detail || msg; } catch (_) {}
+    try {
+      const detail = (await r.json()).detail;
+      if (typeof detail === "string") msg = detail;
+      else if (Array.isArray(detail)) msg = detail.map((d) => d.msg).join("；");
+    } catch (_) {}
+    if (r.status === 404 && (path.startsWith("/api/refinements") || path.startsWith("/api/knowledge/cleanup"))) {
+      msg = "当前后台服务尚未更新，请重启 EvoMind 后再试";
+    }
     throw new Error(msg);
   }
   return r.json();
@@ -61,6 +82,114 @@ const esc = (s) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
   );
 
+/* 只允许 http/https 绝对 URL 与站内绝对路径进入 href / src。
+   esc() 能挡属性逃逸，但挡不住 javascript: / data: 这类伪协议——
+   来源 URL、网页标题、缩略图地址都来自外部，混进伪协议时点一下就执行脚本。
+   注意协议相对地址 //host 也要挡：它会把用户带离本机控制台。 */
+const safeUrl = (u) => {
+  const s = String(u ?? "").trim();
+  if (!s) return "";
+  // 引号 / 尖括号 / 反引号 / 空白 / 控制字符一律拒绝：
+  // 即使 esc() 能挡属性逃逸，也不该让这类字符串成为 href/src 的值。
+  if (/[\s"'<>`\x00-\x1f]/.test(s)) return "";
+  if (/^https?:\/\//i.test(s)) return s;
+  if (s.startsWith("/") && !s.startsWith("//")) return s;
+  return "";
+};
+
+/* ---------------- 弹层可访问性 ----------------
+   三个弹层（新手引导 / 知识点详情 / OCR 抽屉）都标了 role=dialog aria-modal=true，
+   但此前只有知识点详情响应 Esc，焦点既不移入也不还原：键盘用户按 Tab 会跑进被
+   遮住的背景，读屏照样念背景内容。这里统一处理：
+   - 打开：记下触发元素，焦点移入弹层（优先 initial 指定的按钮）；
+   - 背景 .app 与下层弹层设 inert + aria-hidden，读屏与 Tab 都进不去；
+   - Tab / Shift+Tab 在弹层内循环（不支持 inert 的旧浏览器也兜得住）；
+   - Esc 关闭最上层弹层；输入法组字中的 Esc 不算，多行文本框里的 Esc
+     只把焦点退回弹层，避免误触丢掉没保存的校对文字；
+   - 关闭：撤掉 inert，焦点还给打开前的元素。 */
+const FOCUSABLE_SEL =
+  'a[href],button:not([disabled]),input:not([disabled]):not([type="hidden"]),' +
+  'select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+const dialogStack = [];
+
+function dialogFocusables(el) {
+  if (!el || typeof el.querySelectorAll !== "function") return [];
+  return Array.from(el.querySelectorAll(FOCUSABLE_SEL)).filter(
+    (n) => !n.hidden && (typeof n.getClientRects !== "function" || n.getClientRects().length > 0)
+  );
+}
+
+function syncDialogInert() {
+  const top = dialogStack[dialogStack.length - 1];
+  [$(".app"), ...dialogStack.map((d) => d.el)].forEach((el) => {
+    if (!el) return;
+    const blocked = !!top && el !== top.el;
+    el.inert = blocked;
+    if (blocked) el.setAttribute("aria-hidden", "true");
+    else el.removeAttribute?.("aria-hidden");
+  });
+}
+
+function focusDialog(el, initial) {
+  const active = document.activeElement;
+  // 焦点已经在弹层里（例如详情里点了相似条目、原地重渲染）就不抢
+  if (active && active !== el && typeof el.contains === "function" && el.contains(active) &&
+      active.isConnected !== false) return;
+  const target = (initial && $(initial)) || dialogFocusables(el)[0] || el;
+  if (target === el && el.getAttribute?.("tabindex") == null) el.setAttribute("tabindex", "-1");
+  try { target.focus?.(); } catch (_) {}
+}
+
+function dialogOpened(el, { initial = null, onClose = null } = {}) {
+  if (!el) return;
+  const i = dialogStack.findIndex((d) => d.el === el);
+  // 重复打开同一个弹层（换一条知识点）保留最初的还原目标，只把它挪到最上层
+  const entry = i >= 0 ? dialogStack.splice(i, 1)[0]
+    : { el, restore: document.activeElement || null };
+  entry.onClose = onClose || entry.onClose;
+  dialogStack.push(entry);
+  syncDialogInert();
+  focusDialog(el, initial);
+}
+
+function dialogClosed(el) {
+  const i = dialogStack.findIndex((d) => d.el === el);
+  if (i < 0) return;
+  const wasTop = i === dialogStack.length - 1;
+  const [entry] = dialogStack.splice(i, 1);
+  el.inert = false;
+  el.removeAttribute?.("aria-hidden");
+  syncDialogInert();
+  const r = entry.restore;
+  if (!wasTop || !r || r === document.body || r.isConnected === false) return;
+  try { r.focus?.(); } catch (_) {}
+}
+
+document.addEventListener("keydown", (e) => {
+  const top = dialogStack[dialogStack.length - 1];
+  if (!top) return;
+  if (e.key === "Escape") {
+    if (e.isComposing || e.keyCode === 229) return;
+    e.preventDefault?.();
+    const t = e.target;
+    if (t && (t.tagName === "TEXTAREA" || t.isContentEditable)) {
+      if (top.el.getAttribute?.("tabindex") == null) top.el.setAttribute("tabindex", "-1");
+      try { top.el.focus?.(); } catch (_) {}
+      return;
+    }
+    top.onClose?.();
+    return;
+  }
+  if (e.key !== "Tab") return;
+  const items = dialogFocusables(top.el);
+  if (!items.length) { e.preventDefault?.(); top.el.focus?.(); return; }
+  const first = items[0], last = items[items.length - 1];
+  const active = document.activeElement;
+  const inside = typeof top.el.contains === "function" && top.el.contains(active);
+  if (e.shiftKey && (active === first || !inside)) { e.preventDefault?.(); last.focus(); }
+  else if (!e.shiftKey && (active === last || !inside)) { e.preventDefault?.(); first.focus(); }
+});
+
 /* ---------------- 导航 ---------------- */
 const TITLES = {
   dashboard: "总览",
@@ -68,6 +197,7 @@ const TITLES = {
   knowledge: "知识库",
   analytics: "分析",
   library: "书库",
+  media: "多模态",
   resources: "资源获取",
   finetune: "权重进化",
   chat: "检验所学",
@@ -81,21 +211,43 @@ function switchView(v, fromHash) {
   if (!TITLES[v]) v = "dashboard";
   state.view = v;
   if (!fromHash && location.hash.slice(1) !== v) location.hash = v;
-  $$(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.view === v));
+  $$(".nav-item").forEach((n) => {
+    n.classList.toggle("active", n.dataset.view === v);
+    if (n.dataset.view === v) n.setAttribute("aria-current", "page");
+    else n.removeAttribute?.("aria-current");
+  });
   $$(".view").forEach((s) => s.classList.toggle("active", s.id === "view-" + v));
   $("#page-title").textContent = TITLES[v] || v;
-  if (v === "knowledge") loadKnowledge();
+  if (v === "knowledge") {
+    // 切回知识页必须丢弃上一轮的清理预览快照：它带后端下发的 token，
+    // 库在学习/清理后已变化，拿旧 token 提交会清掉错误的一批数据。
+    clearSimilarPreview();
+    duplicatePage = similarPreviewPage = refinePage = 0;
+    loadKnowledge(); loadRefinements(); loadCleanupState();
+  }
   if (v === "analytics") loadAnalytics();
   if (v === "library") loadLibrary();
+  if (v === "media") loadMediaCaps();
   if (v === "resources") loadResources();
   if (v === "finetune") loadFinetune();
   if (v === "dashboard") { loadDashboard(null, true); refreshSuggestions(true); refreshHealth(true); }
   if (v === "settings") { fillSettings(); loadBackups(); }
-  if (v === "learn") loadAuto();
-  if (pid) openPoint(decodeURIComponent(pid));
+  if (v === "learn") { loadAuto(); loadRotation(); }
+  if (pid) {
+    // 手工改 hash 或链接被截断时会出现非法百分号序列，URIError 不该中断导航
+    try { openPoint(decodeURIComponent(pid)); } catch (_) {}
+  }
 }
 
 $$(".nav-item").forEach((n) => n.addEventListener("click", () => switchView(n.dataset.view)));
+// .nav-item 是 div：补键盘入口，否则 10 个视图对 Tab/Enter 完全不可达。
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const n = e.target.closest?.(".nav-item");
+  if (!n) return;
+  e.preventDefault();
+  switchView(n.dataset.view);
+});
 window.addEventListener("hashchange", () => switchView(location.hash.slice(1), true));
 
 /* 全局委托：所有 [data-goto] 跳转按钮（下一步建议 / 健康度 / 网络空态）——
@@ -207,11 +359,15 @@ const STAGE_TEXT = {
 
 function pushEvent(evt, streamEl, animate = true) {
   const box = streamEl || $("#learn-stream");
-  const empty = box.querySelector(".empty");
+  // 空态占位有两种写法（.empty 与 .stream-empty），来第一条事件时都要清掉，
+  // 否则「还没有开始」会一直挂在日志上方
+  const empty = box.querySelector(".empty, .stream-empty");
   if (empty) empty.remove();
 
   const div = document.createElement("div");
-  div.className = "evt " + (evt.level || "info") + (animate ? " enter" : "");
+  // level 来自 SSE 事件，只接受简单标识符当类名，避免任意字符串污染 class
+  const level = /^[a-z][a-z0-9_-]{0,24}$/.test(evt.level || "") ? evt.level : "info";
+  div.className = "evt " + level + (animate ? " enter" : "");
   const src = evt.source
     ? `<div class="src">↳ ${esc(String(evt.source).slice(0, 90))}</div>`
     : "";
@@ -236,6 +392,16 @@ function pushEvent(evt, streamEl, animate = true) {
 }
 
 function updateRing(round) {
+  // 轮换任务在跑时，圆环代表整个轮换的进度；单批的 100 轮只是其中一小段，
+  // 拿它当分母会让环反复从 0 跳回满格。
+  const rot = state.status?.rotation;
+  if (rot && rot.active && rot.total_round_limit) {
+    const done = rot.total_rounds_done || 0;
+    const pct = Math.min(1, done / rot.total_round_limit);
+    $("#ring-fg").style.strokeDashoffset = String(163.4 * (1 - pct));
+    $("#round-label").textContent = `轮换 ${done} / ${rot.total_round_limit} 轮`;
+    return;
+  }
   const total = state.status?.engine?.total_rounds || 1;
   const pct = Math.min(1, round / total);
   const C = 163.4;
@@ -243,9 +409,10 @@ function updateRing(round) {
   $("#round-label").textContent = `第 ${round} / ${total} 轮`;
 }
 
-// SSE 实时通道是否活着。活着时「最近活动」由 SSE 直接推送（零延迟、零额外请求），
-// 不再每 6 秒轮询 /api/events/recent——那条轮询是 SSE 上线前的遗留，纯冗余；
-// 只有 SSE 断开时才回退成轮询，保证断线时活动流不僵死。
+// SSE 实时通道是否活着。活着时「最近活动」由 SSE 直接推送（零延迟、零请求），
+// 不再轮询 /api/events/recent——那条轮询是 SSE 上线前的遗留，纯冗余。
+// 注意：6 秒的 refreshAll 仍保留，它负责顶栏指标 / 建议 / 健康度 / 版本门控，
+// 与活动流无关；断线时 sseAlive=false 只影响徽标，不会额外拉起事件轮询。
 let sseAlive = false;
 
 /* 总览「最近活动」头部的实时状态徽标：让「实时」两个字名副其实——
@@ -264,13 +431,21 @@ function updateFeedLive() {
   }
 }
 
+let sseEs = null;
+let sseReconnectTimer = null;
+
 function connectSSE() {
-  const es = new EventSource("/api/events");
+  // 网络抖动可连续派发 onerror；没有全局句柄与排队标志时会并存多条连接。
+  if (sseEs) { try { sseEs.close(); } catch (_) {} }
+  clearTimeout(sseReconnectTimer);
+  sseReconnectTimer = null;
+  const es = sseEs = new EventSource("/api/events");
   // 服务端回放历史后会发 history-end，之前收到的都算历史，不播入场动画
   let sseReady = false;
   let firstMsg = true;
   es.onopen = () => {
     sseAlive = true;
+    state.sseRetry = 2000;
     updateFeedLive();
   };
   es.addEventListener("history-end", () => {
@@ -292,12 +467,18 @@ function connectSSE() {
       // 其余视图 → #learn-stream。SSE 早已打开，没必要再让总览每 6 秒轮询一次。
       if (state.view === "dashboard") {
         appendDashEvent(evt, sseReady);
+      } else if (state.view === "media") {
+        // 多模态页有自己的进度面板；不切过去就看不到解析/转写的实时进度
+        pushEvent(evt, $("#media-stream"), sseReady);
       } else {
         pushEvent(evt, null, sseReady);
       }
       if (evt.level === "download" || evt.level === "error") {
         if (evt.msg.includes("下载完成")) toast(evt.msg, "ok");
       }
+      // 轮换的换向 / 结束事件要立刻反映到面板，不必等 6 秒轮询；
+      // 面板不可见时不必刷（切回该页会重新拉一次）。
+      if (evt.rotation && state.view === "learn") scheduleRotationRefresh();
     } catch (_) {}
   };
   es.onerror = () => {
@@ -305,9 +486,20 @@ function connectSSE() {
     updateFeedLive();
     es.close();
     sseReady = false;
-    setTimeout(connectSSE, 4000);
+    state.sseRetry = Math.min((state.sseRetry || 2000) * 2, 30000);
+    if (sseReconnectTimer === null) {
+      sseReconnectTimer = setTimeout(() => {
+        sseReconnectTimer = null;
+        connectSSE();
+      }, state.sseRetry);
+    }
   };
 }
+
+window.addEventListener("beforeunload", () => {
+  clearTimeout(sseReconnectTimer);
+  if (sseEs) { try { sseEs.close(); } catch (_) {} }
+});
 
 /* ---------------- 总览 ---------------- */
 /* 内容没变就不动 DOM —— 轮询刷新时避免整块重绘导致文字闪动 */
@@ -486,7 +678,7 @@ function renderHealth(h) {
     setHTML($("#health-level"), "空库");
     setHTML(box, `<div class="empty" style="text-align:left;line-height:1.8;padding:2px 2px 8px">
       <div style="font-weight:600;margin-bottom:4px">知识库还是空的，健康度无从谈起</div>
-      <div>去「自主进化」定一个具体方向，学几轮之后这里会给出一整套评分：规模、可信度、信源多样性、学习新鲜度——哪项最低，就说明下一步该补什么。</div>
+      <div>去「自主进化」定一个具体方向，学几轮之后这里会给出一整套评分：规模、事实依据、信源多样性、学习新鲜度——哪项最低，就说明下一步该补什么。</div>
     </div>`);
     setHTML(weak, `<button class="btn primary sm" data-goto="learn">去定方向 →</button>`);
     return;
@@ -517,6 +709,23 @@ function renderHealth(h) {
       })
       .join("")
   );
+  // 事实质量明细：与「事实依据」维度同源，把原始计数摊开给用户看，
+  // 避免一个 0~100 的分数把「没有证据」遮掩过去。
+  const q = h.quality || {};
+  if (q.available) {
+    const sb = q.status_breakdown || {};
+    const n = (x) => Number(x) || 0;
+    setHTML(box, box.innerHTML + `<div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(128,128,128,.25)">
+      <div class="rowflex" style="justify-content:space-between;font-size:12.5px">
+        <span>事实质量明细</span><span class="mono dim">schema v${n(q.schema_version)}</span>
+      </div>
+      <div class="hint" style="margin:2px 0 0;line-height:1.7">
+        带引文 ${n(q.with_evidence)}/${n(q.active)} 条 · 独立核查 ${n(q.independent_verify_count)} 次 ·
+        纠错 ${n(q.correction_count)} 次 · 负反馈 ${n(q.feedback_count)} 条 ·
+        争议 ${n(sb.disputed)} 条 · 已归档 ${n(sb.archived)} 条
+      </div>
+    </div>`);
+  }
   const w = h.weakest || {};
   setHTML(
     weak,
@@ -586,11 +795,13 @@ function openOnboarding() {
   obStep = 0;
   renderOnboarding();
   $("#onboarding").hidden = false;
+  dialogOpened($("#onboarding"), { initial: "#ob-next", onClose: closeOnboarding });
 }
 
 function closeOnboarding() {
   try { localStorage.setItem(OB_KEY, "1"); } catch (_) {}
   $("#onboarding").hidden = true;
+  dialogClosed($("#onboarding"));
 }
 
 function maybeShowOnboarding() {
@@ -685,6 +896,7 @@ function renderMilestones(points) {
 }
 
 function paintTopbar(st) {
+  learnActive = !!st.engine.running;
   $("#m-points").textContent = st.stats.points;
   $("#m-docs").textContent = st.stats.documents;
   $("#m-disk").textContent = st.stats.disk_gb + " GB";
@@ -721,39 +933,114 @@ function paintTopbar(st) {
       ? "CUDA 不可用"
       : "微调未装";
 
-  $("#btn-start").disabled = running;
-  $("#btn-stop").disabled = !running;
+  $("#btn-start").disabled = running || learnStarting || !!st.rotation?.active;
+  $("#btn-stop").disabled = !running && !st.rotation?.active;
   $("#stage-tag").textContent = STAGE_TEXT[st.engine.stage] || st.engine.stage;
   if (st.engine.running) updateRing(st.engine.round);
 }
 
 /* ---------------- 学习 ---------------- */
-$("#btn-start").addEventListener("click", async () => {
-  const direction = $("#direction").value.trim();
+let learnStarting = false;
+let learnActive = false;
+async function startLearning(chosen) {
+  if (learnStarting || learnActive || state.status?.engine?.running) return;
+  if (state.status?.rotation?.active) return toast("方向轮换正在运行，先暂停或结束它", "err");
+  const direction = chosen || $("#direction").value.trim();
   if (!direction) return toast("先写一个学习方向", "err");
+  $("#direction").value = direction;
+  $$(".direction-choice").forEach((el) => el.classList.toggle("selected", el.textContent === direction));
   const rounds = parseInt($("#rounds").value, 10);
-  $("#learn-stream").innerHTML = "";
+  learnStarting = true;
+  $("#btn-start").disabled = true;
   try {
     const r = await api("/api/learn/start", { method: "POST", body: { direction, rounds } });
     if (!r.ok) return toast(r.msg || "启动失败", "err");
+    learnActive = true;
+    $("#learn-stream").innerHTML = "";
+    if (state.status) state.status.engine.running = true;
     toast("已启动进化学习", "ok");
     $("#btn-start").disabled = true;
     $("#btn-stop").disabled = false;
   } catch (e) {
     toast("启动失败：" + e.message, "err");
+  } finally {
+    learnStarting = false;
+    const running = learnActive || !!state.status?.engine?.running;
+    $("#btn-start").disabled = running;
   }
-});
+}
+$("#btn-start").addEventListener("click", () => startLearning());
 
 $("#btn-stop").addEventListener("click", async () => {
-  await api("/api/learn/stop", { method: "POST" });
-  toast("已发送停止指令");
+  try {
+    await api("/api/learn/stop", { method: "POST" });
+    autoOn = false;
+    await loadAuto();
+    toast("已停止持续调度，当前请求完成后收尾");
+  } catch (e) { toast(e.message, "err"); }
 });
 
 $$("#presets .chip").forEach((c) =>
   c.addEventListener("click", () => {
     $("#direction").value = c.textContent;
+    $("#direction-seed").value = c.textContent;
   })
 );
+
+let directionChoices = [];
+let directionSeed = "";
+let directionsBusy = false;
+async function refreshDirections() {
+  if (directionsBusy) return [];
+  const seed = $("#direction-seed").value.trim();
+  if (!seed) { toast("先填一个预设领域", "err"); return []; }
+  directionsBusy = true;
+  $("#btn-directions").disabled = true;
+  try {
+    const r = await api("/api/learn/directions", {
+      method: "POST", body: { seed, exclude: directionSeed === seed ? directionChoices : [] },
+    });
+    // A result for an earlier input must not overwrite a newly typed seed.
+    if ($("#direction-seed").value.trim() !== seed) return [];
+    directionChoices = r.items || [];
+    directionSeed = seed;
+    $("#direction-options").innerHTML = directionChoices.map((t, i) =>
+      `<button class="direction-choice" data-direction-index="${i}" type="button">${esc(t)}</button>`
+    ).join("");
+    return directionChoices;
+  } catch (e) { toast("刷新失败：" + e.message, "err"); return []; }
+  finally { directionsBusy = false; $("#btn-directions").disabled = false; }
+}
+$("#btn-directions").addEventListener("click", refreshDirections);
+$("#direction-options").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-direction-index]");
+  if (!btn) return;
+  const chosen = directionChoices[Number(btn.dataset.directionIndex)];
+  if (chosen) {
+    $("#direction").value = chosen;
+    $$(".direction-choice").forEach((el) => el.classList.toggle("selected", el === btn));
+  }
+});
+let choosingRandom = false;
+async function chooseRandomDirection() {
+  if (choosingRandom) return;
+  choosingRandom = true;
+  $("#btn-random-learn").disabled = true;
+  try {
+    const choices = directionSeed === $("#direction-seed").value.trim() && directionChoices.length
+      ? directionChoices : await refreshDirections();
+    if (choices.length) {
+      const direction = choices[Math.floor(Math.random() * choices.length)];
+      $("#direction").value = direction;
+      $$(".direction-choice").forEach((el) => el.classList.toggle("selected", el.textContent === direction));
+      toast("方向已选好，调整轮数后点击「开始进化学习」");
+    }
+  } finally {
+    choosingRandom = false;
+    $("#btn-random-learn").disabled = false;
+  }
+}
+$("#btn-random-learn").addEventListener("click", chooseRandomDirection);
 
 /* ---------------- 持续自学 ---------------- */
 let autoOn = false;
@@ -763,6 +1050,7 @@ async function loadAuto() {
     const a = await api("/api/auto");
     autoOn = a.enabled;
     paintAuto(a);
+    if (!$("#direction").value && a.direction) $("#direction").value = a.direction;
   } catch (_) {}
 }
 
@@ -774,14 +1062,37 @@ function paintAuto(a) {
   const d = $("#auto-desc");
   if (a.enabled) {
     // 状态用按钮的 primary 态表达，说明文字保持中性色，别整段变绿抢视线
-    const idle = a.idle_minutes;
-    d.innerHTML = `沿用「${esc(a.direction || "上次方向")}」，空闲 ${idle} 分钟后自动学 2 轮 · 已自动学 ${a.runs} 次`;
+    const wait = a.waiting ? ` · 等待：${esc(a.waiting)}` : a.next_run ? ` · 约${Math.max(0, Math.ceil(a.next_run - Date.now() / 1000))}秒后继续` : "";
+    d.innerHTML = `沿用「${esc(a.direction || "上次方向")}」，间隔 ${a.idle_seconds} 秒 · 每次 ${a.auto_rounds} 轮 · 已自动学 ${a.runs} 次${wait}`;
     d.style.color = "";
   } else {
-    d.textContent = "开启后，学完一段空闲一会儿就自动接着学，不用一直盯着";
+    d.textContent = "每段学习结束后最多等待30秒继续；导入、OCR、微调或炼化期间等待，停止学习会关闭调度。";
     d.style.color = "";
   }
 }
+
+let autoSettingsFilled = false;
+function autoOptions() {
+  const idle_seconds = Number($("#auto-seconds").value);
+  const auto_rounds = Number($("#auto-rounds").value);
+  if (!Number.isInteger(idle_seconds) || idle_seconds < 1 || idle_seconds > 30) throw new Error("学习间隔请输入1到30之间的整数秒");
+  if (!Number.isInteger(auto_rounds) || auto_rounds < 1 || auto_rounds > 100) throw new Error("每次轮数请输入1到100之间的整数");
+  return { idle_seconds, auto_rounds };
+}
+function fillAutoSettings(a) {
+  if (autoSettingsFilled) return;
+  $("#auto-seconds").value = a.idle_seconds || 15;
+  $("#auto-rounds").value = a.auto_rounds || 2;
+  if (state.status?.config?.learning_seed) $("#direction-seed").value = state.status.config.learning_seed;
+  autoSettingsFilled = true;
+}
+$("#btn-auto-save").addEventListener("click", async () => {
+  try {
+    await api("/api/config", { method: "POST", body: autoOptions() });
+    await loadAuto();
+    toast("持续自学设置已保存", "ok");
+  } catch (e) { toast(e.message, "err"); }
+});
 
 $("#btn-auto").addEventListener("click", async () => {
   const direction = $("#direction").value.trim();
@@ -792,7 +1103,8 @@ $("#btn-auto").addEventListener("click", async () => {
   try {
     const r = await api("/api/auto", {
       method: "POST",
-      body: { enabled: !autoOn, direction: direction || undefined },
+      body: { enabled: !autoOn, direction: direction || undefined,
+        ...(!autoOn ? autoOptions() : {}) },
     });
     autoOn = r.enabled;
     paintAuto(r);
@@ -802,7 +1114,453 @@ $("#btn-auto").addEventListener("click", async () => {
   }
 });
 
+/* ---------------- 学习方向自动更换（轮换） ---------------- */
+let rotationBusy = false;
+let rotationSettingsFilled = false;
+let rotationPreviewShown = false;
+let rotationSummaryRun = "";
+let rotationRefreshTimer = 0;
+// 预览过的子方向：启动时若母方向没变就沿用，避免「预览看到的」和「实际学的」是两批
+let rotPreviewItems = [];
+let rotPreviewSeed = "";
+
+function scheduleRotationRefresh() {
+  clearTimeout(rotationRefreshTimer);
+  rotationRefreshTimer = setTimeout(() => loadRotation(), 400);
+}
+
+// 后端 /api/rotation 会直接给 status_text；这里只留一份兜底，
+// 供旧缓存状态或本地构造的对象使用，正常路径不再各自维护一套文案。
+const ROT_STATUS = {
+  total_rounds: "已完成", stopped: "已手动结束", error: "异常结束",
+  no_plan: "无可用子方向", no_direction: "无可用子方向",
+};
+const ROT_STAGE = {
+  idle: "空闲", starting: "启动中", splitting: "拆解子方向", switching: "换方向",
+  learning: "学习中", pausing: "暂停中", paused: "已暂停", stopping: "结束中",
+  waiting_model: "等待模型",
+  done: "已结束", stopped: "已结束",
+};
+
+function rotNumber(sel, label, min, max) {
+  const v = Number($(sel).value);
+  if (!Number.isInteger(v) || v < min || v > max) {
+    throw new Error(`${label}请输入 ${min} 到 ${max} 之间的整数`);
+  }
+  return v;
+}
+
+function paintRotation(r) {
+  if (!r) return;
+  const active = !!r.active;
+  $("#rot-tag").textContent = r.status_text
+    || (active
+      ? (r.paused ? "已暂停" : (ROT_STAGE[r.stage] || "进行中"))
+      : (ROT_STATUS[r.stop_reason] || "未启动"));
+  const startBtn = $("#btn-rot-start");
+  startBtn.disabled = active || rotationBusy;
+  startBtn.title = active ? "已有轮换任务在运行，先暂停或结束" : "按当前参数开始自动轮换";
+  $("#btn-rot-plan").disabled = rotationBusy;
+  $("#btn-rot-plan").title = "只拆解子方向，不启动学习";
+  $("#btn-rot-pause").disabled = !active || r.paused;
+  $("#btn-rot-pause").title = !active
+    ? "没有运行中的任务"
+    : (r.paused ? "已经是暂停状态" : "让当前这一轮跑完再停");
+  $("#btn-rot-resume").disabled = !active || !r.paused;
+  $("#btn-rot-resume").title = !active
+    ? "没有可恢复的任务"
+    : (r.paused ? "从剩余轮次继续" : "任务正在运行");
+  $("#btn-rot-stop").disabled = !active;
+  $("#btn-rot-stop").title = active ? "结束任务并输出各方向汇总" : "没有运行中的任务";
+  const skipBtn = $("#btn-rot-skip");
+  if (skipBtn) {
+    skipBtn.disabled = !active || !r.current || !!r.skip_requested;
+    skipBtn.title = !active
+      ? "没有运行中的任务"
+      : (!r.current ? "还没有选中方向" : "放弃该方向剩余轮次，立刻换下一个");
+  }
+  if (!$("#rot-seed").value && (r.seed || r.last_run?.seed)) {
+    $("#rot-seed").value = r.seed || r.last_run.seed;
+  }
+
+  // 预览结果先占着状态栏，别让 6 秒轮询把它擦掉（但计划/历史照常渲染）
+  const keepPreview = !active && !r.stop_reason && rotationPreviewShown;
+
+  let text;
+  if (active) {
+    const left = Math.max(0, (r.rounds_per_direction || 0) - (r.rounds_in_current || 0));
+    const head = r.paused ? "已暂停" : (ROT_STAGE[r.stage] || "进行中");
+    text = `<b>${head}</b> · 母方向「${esc(r.seed)}」`;
+    if (r.current) text += ` · 当前「${esc(r.current)}」还剩 ${left} 轮`;
+    text += ` · 总计 ${r.total_rounds_done}/${r.total_round_limit} 轮`;
+    if (r.direction_total) text += ` · 子方向 ${r.direction_index || 0}/${r.direction_total}`;
+    if (r.switch_count) text += ` · 已换向 ${r.switch_count} 次`;
+    if (r.retry_in) text += ` · ${r.retry_in} 秒后自动重试`;
+    else if (r.skip_requested) text += " · 正在跳过当前方向";
+    else if (r.blocked) text += " · 等待其他任务结束";
+    else if (r.failures) text += ` · 连续 ${r.failures} 次未推进`;
+  } else if (r.stop_reason) {
+    text = `<b>${ROT_STATUS[r.stop_reason] || "已结束"}</b> · 母方向「${esc(r.seed)}」 · `
+      + `共 ${r.total_rounds_done} 轮 / 上限 ${r.total_round_limit} 轮`;
+  } else if (r.last_run) {
+    text = `<b>上次任务</b> · 「${esc(r.last_run.seed)}」 · `
+      + `${r.last_run.total_rounds}/${r.last_run.total_limit} 轮`;
+  } else {
+    text = "尚未启动";
+  }
+  if (!keepPreview) $("#rot-status").innerHTML = text;
+
+  const pct = Math.max(0, Math.min(100, 100 * (r.progress || 0)));
+  const showBar = active || (r.total_rounds_done || 0) > 0;
+  const bar = $("#rot-bar");
+  bar.hidden = !showBar;
+  bar.setAttribute("role", "progressbar");
+  bar.setAttribute("aria-label", "轮换总进度");
+  bar.setAttribute("aria-valuemin", "0");
+  bar.setAttribute("aria-valuemax", String(r.total_round_limit || 0));
+  bar.setAttribute("aria-valuenow", String(r.total_rounds_done || 0));
+  $("#rot-bar-fill").style.width = (showBar ? pct : 0) + "%";
+
+  const plan = (r.plan && r.plan.length) ? r.plan : (r.last_run?.directions || []);
+  $("#rot-plan-list").innerHTML = plan.map((e) => {
+    const st = e.status || "pending";
+    const meta = st === "rejected"
+      ? "越界已丢弃"
+      : `${e.rounds || 0} 轮 · ${e.points || 0} 条`;
+    return `<div class="rot-item ${esc(st)}" title="${esc(e.note || e.direction || "")}"
+      aria-current="${st === "active" ? "true" : "false"}">
+      <span class="dot"></span><span class="name">${esc(e.direction)}</span>
+      <span class="meta">${meta}</span></div>`;
+  }).join("");
+
+  // /api/status 里的 rotation 不带 history（那是要查库的字段，不能进 6 秒轮询）。
+  // 只有明确给了数组才重画，否则保留当前内容——不然每次轮询都会把「最近任务」刷掉。
+  if (Array.isArray(r.history)) paintRotationHistory(r.history);
+}
+
+function paintRotationHistory(history) {
+  const box = $("#rot-history");
+  if (!box) return;
+  if (!history.length) {
+    box.hidden = true;
+    $("#rot-history-list").innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  $("#rot-history-list").innerHTML = history.map((h) => {
+    const when = h.started_at
+      ? new Date(h.started_at * 1000).toLocaleString("zh-CN", { hour12: false })
+      : "—";
+    const text = h.status_text || ROT_STATUS[h.status] || h.status || "";
+    return `<div class="rot-hist-row">
+      <span class="name">${esc(h.seed)}</span>
+      <span class="meta">${h.total_rounds || 0}/${h.total_limit || 0} 轮 · ${esc(text)} · ${esc(when)}</span>
+    </div>`;
+  }).join("");
+}
+
+function renderRotationSummary(summ) {
+  const box = $("#rot-summary");
+  const actions = $("#rot-summary-actions");
+  if (!summ || !(summ.directions || []).length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    if (actions) actions.hidden = true;
+    return;
+  }
+  const switchCount = summ.switch_count != null
+    ? summ.switch_count
+    : (summ.switches || []).filter((s) => s && s.from).length;
+  const secs = summ.elapsed_seconds || 0;
+  const cost = secs ? ` · 耗时 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒` : "";
+  const skipped = summ.skipped_count || 0;
+  const drop = skipped ? ` · 丢弃越界方向 ${skipped} 个` : "";
+  const lines = [
+    `<div class="rot-head">方向轮换汇总 · 母方向「${esc(summ.seed)}」</div>`,
+    `总 ${summ.total_rounds} 轮 / 上限 ${summ.total_limit} · 每方向 ${summ.rounds_per_direction} 轮`
+      + ` · 切换 ${switchCount} 次 · 新增 ${summ.points_total} 条知识${cost}${drop}`,
+  ];
+  (summ.directions || []).forEach((d) => {
+    const short = d.rounds < (summ.rounds_per_direction || 0) ? "（未学满）" : "";
+    lines.push(`· ${esc(d.direction)}：${d.rounds} 轮 / ${d.points} 条${short}`);
+    (d.highlights || []).slice(0, 2).forEach((h) => lines.push(`　　· ${esc(String(h).slice(0, 80))}`));
+  });
+  box.innerHTML = lines.join("\n");
+  box.hidden = false;
+  if (actions) actions.hidden = false;
+}
+
+$("#btn-rot-copy").addEventListener("click", async () => {
+  const box = $("#rot-summary");
+  const text = (box && (box.innerText || box.textContent) || "").trim();
+  if (!text) return toast("还没有可复制的汇总", "err");
+  try {
+    if (typeof navigator === "undefined" || !navigator.clipboard) {
+      throw new Error("clipboard unavailable");
+    }
+    await navigator.clipboard.writeText(text);
+    toast("汇总已复制到剪贴板", "ok");
+  } catch (_) {
+    // 非 https 或浏览器禁用了剪贴板权限：给出可执行的替代动作，而不是静默失败
+    toast("浏览器不允许自动复制，请手动选中汇总文本", "err");
+  }
+});
+
+async function loadRotation(force = false) {
+  if (rotationBusy && !force) return;
+  try {
+    const r = await api("/api/rotation");
+    paintRotation(r);
+    if (!r.active && r.stop_reason && rotationSummaryRun !== r.run_id) {
+      rotationSummaryRun = r.run_id || "last";
+      const s = await api("/api/rotation/summary");
+      renderRotationSummary(s.summary);
+    }
+  } catch (_) {}
+}
+
+function fillRotationSettings(cfg) {
+  if (rotationSettingsFilled || !cfg) return;
+  if (cfg.rotation_rounds_per_direction) $("#rot-per").value = cfg.rotation_rounds_per_direction;
+  if (cfg.rotation_total_rounds) $("#rot-total").value = cfg.rotation_total_rounds;
+  if (cfg.rotation_subdirection_count) $("#rot-count").value = cfg.rotation_subdirection_count;
+  if (cfg.rotation_recent_window) $("#rot-window").value = cfg.rotation_recent_window;
+  $("#rot-boundary").value = cfg.rotation_boundary_check === false ? "0" : "1";
+  if (!$("#rot-seed").value && cfg.learning_seed) $("#rot-seed").value = cfg.learning_seed;
+  rotationSettingsFilled = true;
+}
+
+$("#btn-rot-start").addEventListener("click", async () => {
+  if (rotationBusy) return;
+  const seed = ($("#rot-seed").value || $("#direction").value).trim();
+  if (!seed) return toast("先填一个大致的学习方向", "err");
+  let body;
+  try {
+    body = {
+      seed,
+      rounds_per_direction: rotNumber("#rot-per", "每个子方向轮数", 1, 2000),
+      total_rounds: rotNumber("#rot-total", "总轮次上限", 1, 100000),
+      subdirection_count: rotNumber("#rot-count", "子方向数量", 2, 20),
+    };
+    const windowSize = rotNumber("#rot-window", "不重复窗口", 1, 20);
+    await api("/api/config", {
+      method: "POST",
+      body: {
+        rotation_recent_window: windowSize,
+        rotation_boundary_check: $("#rot-boundary").value === "1",
+      },
+    });
+  } catch (e) {
+    return toast(e.message, "err");
+  }
+  if (body.total_rounds < body.rounds_per_direction) {
+    toast("总轮次比每方向轮数还少：只会学完一个方向的一部分", "");
+  }
+  rotationBusy = true;
+  $("#btn-rot-start").disabled = true;
+  try {
+    if (rotPreviewSeed === seed && rotPreviewItems.length) body.items = rotPreviewItems;
+    const r = await api("/api/rotation/start", { method: "POST", body });
+    if (!r.ok) return toast(r.msg || "启动失败", "err");
+    rotationPreviewShown = false;
+    rotationSummaryRun = "";
+    $("#rot-summary").hidden = true;
+    toast("已启动方向轮换：正在确定子方向", "ok");
+    await loadRotation(true);
+  } catch (e) {
+    toast("启动失败：" + e.message, "err");
+  } finally {
+    rotationBusy = false;
+    $("#btn-rot-start").disabled = !!state.status?.rotation?.active;
+  }
+});
+
+$("#btn-rot-plan").addEventListener("click", async () => {
+  if (rotationBusy) return;
+  const seed = ($("#rot-seed").value || $("#direction").value).trim();
+  if (!seed) return toast("先填一个大致的学习方向", "err");
+  let count;
+  try {
+    count = rotNumber("#rot-count", "子方向数量", 2, 20);
+  } catch (e) {
+    return toast(e.message, "err");
+  }
+  rotationBusy = true;
+  $("#btn-rot-plan").disabled = true;
+  try {
+    const r = await api("/api/rotation/plan", { method: "POST", body: { seed, count } });
+    const items = r.items || [];
+    $("#rot-plan-list").innerHTML = items.length
+      ? items.map((t) => `<div class="rot-item pending"><span class="dot"></span>
+          <span class="name">${esc(t)}</span><span class="meta">预览</span></div>`).join("")
+      : `<div class="hint">没拆出可用方向，换一个更明确的领域名试试</div>`;
+    rotPreviewItems = items;
+    rotPreviewSeed = seed;
+    $("#rot-status").innerHTML = `预览：将从「${esc(seed)}」拆出 ${items.length} 个子方向`
+      + `（尚未启动；点「开始自动轮换」会沿用这批方向）`;
+    rotationPreviewShown = true;
+  } catch (e) {
+    toast("预览失败：" + e.message, "err");
+  } finally {
+    rotationBusy = false;
+    $("#btn-rot-plan").disabled = false;
+  }
+});
+
+async function rotationAction(path, okMsg) {
+  if (rotationBusy) return;
+  rotationBusy = true;
+  try {
+    const r = await api(path, { method: "POST" });
+    if (r.ok === false) toast(r.msg || "操作失败", "err");
+    else if (okMsg) toast(okMsg, "ok");
+    if (path.endsWith("/stop")) {
+      rotationPreviewShown = false;
+      rotationSummaryRun = "";
+      const s = await api("/api/rotation/summary");
+      renderRotationSummary(s.summary);
+    }
+    await loadRotation(true);
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    rotationBusy = false;
+  }
+}
+$("#btn-rot-pause").addEventListener("click", () => rotationAction("/api/rotation/pause", "已暂停：当前这一轮跑完就停住"));
+$("#btn-rot-resume").addEventListener("click", () => rotationAction("/api/rotation/resume", "已恢复"));
+$("#btn-rot-skip").addEventListener("click", () => rotationAction("/api/rotation/skip", "已跳过当前方向，正在换下一个"));
+$("#btn-rot-stop").addEventListener("click", () => rotationAction("/api/rotation/stop", "已结束，汇总见下方"));
+
+/* ---------------- 二次炼化 ---------------- */
+let refineRequest = 0;
+let refineHTML = "";
+let refinePage = 0;
+let refineTopic = "";
+let refinementLaunching = false;
+let lastRefineState = {};
+function paintRefinement(s) {
+  lastRefineState = s;
+  const busy = !!s.running || refinementLaunching;
+  $("#btn-refine").disabled = busy;
+  $("#btn-refine-books").disabled = busy;
+  $("#btn-refine-stop").disabled = !s.running;
+  const progress = $("#refine-progress");
+  progress.hidden = !(s.total > 0);
+  progress.value = Math.max(0, Math.min(100, 100 * (s.done || 0) / Math.max(1, s.total || 0)));
+  let message = "";
+  if (s.mode === "books" && s.total) {
+    const counts = `已处理 ${s.done || 0}/${s.total} 条 · 跳过已完成 ${s.skipped || 0} 条 · 本次保存 ${s.saved || 0} 批`;
+    if (s.running) message = `全部书籍：${counts} · 第 ${s.batch || 0}/${s.batches || 0} 批${s.current ? " · 《" + s.current + "》" : ""}${s.phase ? " · " + s.phase : ""}`;
+    else if (s.stage === "stopped") message = `已停止，进度已保存；再次一键可继续。${counts}`;
+    else if (s.stage === "partial") message = `本次处理完成，${s.failed || 0} 批失败；再次一键可重试未完成部分。${counts}`;
+    else if (s.stage === "done") message = `全部书籍炼化完成。${counts}`;
+    else message = counts;
+  } else if (s.running) message = `正在炼化 ${s.done}/${s.total} 条…`;
+  else if (s.stage === "stopped") message = "已停止，已保存的结果可继续查看";
+  if (s.error) message = s.error + (message ? " · " + message : "");
+  $("#refine-status").textContent = message;
+}
+async function loadRefinements() {
+  const request = ++refineRequest;
+  const topic = $("#kb-topic").value;
+  if (topic !== refineTopic) { refinePage = 0; refineTopic = topic; }
+  const page = refinePage;
+  try {
+    const params = new URLSearchParams({ limit: "20", offset: String(page * 20) });
+    if (topic) params.set("topic", topic);
+    const r = await api("/api/refinements?" + params);
+    if (request !== refineRequest || topic !== $("#kb-topic").value || page !== refinePage) return;
+    const s = r.state;
+    paintRefinement(s);
+    const total = r.total ?? (r.items || []).length;
+    $("#btn-refine-prev").disabled = page === 0;
+    $("#btn-refine-next").disabled = (page + 1) * 20 >= total;
+    $("#refine-page").textContent = `第${page + 1}/${Math.max(1, Math.ceil(total / 20))}页 · 共${total}批结果`;
+    const html = (r.items || []).map((row) => `<details class="refinement-result">
+      <summary>${row.book_title ? "《" + esc(row.book_title) + "》 · " : ""}${esc(row.topic)} · ${row.input_count} 条 → ${row.items.length} 个核心 · 压缩 ${Math.round((1 - row.after_chars / Math.max(1, row.before_chars)) * 100)}% · ${new Date(row.created_at * 1000).toLocaleString()}</summary>
+      ${!row.items.length ? '<p class="hint">本批核心已合并至已有炼化结果，原始出处仍可追溯。</p>' : ""}
+      ${row.items.map((p) => `<div class="refinement-point"><strong>${esc(p.claim)}</strong><p>${esc(p.detail)}</p>
+        ${(p.source_ids || []).map((id) => { const src = row.sources.find((s) => s.id === id); return src ? `<button class="btn sm" data-pid="${esc(id)}">原知识：${esc(src.claim).slice(0, 45)}</button>${safeUrl(src.source_url) ? ` <a href="${esc(safeUrl(src.source_url))}" target="_blank" rel="noreferrer">来源原文</a>` : ""}` : ""; }).join(" ")}
+      </div>`).join("")}
+    </details>`).join("") || '<div class="empty">当前范围尚无炼化结果</div>';
+    if (html !== refineHTML) { $("#refine-results").innerHTML = html; refineHTML = html; }
+  } catch (e) { $("#refine-status").textContent = "加载失败：" + e.message; }
+}
+async function startRefinement(books = false) {
+  if (refinementLaunching || lastRefineState.running) return;
+  refinementLaunching = true;
+  paintRefinement(lastRefineState);
+  try {
+    const r = await api(books ? "/api/refinements/books/start" : "/api/refinements/start", {
+      method: "POST", ...(books ? {} : { body: { topic: $("#kb-topic").value || null } }),
+    });
+    if (!r.ok) toast(r.msg, "err");
+    else {
+      if (books) {
+        $("#kb-topic").value = "";
+        refinePage = 0;
+        loadKnowledge();
+      }
+      toast(r.completed ? "全部书籍已炼化，无需重复处理" : books
+        ? `已开始整理全部书籍：待处理 ${r.pending} 条，自动跳过 ${r.skipped} 条` : `已开始炼化 ${r.total} 条知识`, "ok");
+    }
+  } catch (e) { toast(e.message, "err"); }
+  finally {
+    refinementLaunching = false;
+    paintRefinement(lastRefineState);
+    await loadRefinements();
+  }
+}
+$("#btn-refine").addEventListener("click", () => startRefinement());
+$("#btn-refine-books").addEventListener("click", () => startRefinement(true));
+$("#btn-refine-prev").addEventListener("click", () => { if (refinePage > 0) { refinePage--; loadRefinements(); } });
+$("#btn-refine-next").addEventListener("click", () => { refinePage++; loadRefinements(); });
+$("#btn-refine-stop").addEventListener("click", async () => {
+  try { await api("/api/refinements/stop", { method: "POST" }); toast("当前模型请求完成后停止炼化"); }
+  catch (e) { toast(e.message, "err"); }
+});
+
 /* ---------------- 知识库 ---------------- */
+let cleanupBusy = false;
+let cleanupUndo = false;
+async function loadCleanupState() {
+  try {
+    const s = await api("/api/knowledge/cleanup");
+    cleanupUndo = !!s.available;
+    $("#btn-cleanup-undo").disabled = cleanupBusy || !cleanupUndo;
+  } catch (_) {}
+}
+async function cleanupKnowledge(undo = false) {
+  if (cleanupBusy) return;
+  clearSimilarPreview();
+  cleanupBusy = true;
+  $("#btn-cleanup").disabled = true;
+  $("#btn-cleanup-undo").disabled = true;
+  $("#cleanup-status").textContent = undo ? "正在恢复…" : "正在扫描并清理确定重复项…";
+  try {
+    const result = await api(undo ? "/api/knowledge/cleanup/undo" : "/api/knowledge/cleanup", { method: "POST" });
+    if (!result.ok) throw new Error(result.msg || "操作未完成");
+    cleanupUndo = !!result.undo?.available;
+    $("#cleanup-status").textContent = undo ? `已恢复 ${result.restored} 条知识` :
+      `已清理 ${result.removed} 条确定重复项，保留 ${result.remaining} 条；近似内容保留供核对`;
+    toast(undo ? "已撤销清理" : `已清理 ${result.removed} 条重复知识，可撤销`, "ok");
+    state.kbVer = state.dupVer = state.anVer = -1;
+    if (state.pointId) closePoint();
+    await loadKnowledge();
+    await refreshAll();
+  } catch (e) {
+    $("#cleanup-status").textContent = e.message;
+    toast(e.message, "err");
+  } finally {
+    cleanupBusy = false;
+    $("#btn-cleanup").disabled = false;
+    $("#btn-cleanup-undo").disabled = !cleanupUndo;
+  }
+}
+$("#btn-cleanup").addEventListener("click", () => cleanupKnowledge());
+$("#btn-cleanup-undo").addEventListener("click", () => cleanupKnowledge(true));
+
 async function loadKnowledge(q = state.knowledgeQuery) {
   state.knowledgeQuery = q || "";
   const request = ++state.knowledgeRequest;
@@ -815,87 +1573,174 @@ async function loadKnowledge(q = state.knowledgeQuery) {
     const r = await api(url);
     if (request !== state.knowledgeRequest) return;
     renderKnowledge(r.items);
-    if (!q) fillTopicSelect(r.items, topic);
+    if (r.topics) fillTopicSelect(r.topics, topic, true);
+    else if (!q) fillTopicSelect(r.items, topic);
     // 记下本次渲染对应的写入版本：refreshAll 之后只在版本变化时再拉一次
     const ver = state.status && state.status.stats && state.status.stats.ver;
     if (ver !== undefined) state.kbVer = ver;
     // 近重复扫描按库版本缓存，题库没变时服务端直接命中缓存（~0ms），
     // 但仍省一次往返：版本一致就不重复问。
-    if (ver !== state.dupVer) loadDuplicates();
+    if (ver !== state.dupVer || duplicateScope !== duplicateParams(duplicateThreshold()).toString()) loadDuplicates();
   } catch (e) {
     toast("知识库加载失败：" + e.message, "err");
   }
 }
 
-/* ---------------- 近重复整理（新） ---------------- */
-async function loadDuplicates(threshold = 0.9) {
-  let d;
+/* ---------------- 近似知识点：完整扫描、成对比较和确认清理 ---------------- */
+let duplicateRequest = 0;
+let duplicatePage = 0;
+let duplicateScope = "";
+let similarPreview = null;
+let similarPreviewPage = 0;
+let similarBusy = false;
+let previewRequest = 0;
+
+function duplicateThreshold() {
+  const value = Number($("#dup-threshold").value || 90);
+  if (!Number.isFinite(value) || value < 50 || value > 100) throw new Error("请输入50至100之间的相似度百分比");
+  return value / 100;
+}
+function clearSimilarPreview() {
+  previewRequest++;
+  similarPreview = null;
+  $("#dup-preview").hidden = true;
+  $("#btn-confirm-similar").disabled = true;
+}
+function duplicateParams(threshold) {
+  const params = new URLSearchParams({ threshold: String(threshold) });
+  if ($("#kb-topic").value) params.set("topic", $("#kb-topic").value);
+  return params;
+}
+async function loadDuplicates(threshold) {
+  const request = ++duplicateRequest;
   try {
-    d = await api(`/api/knowledge/duplicates?threshold=${threshold}&limit=12`);
-  } catch (_) {
-    return;
+    threshold = threshold ?? duplicateThreshold();
+    const params = duplicateParams(threshold);
+    const scope = params.toString();
+    if (scope !== duplicateScope) { duplicateScope = scope; duplicatePage = 0; }
+    params.set("limit", "12");
+    params.set("offset", String(duplicatePage * 12));
+    const d = await api(`/api/knowledge/duplicates?${params}`);
+    if (request !== duplicateRequest) return;
+    const ver = state.status && state.status.stats && state.status.stats.ver;
+    if (ver !== undefined) state.dupVer = ver;
+    renderDuplicates(d);
+  } catch (e) {
+    if (request === duplicateRequest) $("#dup-status").textContent = "扫描失败：" + e.message;
   }
-  const ver = state.status && state.status.stats && state.status.stats.ver;
-  if (ver !== undefined) state.dupVer = ver;
-  renderDuplicates(d);
 }
-
+function duplicateSide(it, label = "", dropId = "") {
+  return `<div class="dup-side">
+    ${label ? `<span class="tagmini">${esc(label)}</span>` : ""}
+    <div class="dup-claim" data-pid="${esc(it.id)}">${esc(it.claim)}</div>
+    <div class="dup-meta"><span>${esc(it.topic)}</span><span>可信 ${(+it.confidence || 0).toFixed(2)}</span></div>
+    <details class="dup-detail"><summary>展开完整内容与出处</summary>
+      <strong>${esc(it.claim)}</strong><p>${esc(it.detail || "无补充内容")}</p>
+      <div class="hint">出处：${esc(it.source_title || it.source_url || "未记录")}</div>
+      <div class="hint">创建：${it.created_at ? esc(new Date(it.created_at * 1000).toLocaleString()) : "未记录"}</div>
+    </details>
+    ${dropId ? `<button class="btn sm dup-keep" data-drop="${esc(dropId)}" data-claim="${esc(it.claim)}">保留这条</button>` : ""}</div>`;
+}
+function duplicatePair(a, b, sim, preview = false) {
+  const pct = Math.max(0, Math.min(100, sim * 100));
+  return `<div class="dup-pair">${duplicateSide(a, preview ? "保留" : "知识点 A", preview ? "" : b.id)}
+    <div class="dup-mid"><div class="dup-sim">${pct.toFixed(1)}%</div>
+      <div class="dup-bar"><i style="width:${pct.toFixed(1)}%"></i></div><span class="dup-sep">相似度</span></div>
+    ${duplicateSide(b, preview ? "待清除" : "知识点 B", preview ? "" : a.id)}</div>`;
+}
 function renderDuplicates(d) {
-  const card = $("#dup-card");
-  const box = $("#dup-body");
-  if (!card || !box) return;
-  const pairs = (d && d.pairs) || [];
-  const scanned = (d && d.scanned) || 0;
-  // 没有重复、且扫描量太小（说明库还不够大）时整块隐藏，不占版面
-  if (!pairs.length && scanned < 20) {
-    card.hidden = true;
-    setHTML(box, "");
-    return;
-  }
-  card.hidden = false;
-  if (!pairs.length) {
-    setHTML(
-      box,
-      `<div class="empty" style="text-align:left;line-height:1.75;padding:2px 0">
-       扫了 ${scanned} 条，没有发现相似度 ≥ ${(d.threshold || 0.9).toFixed(2)} 的重复项——
-       说明入库去重工作正常，这部分不用操心。
-       <div class="hint" style="margin-top:6px">相似度调到 0.85 会更严格地找「换个说法讲同一件事」的条目。</div>
-      </div>`
-    );
-    return;
-  }
-  const html =
-    `<div class="hint" style="margin:-2px 0 12px">
-       扫了 ${scanned} 条，发现 ${pairs.length} 组很像的结论。它们不是一字不差的重复
-       （那样入库时就被挡掉了），而是「换个说法讲同一件事」——留着会互相挤占检索名额。
-     </div>` +
-    pairs
-      .map((p) => {
-        const pct = Math.max(0, Math.min(100, (p.sim - 0.8) / 0.2 * 100));
-        const side = (it, dropId) =>
-          `<div class="dup-side">
-             <div class="dup-claim" data-pid="${esc(it.id)}">${esc(it.claim)}</div>
-             <div class="dup-meta"><span class="tagmini">${esc(it.topic || "")}</span>
-               <span class="dim mono">可信 ${(+it.confidence || 0).toFixed(2)}</span></div>
-             <button class="btn sm dup-keep" data-drop="${esc(dropId)}" data-claim="${esc((it.claim || "").slice(0, 60))}">保留这条</button>
-           </div>`;
-        return `<div class="dup-pair">
-            ${side(p.a, p.b.id)}
-            <div class="dup-mid">
-              <div class="dup-sim">${p.sim.toFixed(3)}</div>
-              <div class="dup-bar"><i style="width:${pct.toFixed(0)}%"></i></div>
-              <div class="dup-sep">相似</div>
-            </div>
-            ${side(p.b, p.a.id)}
-          </div>`;
-      })
-      .join("");
-  setHTML(box, html);
+  const pairs = d?.pairs || [];
+  const total = d?.total ?? pairs.length;
+  $("#dup-card").hidden = false;
+  $("#dup-threshold-label").textContent = `相似度 ≥ ${((d?.threshold ?? .9) * 100).toFixed(1)}%`;
+  $("#dup-status").textContent = `已扫描 ${d?.scanned || 0} 条，发现 ${total} 条可合并的近似知识。` +
+    (d?.invalid ? ` ${d.invalid} 条向量无效，已保留。` : "");
+  setHTML($("#dup-body"), pairs.length ? pairs.map(p => duplicatePair(p.a, p.b, p.sim)).join("") :
+    '<div class="empty">当前阈值下暂无近似知识点</div>');
+  $("#btn-dup-prev").disabled = duplicatePage === 0;
+  $("#btn-dup-next").disabled = (duplicatePage + 1) * 12 >= total;
+  $("#dup-page").textContent = `第${duplicatePage + 1}/${Math.max(1, Math.ceil(total / 12))}页`;
 }
+function renderSimilarPreview() {
+  if (!similarPreview) return;
+  const p = similarPreview;
+  $("#dup-preview").hidden = false;
+  $("#dup-preview-summary").textContent = `清理预览：阈值 ${(p.threshold * 100).toFixed(1)}%，待清除 ${p.removed} 条，涉及 ${p.groups} 个保留项。以下为完整待清除列表，分页展示。`;
+  $("#dup-preview-list").innerHTML = p.items.slice(similarPreviewPage * 20, (similarPreviewPage + 1) * 20)
+    .map(item => `<div class="hint">${esc(item.reason)}</div>` + duplicatePair(item.keep, item.drop, item.sim, true)).join("") || '<div class="empty">没有需要清除的知识点</div>';
+  $("#dup-preview-page").textContent = `第${similarPreviewPage + 1}/${Math.max(1, Math.ceil(p.items.length / 20))}页 · 共${p.removed}条`;
+  $("#btn-preview-prev").disabled = similarPreviewPage === 0;
+  $("#btn-preview-next").disabled = (similarPreviewPage + 1) * 20 >= p.items.length;
+  $("#btn-confirm-similar").disabled = similarBusy || !p.removed;
+  $("#btn-confirm-similar").textContent = `确认清除 ${p.removed} 条`;
+}
+async function previewSimilarKnowledge() {
+  if (similarBusy || cleanupBusy) return;
+  clearSimilarPreview();
+  const request = previewRequest;
+  similarBusy = true;
+  $("#btn-cleanup-similar").disabled = true;
+  $("#dup-status").textContent = "正在扫描全部知识并生成清理预览…";
+  try {
+    const params = duplicateParams(duplicateThreshold());
+    const p = await api(`/api/knowledge/cleanup/preview?${params}`);
+    if (request !== previewRequest) return;
+    similarPreview = p;
+    similarPreviewPage = 0;
+    similarBusy = false;
+    renderSimilarPreview();
+    $("#dup-status").textContent = "预览完成，尚未删除任何知识点。";
+  } catch (e) { $("#dup-status").textContent = e.message; toast(e.message, "err"); }
+  finally { similarBusy = false; $("#btn-cleanup-similar").disabled = false; }
+}
+async function confirmSimilarCleanup() {
+  if (!similarPreview || similarBusy || cleanupBusy) return;
+  const plan = similarPreview;
+  similarBusy = cleanupBusy = true;
+  $("#btn-confirm-similar").disabled = true;
+  $("#btn-cleanup-similar").disabled = true;
+  $("#btn-cleanup").disabled = $("#btn-cleanup-undo").disabled = true;
+  try {
+    const result = await api("/api/knowledge/cleanup", { method:"POST", body:{ threshold:plan.threshold, topic:plan.topic, token:plan.token } });
+    if (!result.ok) throw new Error(result.msg || "清除失败");
+    clearSimilarPreview();
+    cleanupUndo = !!result.undo?.available;
+    $("#cleanup-status").textContent = `已归档 ${result.removed} 条高相似度知识，可撤销。`;
+    toast(`已清除 ${result.removed} 条近似知识，可撤销`, "ok");
+    state.kbVer = state.dupVer = state.anVer = -1;
+    if (state.pointId) closePoint();
+    await loadKnowledge();
+    await refreshAll();
+  } catch(e) { clearSimilarPreview(); $("#dup-status").textContent = e.message; toast(e.message, "err"); }
+  finally {
+    similarBusy = cleanupBusy = false;
+    $("#btn-cleanup-similar").disabled = $("#btn-cleanup").disabled = false;
+    $("#btn-cleanup-undo").disabled = !cleanupUndo;
+  }
+}
+// 阈值是数字框：键入「85.5」会连发 4 次 input，按住微调箭头更多，每次都是一轮全库
+// 近似扫描。预览快照必须立刻作废（安全相关，不能等），扫描请求则防抖 350ms；
+// 先把请求序号推进一格，让已在路上的旧阈值结果回来也不会覆盖界面。
+let dupThresholdTimer = null;
+$("#dup-threshold").addEventListener("input", () => {
+  clearSimilarPreview();
+  state.dupVer = -1;
+  duplicateRequest++;
+  clearTimeout(dupThresholdTimer);
+  dupThresholdTimer = setTimeout(() => loadDuplicates(), 350);
+});
+$("#btn-cleanup-similar").addEventListener("click", previewSimilarKnowledge);
+$("#btn-confirm-similar").addEventListener("click", confirmSimilarCleanup);
+$("#btn-cancel-similar").addEventListener("click", clearSimilarPreview);
+$("#btn-preview-prev").addEventListener("click", () => { if (similarPreviewPage > 0) { similarPreviewPage--; renderSimilarPreview(); } });
+$("#btn-preview-next").addEventListener("click", () => { if (similarPreview && (similarPreviewPage + 1) * 20 < similarPreview.items.length) { similarPreviewPage++; renderSimilarPreview(); } });
+$("#btn-dup-prev").addEventListener("click", () => { if (duplicatePage > 0) { duplicatePage--; loadDuplicates(); } });
+$("#btn-dup-next").addEventListener("click", () => { duplicatePage++; loadDuplicates(); });
 
-function fillTopicSelect(items, activeTopic = "") {
+function fillTopicSelect(items, activeTopic = "", complete = false) {
   const sel = $("#kb-topic");
   const topics = [...new Set(items.map((i) => i.topic))];
+  if (complete && activeTopic && !topics.includes(activeTopic)) topics.push(activeTopic);
   if (!topics.length) return;
   const html =
     '<option value="">全部方向</option>' +
@@ -904,11 +1749,13 @@ function fillTopicSelect(items, activeTopic = "") {
     // 已填过：仅当方向集合真的变了才重建（保留用户当前筛选）。
     // 筛选态下 items 只有该方向一个主题，绝不能拿来重建选项，否则
     // 下拉里就只剩当前方向、切不回去了。
-    if (activeTopic || sel.innerHTML === html) return;
+    if ((!complete && activeTopic) || sel.innerHTML === html) return;
     sel.innerHTML = html;
+    if (complete) sel.value = activeTopic;
     return;
   }
   sel.innerHTML = html;
+  if (complete) sel.value = activeTopic;
   sel.dataset.filled = "1";
 }
 
@@ -922,8 +1769,9 @@ function renderKnowledge(items) {
     .map((p) => {
       const conf = Math.round((p.confidence || 0) * 100);
       const tags = (p.tags || []).map((t) => `<span class="tagmini">${esc(t)}</span>`).join(" ");
-      const src = p.source_url
-        ? `<a href="${esc(p.source_url)}" target="_blank" rel="noreferrer">${esc(
+      const srcUrl = safeUrl(p.source_url);
+      const src = srcUrl
+        ? `<a href="${esc(srcUrl)}" target="_blank" rel="noreferrer">${esc(
             p.source_title || p.source_url
           ).slice(0, 70)}</a>`
         : "";
@@ -947,6 +1795,66 @@ function renderKnowledge(items) {
    邻居来自后端 similar_points（点积排序，不再走一次 LLM 嵌入），
    相似度条把「这条和哪条最像」直接画出来——这是判断一条结论可不可靠
    最省事的办法：如果最近邻都跟它说的不是一回事，说明它可能是孤证。 */
+
+/* ---------------- 知识治理：纠错 / 反馈 / 状态 / 独立核查 ---------------- */
+async function submitGovernance(pid, path, method, payload, okMsg) {
+  try {
+    const opts = { method };
+    if (payload) opts.body = payload;
+    await api(`/api/knowledge/${encodeURIComponent(pid)}${path}`, opts);
+    toast(okMsg, "ok");
+    await openPoint(pid); // 重新拉详情：状态、revision、反馈都要立刻可见
+  } catch (e) {
+    toast("操作失败：" + (e.message || e), "err");
+  }
+}
+
+function bindPointGovernance(p) {
+  if (!p || !p.id) return;
+  const pid = p.id;
+  const body = $("#pt-body");
+  if (!body) return;
+  body.querySelectorAll("[data-gov-fb]").forEach((b) =>
+    b.addEventListener("click", () =>
+      submitGovernance(pid, "/feedback", "POST",
+        { verdict: b.dataset.govFb, note: "" }, "反馈已记录")));
+  const sel = $("#pt-gov-status");
+  const statusBtn = $("#pt-gov-status-go");
+  if (sel && statusBtn) statusBtn.addEventListener("click", () =>
+    submitGovernance(pid, "", "PATCH",
+      { status: sel.value, reason: "手动调整状态" }, "状态已更新"));
+  const verifyBtn = $("#pt-gov-verify");
+  if (verifyBtn) verifyBtn.addEventListener("click", async () => {
+    verifyBtn.disabled = true;
+    toast("独立核查中…");
+    try {
+      const r = await api(`/api/knowledge/${encodeURIComponent(pid)}/verify`, { method: "POST" });
+      if (r.independent) {
+        toast(`独立核查：${r.verdict === "pass" ? "通过" : "未通过"}`,
+          r.verdict === "pass" ? "ok" : "err");
+      } else {
+        toast("未做独立核查（主模型自证不算核查）：" + (r.reason || ""), "err");
+      }
+      await openPoint(pid);
+    } catch (e) {
+      toast("核查失败：" + e.message, "err");
+      verifyBtn.disabled = false;
+    }
+  });
+  const saveBtn = $("#pt-gov-save");
+  if (saveBtn) saveBtn.addEventListener("click", () => {
+    const val = (id) => ($(id) || {}).value || "";
+    const claim = val("#pt-gov-claim");
+    if (claim.trim().length < 8) { toast("结论至少 8 个字符", "err"); return; }
+    submitGovernance(pid, "", "PATCH", {
+      claim,
+      detail: val("#pt-gov-detail"),
+      evidence: val("#pt-gov-ev"),
+      reason: val("#pt-gov-reason"),
+    }, "已保存，旧版本已留痕");
+  });
+}
+
 async function openPoint(pid) {
   if (!pid) return;
   const mask = $("#pt-mask");
@@ -955,6 +1863,7 @@ async function openPoint(pid) {
   state.pointId = pid;
   mask.hidden = false;
   drawer.hidden = false;
+  dialogOpened(drawer, { initial: "#pt-close", onClose: closePoint });
   setHTML($("#pt-body"), '<div class="hint" style="padding:8px 2px">加载中…</div>');
   let d;
   try {
@@ -972,7 +1881,7 @@ function closePoint() {
   const mask = $("#pt-mask");
   const drawer = $("#pt-drawer");
   if (mask) mask.hidden = true;
-  if (drawer) drawer.hidden = true;
+  if (drawer) { drawer.hidden = true; dialogClosed(drawer); }
   // 从深链进来时把地址退回列表，避免刷新又弹一次
   if (String(location.hash).startsWith("#knowledge/")) location.hash = "knowledge";
 }
@@ -982,11 +1891,73 @@ function renderPoint(d) {
   const sims = d.similar || [];
   const conf = Math.round((p.confidence || 0) * 100);
   const tags = (p.tags || []).map((t) => `<span class="tagmini">${esc(t)}</span>`).join(" ");
-  const src = p.source_url
-    ? `<a href="${esc(p.source_url)}" target="_blank" rel="noreferrer">${esc(
+  const srcUrl = safeUrl(p.source_url);
+  const src = srcUrl
+    ? `<a href="${esc(srcUrl)}" target="_blank" rel="noreferrer">${esc(
         p.source_title || p.source_url
       )}</a>`
     : '<span class="dim">没有记录出处</span>';
+
+  const STATUS_LABEL = {
+    legacy: "存量未迁移", unverified: "待核查", verified: "已核查",
+    disputed: "有争议", archived: "已归档", superseded: "已被取代",
+  };
+  const curStatus = p.status || "legacy";
+  const evBlock = p.evidence
+    ? `<div style="margin:6px 0"><span class="dim">原文依据</span>
+         <div class="pt-detail" style="white-space:pre-wrap">${esc(p.evidence)}</div>
+         <div class="hint">${esc(p.verification || "未标注核查方式")} · ${esc(p.evidence_locator || "无定位")}</div></div>`
+    : `<div class="hint" style="color:var(--orange, #e0a23b);margin:6px 0">这条知识没有原文依据，无法做证据核查。</div>`;
+  const revList = (p.revisions || []).slice(0, 5);
+  const fbList = (p.feedback || []).slice(0, 5);
+  const histHtml = revList.length
+    ? revList.map((r) => `<div>· v${Number(r.revision) || 1} ${esc(r.reason || r.kind || "")} <span class="dim">${fmtTime(r.changed_at)}</span></div>`).join("")
+    : '<div class="dim">还没有修改记录</div>';
+  const fbHtml = fbList.length
+    ? fbList.map((f) => `<div>· ${esc(f.verdict)} ${esc(f.note || "")} <span class="dim">${fmtTime(f.created_at)}</span></div>`).join("")
+    : '<div class="dim">还没有反馈</div>';
+  const govHtml = `<details style="margin:10px 0;border-top:1px solid rgba(128,128,128,.25);padding-top:8px">
+    <summary style="cursor:pointer;font-size:12.5px">纠错 / 反馈 / 核查
+      <span class="mono dim">${esc(STATUS_LABEL[curStatus] || curStatus)} · v${Number(p.revision) || 1}</span></summary>
+    <div style="margin-top:8px">
+      ${evBlock}
+      <div style="display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin:6px 0">
+        <span class="dim">反馈</span>
+        ${[["correct", "正确"], ["wrong", "错误"], ["outdated", "过时"],
+           ["duplicate", "重复"], ["source_dead", "来源失效"]]
+          .map(([v, l]) => `<button class="btn sm" data-gov-fb="${v}">${l}</button>`).join("")}
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin:6px 0">
+        <span class="dim">状态</span>
+        <select id="pt-gov-status" class="btn sm">
+          ${Object.entries(STATUS_LABEL).filter(([k]) => k !== "legacy")
+            .map(([k, l]) => `<option value="${k}"${k === curStatus ? " selected" : ""}>${l}</option>`).join("")}
+        </select>
+        <button class="btn sm" id="pt-gov-status-go">更新</button>
+        <button class="btn sm" id="pt-gov-verify">独立核查</button>
+      </div>
+      <div style="margin:6px 0">
+        <div class="dim" style="margin-bottom:4px">修订历史（不可修改的旧版本）</div>
+        <div class="hint">${histHtml}</div>
+        <div class="dim" style="margin:6px 0 4px">反馈记录</div>
+        <div class="hint">${fbHtml}</div>
+      </div>
+      <details style="margin-top:8px"><summary style="cursor:pointer;font-size:12.5px">编辑结论</summary>
+        <div style="display:grid;gap:5px;margin-top:6px">
+          <label class="dim">结论 claim</label>
+          <textarea id="pt-gov-claim" rows="2">${esc(p.claim || "")}</textarea>
+          <label class="dim">补充 detail</label>
+          <textarea id="pt-gov-detail" rows="3">${esc(p.detail || "")}</textarea>
+          <label class="dim">原文依据 evidence</label>
+          <textarea id="pt-gov-ev" rows="3">${esc(p.evidence || "")}</textarea>
+          <label class="dim">修改说明</label>
+          <input id="pt-gov-reason" placeholder="为什么改（会写进修订历史）" />
+          <div><button class="btn primary sm" id="pt-gov-save">保存并留痕</button>
+            <span class="hint">保存后状态回到「待核查」，旧版本可追溯。</span></div>
+        </div>
+      </details>
+    </div>
+  </details>`;
 
   const simHtml = sims.length
     ? sims
@@ -1019,24 +1990,27 @@ function renderPoint(d) {
        <span class="dim">${fmtTime(p.created_at)}</span>
      </div>
      <div class="pt-src"><span class="dim">出处</span> ${src}</div>
+     ${p.archived ? `<div class="hint">这条知识已归档为重复项，历史出处仍保留。<button class="btn sm" data-pid="${esc(p.canonical_id)}">查看保留条目</button></div>` : ""}
+     ${(p.duplicate_sources || []).length ? `<div class="hint">已合并的其他出处：${p.duplicate_sources.map((s) => `<button class="btn sm" data-pid="${esc(s.id)}">${esc(s.source_title || "查看原知识")}</button>`).join(" ")}</div>` : ""}
+     ${(p.merged_sources || []).length ? `<details class="dup-detail"><summary>入库查重合并的原始内容与出处（${p.merged_sources.length}条）</summary>${p.merged_sources.map(s => `<div><strong>${esc(s.claim)}</strong><p>${esc(s.detail)}</p><span class="hint">${esc(s.source_title || s.source_url)}</span></div>`).join("")}</details>` : ""}
      <div class="pt-actions">
        <button class="btn sm" data-goto="knowledge" data-topic="${esc(p.topic || "")}">只看这个方向</button>
        <button class="btn sm pt-ask" data-claim="${esc((p.claim || "").slice(0, 120))}">就这条提问</button>
        <button class="btn sm pt-copy">复制链接</button>
      </div>
+     ${govHtml}
      <div class="pt-sim-head">
        <span>语义最近的 ${sims.length} 条</span>
        <span class="hint" style="margin:0">向量余弦，越高越接近</span>
      </div>
      <div class="pt-sims">${simHtml}</div>`
   );
+  bindPointGovernance(p);
 }
 
 $("#pt-close").addEventListener("click", closePoint);
 $("#pt-mask").addEventListener("click", closePoint);
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && state.pointId) closePoint();
-});
+// Esc 关闭由「弹层可访问性」统一处理（只关最上层、避开输入法组字）
 
 $("#btn-kb-search").addEventListener("click", () => {
   const q = $("#kb-search").value.trim();
@@ -1045,7 +2019,7 @@ $("#btn-kb-search").addEventListener("click", () => {
 $("#kb-search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("#btn-kb-search").click();
 });
-$("#kb-topic").addEventListener("change", () => loadKnowledge());
+$("#kb-topic").addEventListener("change", () => { clearSimilarPreview(); state.dupVer = -1; loadKnowledge(); loadRefinements(); });
 
 /* 分析页手动刷新：绕过版本门控强制重算+重绘（服务端也会强制重聚） */
 $("#btn-an-refresh").addEventListener("click", () => loadAnalytics(true));
@@ -1053,6 +2027,9 @@ $("#btn-an-refresh").addEventListener("click", () => loadAnalytics(true));
 /* ---------------- 书库 ---------------- */
 let libSelected = new Set();
 let libPoll = null;
+// 2~2.5 秒一拍的轮询：后端偶尔慢于间隔时，上一拍没回来就不叠加新请求，
+// 否则请求排队、回包乱序，进度条会来回跳。后台标签页一律不发，切回时补一拍。
+let libPollBusy = false;
 
 const BOOK_STATUS = {
   pending: ["待解析", "var(--text-dim)"],
@@ -1263,7 +2240,7 @@ function renderLibBooks(items, total) {
         b.format === "pdf" &&
         (b.status === "skipped" || b.status === "ready" || b.status === "done");
       return `<div class="row" style="display:flex;gap:11px;align-items:flex-start">
-        <input type="checkbox" class="lib-ck" data-id="${b.id}"
+        <input type="checkbox" class="lib-ck" data-id="${esc(b.id)}"
                ${canPick ? "" : "disabled"}
                ${libSelected.has(b.id) ? "checked" : ""}
                style="width:15px;height:15px;margin-top:3px;flex-shrink:0;cursor:pointer" />
@@ -1271,8 +2248,8 @@ function renderLibBooks(items, total) {
           <div class="rowflex" style="justify-content:space-between;gap:10px">
             <span style="font-size:13.3px">${esc(b.title || b.path)}</span>
             <span class="rowflex" style="gap:7px;white-space:nowrap">
-              <span style="color:${color};font-size:11.5px">${txt}</span>
-              ${needOcr ? `<button class="btn sm" data-ocr="${b.id}">OCR</button>` : ""}
+              <span style="color:${color};font-size:11.5px">${esc(txt)}</span>
+              ${needOcr ? `<button class="btn sm" data-ocr="${esc(b.id)}">OCR</button>` : ""}
             </span>
           </div>
           <div class="meta">
@@ -1290,19 +2267,25 @@ function renderLibBooks(items, total) {
     })
     .join("");
 
-  $$("#lib-book-list .lib-ck").forEach((ck) =>
-    ck.addEventListener("change", () => {
+  // 一次 innerHTML 可渲染上千行；逐行绑监听器会累积约 2000 个回调。
+  // 改为在容器上各绑一次委托，__delegated 保证重复渲染不再叠加。
+  const listBox = $("#lib-book-list");
+  if (listBox && !listBox.__delegated) {
+    listBox.__delegated = true;
+    listBox.addEventListener("change", (e) => {
+      const ck = e.target.closest?.("#lib-book-list .lib-ck");
+      if (!ck) return;
       if (ck.checked) libSelected.add(ck.dataset.id);
       else libSelected.delete(ck.dataset.id);
       updateLibImportBtn();
-    })
-  );
-  $$("#lib-book-list [data-ocr]").forEach((btn) =>
-    btn.addEventListener("click", () => {
+    });
+    listBox.addEventListener("click", (e) => {
+      const btn = e.target.closest?.("#lib-book-list [data-ocr]");
+      if (!btn) return;
       const book = (window.__libBooks || []).find((x) => x.id === btn.dataset.ocr);
       if (book) openOcr(book);
-    })
-  );
+    });
+  }
   updateLibImportBtn();
 }
 
@@ -1336,7 +2319,9 @@ function paintLibTask(t) {
     const pct = t.total ? Math.round((t.done / t.total) * 100) : 0;
     $("#lib-bar").style.width = pct + "%";
     const stage = t.kind === "scan" ? "扫描中" : "导入中";
-    $("#lib-task-hint").textContent = `${stage} ${t.done}/${t.total}${t.current ? " · " + t.current.slice(0, 40) : ""}${t.points ? " · 已入库 " + t.points + " 条" : ""}`;
+    const hint = $("#lib-task-hint");
+    hint.textContent = `${stage} ${t.done}/${t.total}${t.current ? " · " + t.current.slice(0, 40) : ""}${t.points ? " · 已入库 " + t.points + " 条" : ""}`;
+    hint.__lastHTML = null; // 与 paintOcrLive 的 setHTML 共用此节点：作废其缓存
     if (!libPoll) libPoll = setInterval(pollLibTask, 2500);
   } else {
     wrap.style.display = "none";
@@ -1348,6 +2333,8 @@ function paintLibTask(t) {
 }
 
 async function pollLibTask() {
+  if (libPollBusy || document.hidden) return;
+  libPollBusy = true;
   try {
     // OCR 任务和书库任务是两套状态，批量 OCR 时 library/state 是空的，
     // 只查它的话书库页会完全没反应
@@ -1364,6 +2351,7 @@ async function pollLibTask() {
       loadLibrary();
     }
   } catch (_) {}
+  finally { libPollBusy = false; }
 }
 
 // 批量 OCR 的进度：外层是第几本，内层是当前书第几页
@@ -1388,16 +2376,22 @@ function paintOcrLive(o) {
     const idx = total ? Math.min(Math.max(doneBooks + (o.running ? 1 : 0), 1), total) : 0;
     const head = o.batch ? `OCR 批量 ${idx}/${total} 本 · 总体 ${overall}%` : `OCR 识别中 · ${overall}%`;
     const inner = o.running && o.total ? ` · 当前书 ${o.done}/${o.total} 页` : " · 正在切下一本";
-    const name = o.book_title ? ` · ${o.book_title.slice(0, 26)}` : "";
-    hint.innerHTML =
+    const name = o.book_title ? ` · ${esc(String(o.book_title).slice(0, 26))}` : "";
+    // 每 2 秒一拍：内容没变就不动 DOM（setHTML），「查看」改为容器上一次性委托，
+    // 不再每拍重建链接再绑一次监听——那样鼠标悬停/键盘焦点会被每拍打断。
+    setHTML(hint,
       `${head}${inner}${name}` +
-      ` <a href="#" id="lib-ocr-peek" style="color:var(--accent)">查看</a>`;
-    const peek = $("#lib-ocr-peek");
-    if (peek) {
-      peek.addEventListener("click", (ev) => {
+      ` <a href="#" id="lib-ocr-peek" style="color:var(--accent)"` +
+      ` data-book="${esc(o.book_id || "")}" data-title="${esc(o.book_title || "")}">查看</a>`);
+    if (!hint.__peekBound) {
+      hint.__peekBound = true;
+      hint.addEventListener("click", (ev) => {
+        const peek = ev.target.closest?.("#lib-ocr-peek");
+        if (!peek) return;
         ev.preventDefault();
         // follow=true：之后每换一本书，抽屉自动跟着切
-        if (o.book_id) openOcr({ id: o.book_id, title: o.book_title || "" }, true);
+        const id = peek.dataset.book;
+        if (id) openOcr({ id, title: peek.dataset.title || "" }, true);
       });
     }
   }
@@ -1411,7 +2405,8 @@ async function doScan(dirId) {
       method: "POST",
       body: dirId ? { dirs: [dirId] } : {},
     });
-    if (r.ok) toast(`扫描完成：发现 ${r.found} 个，新增 ${r.added} 个`, "ok");
+    if (r.ok) toast("已开始后台扫描，可在书库查看进度", "ok");
+    else toast(r.msg || "扫描未启动", "err");
     loadLibrary();
   } catch (e) {
     toast("扫描失败：" + e.message, "err");
@@ -1614,6 +2609,7 @@ if (_btnOcr) _btnOcr.addEventListener("click", async () => {
 let ocrBook = null;
 let ocrPageNo = 0;
 let ocrPoll = null;
+let ocrPollBusy = false; // 同 libPollBusy：不叠加、后台不发
 // 批量识别时，抽屉自动跟着「正在识别的那本书」走
 let ocrFollow = false;
 // 自动预览当前正在识别的页；用户手动点过页就关掉，避免抢走他的选择
@@ -1631,6 +2627,7 @@ function openOcr(book, follow = false) {
   $("#ocr-img").removeAttribute("src");
   $("#ocr-page-list").innerHTML = "";
   $("#ocr-drawer").classList.add("open");
+  dialogOpened($("#ocr-drawer"), { initial: "#ocr-close", onClose: closeOcr });
   loadOcrPages();
   paintOcrDevice();
   pollOcr();
@@ -1671,6 +2668,7 @@ function attachOcrBook(s) {
 
 function closeOcr() {
   $("#ocr-drawer").classList.remove("open");
+  dialogClosed($("#ocr-drawer"));
   ocrBook = null;
   ocrFollow = false;
   if (ocrPoll) {
@@ -1714,7 +2712,7 @@ async function selectOcrPage(pno, auto = false) {
   $$("#ocr-page-list .pg").forEach((el) =>
     el.classList.toggle("active", +el.dataset.pg === pno)
   );
-  $("#ocr-img").src = `/api/library/books/${ocrBook.id}/page/${pno}.png?dpi=120`;
+  $("#ocr-img").src = `/api/library/books/${encodeURIComponent(ocrBook.id)}/page/${pno}.png?dpi=120`;
   $("#ocr-page-info").textContent = "加载中…";
   try {
     const d = await api(`/api/library/books/${ocrBook.id}/ocr/${pno}`);
@@ -1751,6 +2749,8 @@ async function startOcr() {
 }
 
 async function pollOcr() {
+  if (ocrPollBusy || document.hidden) return;
+  ocrPollBusy = true;
   try {
     const s = await api("/api/ocr/state");
     const batch = !!s.batch;
@@ -1790,6 +2790,7 @@ async function pollOcr() {
       loadLibrary();
     }
   } catch (_) {}
+  finally { ocrPollBusy = false; }
 }
 
 function paintOcrTask(s) {
@@ -1912,7 +2913,7 @@ async function loadResources() {
         return `<div class="row">
           <div class="rowflex" style="justify-content:space-between">
             <span class="mono" style="font-size:13px">${esc(it.repo)}</span>
-            <span style="color:${color};font-size:12px">${txt}</span>
+            <span style="color:${color};font-size:12px">${esc(txt)}</span>
           </div>
           <div class="meta">
             <span class="tagmini">${esc(it.rtype)}</span>
@@ -1952,9 +2953,9 @@ async function loadFinetune() {
     const rows = Object.entries(env.modules)
       .map(
         ([k, v]) =>
-          `<div class="kv"><span class="k">${k}</span><span class="v ${
+          `<div class="kv"><span class="k">${esc(k)}</span><span class="v ${
             v ? "ok-mark" : "bad-mark"
-          }">${v || "未安装"}</span></div>`
+          }">${esc(v || "未安装")}</span></div>`
       )
       .join("");
     $("#ft-env").innerHTML =
@@ -1974,7 +2975,7 @@ async function loadFinetune() {
           (o) => `<div class="row">
             <div class="rowflex" style="justify-content:space-between">
               <span class="mono" style="font-size:12.5px">${esc(o.name)}</span>
-              <span class="tagmini">${o.kind}</span>
+              <span class="tagmini">${esc(o.kind)}</span>
             </div>
             <div class="meta"><span>${o.size_gb} GB</span>
               <span style="margin-left:auto">${fmtTime(o.mtime)}</span></div>
@@ -1989,50 +2990,63 @@ async function loadFinetune() {
 
 $("#btn-ft-install").addEventListener("click", async () => {
   toast("开始安装，约 3GB，请看进化流日志");
-  await api("/api/finetune/install", { method: "POST" });
+  try {
+    await api("/api/finetune/install", { method: "POST" });
+  } catch (e) {
+    toast("启动失败：" + (e.message || e), "err");
+  }
 });
 
 let ftPollTimer = null;
+let ftPollBusy = false;
 
 // 生成训练集要改写几百条问句，十几分钟起步，必须轮询看进度
 function pollFinetune() {
   if (ftPollTimer) return;
-  ftPollTimer = setInterval(async () => {
-    try {
-      const st = await api("/api/finetune/state");
-      const pct = Math.round((st.progress || 0) * 100);
-      const bar = $("#ft-bar");
-      if (bar) bar.style.width = pct + "%";
-      // 进度条只在跑的时候出现：平时常驻一条 0% 的空槽，看起来像分割线
-      const pw = $("#ft-progress");
-      if (pw) pw.hidden = !st.running;
-      if (st.running && st.stage) $("#ft-ds").textContent = st.stage;
-      if (!st.running) {
-        if (pw) pw.hidden = true;
-        clearInterval(ftPollTimer);
-        ftPollTimer = null;
-        $("#btn-ft-dataset").disabled = false;
+  ftPollTimer = setInterval(ftPollOnce, 2000);
+}
+
+// 单拍抽成具名函数：切回前台时可以立刻补一拍。busy 护栏防止慢请求叠加——
+// 叠加时两次回包都会看到 running=false，「微调完成」会连弹两次。
+async function ftPollOnce() {
+  if (ftPollBusy || document.hidden || !ftPollTimer) return;
+  ftPollBusy = true;
+  try {
+    const st = await api("/api/finetune/state");
+    const pct = Math.round((st.progress || 0) * 100);
+    const bar = $("#ft-bar");
+    if (bar) bar.style.width = pct + "%";
+    // 进度条只在跑的时候出现：平时常驻一条 0% 的空槽，看起来像分割线
+    const pw = $("#ft-progress");
+    if (pw) pw.hidden = !st.running;
+    if (st.running && st.stage) $("#ft-ds").textContent = st.stage;
+    if (!st.running) {
+      if (pw) pw.hidden = true;
+      clearInterval(ftPollTimer);
+      ftPollTimer = null;
+      $("#btn-ft-dataset").disabled = false;
+      $("#btn-ft-train").disabled = false;
+      const res = st.result || {};
+      if (res.ok && res.count !== undefined) {
+        // 数据集生成完成
+        state.datasetPath = res.path;
+        $("#ft-ds").textContent = `${res.count} 条`;
         $("#btn-ft-train").disabled = false;
-        const res = st.result || {};
-        if (res.ok && res.count !== undefined) {
-          // 数据集生成完成
-          state.datasetPath = res.path;
-          $("#ft-ds").textContent = `${res.count} 条`;
-          $("#btn-ft-train").disabled = false;
-          toast(`训练集已生成：${res.count} 条`, "ok");
-        } else if (res.ok) {
-          // 微调完成
-          $("#ft-train").textContent = "已完成";
-          $("#ft-merge").textContent = res.merged ? "已合并" : "仅 adapter";
-          toast("微调完成", "ok");
-        } else if (res.msg) {
-          toast(res.msg, "err");
-        }
+        toast(`训练集已生成：${res.count} 条`, "ok");
+      } else if (res.ok) {
+        // 微调完成
+        $("#ft-train").textContent = "已完成";
+        $("#ft-merge").textContent = res.merged ? "已合并" : "仅 adapter";
+        toast("微调完成", "ok");
+      } else if (res.msg) {
+        toast(res.msg, "err");
       }
-    } catch (e) {
-      // 单次轮询失败不打断，等下一轮
     }
-  }, 2000);
+  } catch (e) {
+    // 单次轮询失败不打断，等下一轮
+  } finally {
+    ftPollBusy = false;
+  }
 }
 
 $("#btn-ft-dataset").addEventListener("click", async () => {
@@ -2099,11 +3113,11 @@ async function askChat() {
       s.innerHTML =
         `<div class="dim">引用 ${r.hits} 条知识</div>` +
         r.sources
-          .filter((x) => x.url)
+          .filter((x) => safeUrl(x.url))
           .slice(0, 5)
           .map(
             (x) =>
-              `<a href="${esc(x.url)}" target="_blank" rel="noreferrer">${esc(
+              `<a href="${esc(safeUrl(x.url))}" target="_blank" rel="noreferrer">${esc(
                 x.title || x.url
               ).slice(0, 80)}</a>`
           )
@@ -2172,6 +3186,7 @@ async function fillSettings() {
     $("#cfg-qpr").value = cfg.queries_per_round;
     $("#cfg-fpr").value = cfg.fetch_per_round;
     $("#cfg-rel").value = cfg.min_relevance;
+    $("#cfg-retry").value = cfg.doc_retry_days ?? 7;
     $("#cfg-budget").value = cfg.disk_budget_gb;
     $("#cfg-maxone").value = cfg.max_model_gb;
     $("#cfg-auto").value = cfg.auto_download ? "1" : "0";
@@ -2179,6 +3194,12 @@ async function fillSettings() {
     $("#cfg-proxy").value = cfg.proxy || "";
     $("#cfg-search-key").value = cfg.search_api_key || "";
     $("#cfg-ft-base").value = cfg.finetune_base || "";
+    // 多模态（老配置文件没有这些键时用默认值兜底，避免显示成空）
+    $("#cfg-media").value = cfg.media_enabled === false ? "0" : "1";
+    $("#cfg-media-per").value = cfg.media_per_round ?? 2;
+    $("#cfg-media-max").value = cfg.media_max_mb ?? 80;
+    $("#cfg-asr-model").value = cfg.asr_model || "small";
+    $("#cfg-vision").value = cfg.vision_model || "";
   } catch (e) {
     toast("设置加载失败：" + e.message, "err");
   }
@@ -2194,6 +3215,7 @@ $("#btn-save-cfg").addEventListener("click", async () => {
         queries_per_round: parseInt($("#cfg-qpr").value, 10),
         fetch_per_round: parseInt($("#cfg-fpr").value, 10),
         min_relevance: parseFloat($("#cfg-rel").value),
+        doc_retry_days: parseInt($("#cfg-retry").value, 10) || 7,
         disk_budget_gb: parseInt($("#cfg-budget").value, 10),
         max_model_gb: parseInt($("#cfg-maxone").value, 10),
         auto_download: $("#cfg-auto").value === "1",
@@ -2204,6 +3226,27 @@ $("#btn-save-cfg").addEventListener("click", async () => {
       },
     });
     toast("设置已保存", "ok");
+  } catch (e) {
+    toast("保存失败：" + e.message, "err");
+  }
+});
+
+/* 多模态设置单独一个保存按钮：这块开关直接影响一轮学习的耗时，
+   和上面的模型/预算设置混在一起容易被误改。 */
+$("#btn-save-cfg-media")?.addEventListener("click", async () => {
+  try {
+    await api("/api/config", {
+      method: "POST",
+      body: {
+        media_enabled: $("#cfg-media").value === "1",
+        media_per_round: parseInt($("#cfg-media-per").value, 10) || 0,
+        media_max_mb: parseInt($("#cfg-media-max").value, 10) || 80,
+        asr_model: $("#cfg-asr-model").value,
+        vision_model: ($("#cfg-vision").value || "").trim() || "qwen2.5vl:7b",
+      },
+    });
+    toast("多模态设置已保存", "ok");
+    if (state.view === "media") loadMediaCaps();
   } catch (e) {
     toast("保存失败：" + e.message, "err");
   }
@@ -3506,6 +4549,280 @@ document.addEventListener("click", (e) => {
     .catch((err) => toast("删除失败：" + err.message, "err"));
 });
 
+/* ---------------- 多模态 ---------------- */
+/* 这一页只做两件事：把 URL 变成知识、把媒体素材搜出来。
+   解析细节（视觉模型 / 字幕 / 转写 / OCR）全在后端，前端只显示能力状态和进度。 */
+const MM_KIND_CN = { image: "图片", audio: "音频", video: "视频", pdf: "PDF" };
+const MM_KIND_ICO = { image: "▣", audio: "♪", video: "▶", pdf: "▤" };
+
+/* 能力卡：可用绿点、不可用灰点，副标题直接给出「缺什么、怎么补」 */
+function paintCap(vSel, sSel, ok, main, note) {
+  const v = $(vSel);
+  const s = $(sSel);
+  if (!v || !s) return;
+  v.innerHTML = `<span class="mm-dot ${ok ? "on" : "off"}"></span>${esc(main)}`;
+  v.style.fontSize = "17px";
+  s.textContent = note || "";
+  s.title = note || "";
+}
+
+async function loadMediaCaps() {
+  try {
+    const c = await api("/api/media/status");
+    paintCap("#mm-vision", "#mm-vision-s", c.vision.ok,
+      c.vision.ok ? "就绪" : "缺失",
+      c.vision.ok ? `模型 ${c.vision.model}` : c.vision.reason);
+    paintCap("#mm-asr", "#mm-asr-s", c.asr.ok,
+      c.asr.ok ? "就绪" : "缺失",
+      c.asr.ok ? `faster-whisper · ${c.asr.model}` : c.asr.reason);
+    paintCap("#mm-sub", "#mm-sub-s", c.subtitles.ok,
+      c.subtitles.ok ? "就绪" : "缺失",
+      c.subtitles.ok ? "YouTube / Bilibili 字幕可直接取" : c.subtitles.reason);
+    const pdfOk = c.pdf.ok && c.ocr.ok;
+    paintCap("#mm-pdf", "#mm-pdf-s", pdfOk,
+      c.pdf.ok ? (c.ocr.ok ? "就绪" : "仅文本层") : "缺失",
+      c.pdf.ok ? (c.ocr.ok ? "文本层 + 扫描件 OCR" : "扫描件无法识别（缺 OCR）") : c.pdf.reason);
+
+    const tag = $("#mm-mode");
+    if (tag) {
+      tag.textContent = c.enabled ? `已开启 · ${(c.kinds || []).join(" / ")}` : "已在设置中关闭";
+    }
+    const hint = $("#mm-storage");
+    if (hint && c.storage) {
+      hint.textContent = `缓存 ${c.storage.files} 个文件 / ${c.storage.mb} MB`;
+    }
+  } catch (e) {
+    toast("能力检测失败：" + e.message, "err");
+  }
+  loadBackfillTopics();
+}
+
+/* 补漏方向下拉：直接用知识库的主题列表，选空 = 自动取知识点最多的前 6 个 */
+async function loadBackfillTopics() {
+  const sel = $("#mm-bf-topic");
+  if (!sel) return;
+  const keep = sel.value;
+  try {
+    const r = await api("/api/knowledge?limit=1");
+    const topics = (r.topics || []).map((t) => t.topic).filter(Boolean);
+    sel.innerHTML =
+      '<option value="">全部方向（知识点最多的前 6 个）</option>' +
+      topics.map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join("");
+    if (keep && topics.includes(keep)) sel.value = keep;
+  } catch (_) {
+    sel.innerHTML = '<option value="">全部方向（知识点最多的前 6 个）</option>';
+  }
+}
+
+async function startBackfill() {
+  const topic = ($("#mm-bf-topic").value || "").trim();
+  const per = parseInt($("#mm-bf-per").value, 10) || 2;
+  try {
+    const r = await api("/api/media/backfill", {
+      method: "POST",
+      body: { topic: topic || null, per_topic: per },
+    });
+    const box = $("#media-stream");
+    if (box) box.innerHTML = "";
+    toast(
+      topic ? `开始补漏「${topic}」` : `开始补漏 ${r.topics.length} 个方向`,
+      "ok"
+    );
+  } catch (e) {
+    toast("启动失败：" + e.message, "err");
+  }
+}
+
+/* 缩略图加载失败就藏起来。原先写在 HTML 字符串里的 onerror= 是全站唯一的内联
+   事件处理器，会挡住将来下发 CSP（script-src 不带 'unsafe-inline'）。error 事件
+   不冒泡，所以在捕获阶段委托。 */
+document.addEventListener("error", (e) => {
+  const img = e.target;
+  if (img && img.tagName === "IMG" && img.hasAttribute?.("data-hide-on-error")) {
+    img.style.visibility = "hidden";
+  }
+}, true);
+
+function renderMediaResults(items) {
+  const box = $("#mm-results");
+  if (!box) return;
+  if (!items || !items.length) {
+    box.innerHTML = '<div class="empty">没有结果。换个关键词再试；国内网络下 YouTube 需要 yt-dlp 可用。</div>';
+    return;
+  }
+  box.innerHTML = items
+    .map((it) => {
+      const kind = it.kind || "image";
+      const thumbUrl = safeUrl(it.thumb);
+      const thumb = thumbUrl
+        ? `<img class="mm-thumb" src="${esc(thumbUrl)}" alt="" loading="lazy"
+             referrerpolicy="no-referrer" data-hide-on-error />`
+        : `<div class="mm-thumb-ph">${MM_KIND_ICO[kind] || "▣"}</div>`;
+      return `<div class="row"><div class="mm-item">
+        ${thumb}
+        <div class="mm-body">
+          <div class="mm-title">${esc(it.title || it.url)}</div>
+          ${it.snippet ? `<div class="mm-snip">${esc(it.snippet)}</div>` : ""}
+          <div class="meta">
+            <span class="mm-kind ${esc(kind)}">${esc(MM_KIND_CN[kind] || kind)}</span>
+            <span>${esc(it.source || "")}</span>
+            ${it.license ? `<span>${esc(String(it.license).slice(0, 28))}</span>` : ""}
+          </div>
+        </div>
+        <button class="btn sm primary mm-act" data-mm-ingest="${esc(it.url)}">摄取</button>
+      </div></div>`;
+    })
+    .join("");
+}
+
+async function startMediaIngest(urls) {
+  const list = (Array.isArray(urls) ? urls : [urls]).map((s) => String(s || "").trim()).filter(Boolean);
+  if (!list.length) {
+    toast("先填一个链接", "err");
+    return;
+  }
+  try {
+    const r = await api("/api/media/ingest", {
+      method: "POST",
+      body: { urls: list, direction: ($("#mm-direction").value || "").trim() || null },
+    });
+    const box = $("#media-stream");
+    if (box) box.innerHTML = "";
+    toast(`已开始解析 ${r.count} 个来源，进度见右侧`, "ok");
+  } catch (e) {
+    toast("启动失败：" + e.message, "err");
+  }
+}
+
+async function searchMedia() {
+  const q = ($("#mm-q").value || "").trim();
+  if (q.length < 2) {
+    toast("关键词至少两个字符", "err");
+    return;
+  }
+  const kinds = ["image", "audio", "video"].filter((k) => {
+    const el = $("#mm-k-" + k);
+    return el && el.checked;
+  });
+  if (!kinds.length) {
+    toast("至少选一种素材类型", "err");
+    return;
+  }
+  $("#mm-results").innerHTML = '<div class="empty">检索中…</div>';
+  try {
+    const r = await api("/api/media/search", { method: "POST", body: { q, kinds, limit: 6 } });
+    renderMediaResults(r.items);
+  } catch (e) {
+    $("#mm-results").innerHTML = `<div class="empty">搜索失败：${esc(e.message)}</div>`;
+  }
+}
+
+$("#btn-mm-ingest")?.addEventListener("click", () => {
+  const urls = ($("#mm-urls").value || "").split(/\s*\n\s*/).filter(Boolean);
+  startMediaIngest(urls);
+});
+$("#btn-mm-stop")?.addEventListener("click", async () => {
+  try {
+    await api("/api/learn/stop", { method: "POST" });
+    toast("已请求停止，当前来源解析完就收尾", "");
+  } catch (e) {
+    toast("停止失败：" + e.message, "err");
+  }
+});
+$("#btn-mm-search")?.addEventListener("click", searchMedia);
+$("#btn-mm-backfill")?.addEventListener("click", startBackfill);
+$("#mm-q")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") searchMedia();
+});
+/* 搜索结果里的「摄取」按钮是动态渲染的，用事件委托 */
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-mm-ingest]");
+  if (!btn) return;
+  startMediaIngest([btn.dataset.mmIngest]);
+});
+
+/* ---------------- 证据复核与检索运维面板 ----------------
+   默认全部走 dry run：接口本身也是默认只读，只有用户勾选「真正执行」
+   才把 dry_run:false 传下去。写库 / 联网这种不可逆动作不放在自动轮询里。 */
+function opsWriteEnabled() {
+  const box = $("#ops-write");
+  return !!(box && box.checked);
+}
+
+function opsRender(label, data) {
+  const el = $("#ops-output");
+  if (!el) return;
+  el.textContent = label + "\n" + JSON.stringify(data, null, 2);
+}
+
+async function opsCall(label, path, opts) {
+  try {
+    toast(label + "…");
+    const out = await api(path, opts || {});
+    opsRender(label, out);
+    toast(label + "完成", "ok");
+    return out;
+  } catch (e) {
+    toast(label + "失败：" + (e.message || e), "err");
+    return null;
+  }
+}
+
+function opsPost(body) {
+  return { method: "POST", body: Object.assign({ dry_run: !opsWriteEnabled() }, body || {}) };
+}
+
+function bindOpsPanel() {
+  const on = (sel, fn) => {
+    const el = $(sel);
+    if (el) el.addEventListener("click", fn);
+  };
+  on("#btn-ops-plan", () => opsCall("无引文盘点（只读）", "/api/review/plan?sample=5"));
+  on("#btn-ops-enqueue", () => opsCall("复核入队", "/api/review/enqueue", opsPost()));
+  on("#btn-ops-local", () => opsCall("本地逐字补证", "/api/review/run-local",
+    opsPost({ batch: 50 })));
+  on("#btn-ops-urls", () => opsCall("来源 URL 复检", "/api/review/run-urls",
+    opsPost({ limit: 20 })));
+  on("#btn-ops-status", () => opsCall("复核进度", "/api/review/status"));
+  on("#btn-ops-index", () => opsCall("词法索引状态", "/api/search/index"));
+  on("#btn-ops-hybrid", () => {
+    const q = (($("#ops-q") || {}).value || state.knowledgeQuery || "ZBrush").trim();
+    if (!q) { toast("先填一个查询词", "err"); return; }
+    opsCall("混合召回：" + q, "/api/knowledge/hybrid-search?q=" + encodeURIComponent(q) + "&k=8");
+  });
+  on("#btn-ops-events", () => opsCall("事件聚合", "/api/events/rollups"));
+  on("#btn-ops-topics", () => opsCall("主题聚类", "/api/topics/clusters"));
+  // 策略探针改为 ops 卡片首次交互时惰性加载：模块顶层一旦发请求，
+  // 会在测试沙箱与首帧渲染里凭空多一次 fetch，污染请求队列。
+  on("#ops-card", () => loadOpsPolicy());
+}
+
+let opsPolicyLoaded = false;
+
+function loadOpsPolicy() {
+  if (opsPolicyLoaded) return;
+  opsPolicyLoaded = true;
+  api("/api/analytics/evidence-policy").then((p) => {
+    const tag = $("#ops-policy");
+    if (!tag) return;
+    let text = p.independent_verification
+      ? "独立核查 · " + (p.verify_model || "")
+      : "主模型自证（未配置独立核查模型）";
+    const bad = ((p.path_diagnostics || {}).unmatched_configured || []);
+    if (bad.length) {
+      text += " · 警告：灰度通路名无效 " + bad.join(", ");
+      tag.style.color = "#ffa640";
+    }
+    tag.textContent = text;
+  }).catch(() => {
+    const tag = $("#ops-policy");
+    if (tag) tag.textContent = "证据策略不可用";
+    opsPolicyLoaded = false;  // 失败允许下次交互重试
+  });
+}
+
+bindOpsPanel();
+
 /* ---------------- 轮询 ---------------- */
 let refreshBusy = false;
 async function refreshAll() {
@@ -3515,11 +4832,17 @@ async function refreshAll() {
     const st = await api("/api/status");
     state.status = st;
     paintTopbar(st);
+    if (st.auto) { autoOn = st.auto.enabled; paintAuto(st.auto); fillAutoSettings(st.auto); }
+    if (st.config) fillRotationSettings(st.config);
+    // 面板只在「自主进化」页可见：其他页面每 6 秒重建几十行子方向 DOM 是白费，
+    // 切回该页时 loadRotation() 会补一次。
+    if (st.rotation && state.view === "learn") paintRotation(st.rotation);
     await refreshSuggestions();
     if (state.view === "dashboard") { await loadDashboard(st); refreshHealth(); }
     // 知识库列表按写入版本门控：版本没变过就整轮跳过（服务端此时也命中缓存），
     // 不再每 6 秒无条件重拉 + 重建 60 行 DOM。
     if (state.view === "knowledge") {
+      await loadRefinements();
       const ver = st.stats && st.stats.ver;
       if (ver !== state.kbVer) await loadKnowledge();
     }
@@ -3541,4 +4864,19 @@ switchView(location.hash.slice(1) || "dashboard", true);
 // 请求先发出去，别和它抢带宽。
 setTimeout(refreshAll, 0);
 setInterval(refreshAll, 6000);
+
+/* 切回前台：refreshAll 与书库 / OCR / 微调轮询在后台标签页里都会跳过（省请求、
+   省后端 CPU），回到前台不必干等下一拍（最长 6 秒）——立刻补一拍。SSE 若在后台
+   断开、正处在指数退避（最长 30 秒）里，也立即重连，不让「最近活动」停在旧状态。 */
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  refreshAll();
+  if (libPoll) pollLibTask();
+  if (ocrPoll) pollOcr();
+  if (ftPollTimer) ftPollOnce();
+  if (!sseAlive && sseReconnectTimer !== null) {
+    state.sseRetry = 2000;
+    connectSSE();
+  }
+});
 maybeShowOnboarding();
