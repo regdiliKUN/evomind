@@ -188,6 +188,8 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001
                 print(f"  {C_WARN}!{C_END} 跳过 {rel}：{e}")
                 continue
+            if src.suffix.lower() in {".cmd", ".bat"}:
+                data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
             raw_total += len(data)
             comp = zipfile.ZIP_STORED if src.suffix.lower() in stored else zipfile.ZIP_DEFLATED
             info = zipfile.ZipInfo(f"EvoMind/{rel.as_posix()}", time.localtime(src.stat().st_mtime)[:6])
