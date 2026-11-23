@@ -201,7 +201,7 @@ class LedgerRobustnessTests(IsolatedTest):
         point = {"claim": "DynaMesh 分辨率控制多边形密度", "detail": "提高分辨率增加面数。",
                  "evidence": "DynaMesh resolution controls polygon density.",
                  "relevance": .9, "confidence": .8}
-        with patch.object(llm, "chat_json", side_effect=[{"points": [point]}, {"verified": [0]}]):
+        with self.mock_embeddings(), patch.object(llm, "chat_json", side_effect=[{"points": [point]}, {"verified": [0]}]):
             with patch.object(memory, "record_attempts", side_effect=RuntimeError("database is locked")):
                 got = engine._extract_all([doc], "ZBrush", "")
         self.assertEqual(len(got), 1)  # 台账写失败，知识点照样入库
@@ -213,7 +213,7 @@ class LedgerRobustnessTests(IsolatedTest):
                  "evidence": "DynaMesh resolution controls polygon density.",
                  "relevance": .9, "confidence": .8}
         sections = [(0, good), (1, "这不是一个字典")]
-        with patch.object(engine, "_sections", return_value=sections), \
+        with self.mock_embeddings(), patch.object(engine, "_sections", return_value=sections), \
              patch.object(llm, "chat_json", side_effect=[{"points": [point]}, {"verified": [0]}]):
             got = engine._extract_all([good, good], "ZBrush", "")
         self.assertEqual(len(got), 1)
@@ -343,7 +343,7 @@ class FunnelTests(IsolatedTest):
         point = {"claim": "DynaMesh 分辨率控制多边形密度", "detail": "提高分辨率增加面数。",
                  "evidence": "DynaMesh resolution controls polygon density.",
                  "relevance": .9, "confidence": .8}
-        with patch.object(llm, "chat_json", side_effect=[{"points": [point]}, {"verified": [0]}]):
+        with self.mock_embeddings(), patch.object(llm, "chat_json", side_effect=[{"points": [point]}, {"verified": [0]}]):
             engine._extract_all([doc], "ZBrush", "")
         self.assertEqual(engine._funnel["sections"], 1)
         self.assertEqual(engine._funnel["candidates"], 1)

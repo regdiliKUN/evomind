@@ -72,6 +72,10 @@ class IsolatedTest(unittest.TestCase):
             vec=[1.0, 0.0] if vec is None else vec, dedup=False,
         )
 
+    def mock_embeddings(self):
+        """Provide a deterministic vector distinct from the fixture points."""
+        return patch.object(llm, "embed", side_effect=lambda texts: [[0.0, 1.0] for _ in texts])
+
 
 class MemoryTests(IsolatedTest):
     def test_cache_reuses_normalized_vectors(self):

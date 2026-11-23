@@ -91,7 +91,8 @@ class KnowledgeDedupTests(IsolatedTest):
             rows.append(dict(memory.conn().execute('SELECT * FROM knowledge WHERE id=?',(pid,)).fetchone()))
         items = [dict(claim='打印前检查模型壁厚',detail='必要条件',source_ids=[p['id'] for p in rows])]
         refinement._stop.clear()
-        refinement._save('CAD',rows,items)
+        with self.mock_embeddings():
+            refinement._save('CAD',rows,items)
         # 炼化不再自动删除 / 归档原始条目：2 条原始 + 1 条可检索的精炼结论。
         self.assertEqual(memory.count_points(),3)
         self.assertNotIn(memory.get_point(rows[0]['id']).get('status'),
@@ -100,7 +101,8 @@ class KnowledgeDedupTests(IsolatedTest):
         self.assertEqual(len(refined),1)
         self.assertIn(rows[0]['id'], refined[0]['supersedes'])
         self.assertIn(rows[1]['id'], refined[0]['supersedes'])
-        refinement._save('CAD',rows,items)
+        with self.mock_embeddings():
+            refinement._save('CAD',rows,items)
         history = refinement.history('CAD')
         self.assertEqual(sum(len(h['items']) for h in history),1)
         self.assertEqual(set(history[1]['items'][0]['source_ids']), {p['id'] for p in rows})

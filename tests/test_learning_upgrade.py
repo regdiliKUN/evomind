@@ -156,7 +156,8 @@ class LearningUpgradeTests(IsolatedTest):
         p1, p2 = self.point(1, topic="ZBrush"), self.point(2, topic="ZBrush")
         rows = memory.list_points("ZBrush")
         out = {"items": [{"claim": "Core knowledge summary", "detail": "", "source_ids": [p1, p2]}]}
-        with patch.object(llm, "chat_json", side_effect=[out, {"verified": [0]}]), patch.dict(refinement._state, saved=0, done=0, stage="refining", error=""):
+        with self.mock_embeddings(), patch.object(llm, "chat_json", side_effect=[out, {"verified": [0]}]), \
+             patch.dict(refinement._state, saved=0, done=0, stage="refining", error=""):
             refinement._stop.clear()
             refinement._run(rows)
             self.assertEqual(refinement.state()["stage"], "done")

@@ -51,7 +51,7 @@ class BookRefinementTests(IsolatedTest):
         self.assertTrue(all(len(job["points"]) <= 60 for job in batches))
         self.assertNotIn(web, {p["id"] for b in batches for p in b["points"]})
         self.assertTrue(all(len({p["book_id"] for p in b["points"]}) == 1 for b in batches))
-        with patch.object(refinement, "_distill", side_effect=self.distill):
+        with self.mock_embeddings(), patch.object(refinement, "_distill", side_effect=self.distill):
             state = self.run_pending()
         self.assertEqual(state["stage"], "done")
         self.assertEqual(state["done"], 135)
