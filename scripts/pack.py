@@ -47,6 +47,7 @@ INCLUDE_DIRS = ["backend", "web", "scripts", "assets", "tests"]
 INCLUDE_FILES = [
     "run.py",
     "evomind_launcher.py",
+    "EvoMind.exe",
     "requirements.txt",
     "README.md",
     "LICENSE",

@@ -481,7 +481,7 @@
   <h2>常见问题</h2>
 
   <h3>双击后黑窗口一闪就没了</h3>
-  <p>先运行「② 修复环境.cmd」重建依赖，再启动。如果还是不行，看黑窗口里的报错。</p>
+  <p>如果提示找不到 python.exe、pythonw.exe，或退出码 103，请先确认已装 Windows x64 Python 3.13，再运行「② 修复环境.cmd」。同版本环境会尝试保留依赖。需要重建时，旧环境会备份，知识库和设置仍在 data/ 中。</p>
 
   <h3>提示模型离线</h3>
   <p>Ollama 没启动。启动器会自动拉起它，如果失败，手动打开一次 Ollama 程序再刷新页面。</p>
@@ -512,7 +512,7 @@
     <tr><th>文件/目录</th><th>说明</th></tr>
     <tr><td><code>⓪ 首次安装.cmd</code></td><td>第一次用跑这个，装环境、可选建桌面图标</td></tr>
     <tr><td><code>① 双击这里启动.cmd</code></td><td>日常启动，最常用</td></tr>
-    <tr><td><code>② 修复环境.cmd</code></td><td>依赖坏了时用它重建</td></tr>
+    <tr><td><code>② 修复环境.cmd</code></td><td>修复 Python 环境并补装依赖</td></tr>
     <tr><td><code>③ 桌面图标.cmd</code></td><td>随时增删桌面图标</td></tr>
     <tr><td><code>data/knowledge/</code></td><td>知识库数据库（你的学习成果都在这）</td></tr>
     <tr><td><code>data/models/</code></td><td>它自己下载的模型</td></tr>

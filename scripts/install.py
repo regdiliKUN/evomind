@@ -11,10 +11,13 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent.parent
 VENV = ROOT / ".venv"
@@ -87,10 +90,81 @@ def check_python() -> bool:
     return True
 
 
+def venv_works() -> bool:
+    if not PY.is_file():
+        return False
+    try:
+        result = subprocess.run(
+            [str(PY), "-I", "-c", "import sys; sys.exit(sys.version_info < (3, 10) or sys.prefix == sys.base_prefix)"],
+            capture_output=True, timeout=10,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def pe_machine(path: Path) -> bytes:
+    with path.open("rb") as exe:
+        exe.seek(0x3C)
+        exe.seek(int.from_bytes(exe.read(4), "little"))
+        if exe.read(4) != b"PE\0\0":
+            raise ValueError(f"不是 Windows 可执行文件：{path}")
+        return exe.read(2)
+
+
+def reconnect_venv() -> bool:
+    """同版本、同架构时只修正基解释器路径，保留已安装的包。"""
+    cfg = VENV / "pyvenv.cfg"
+    base = Path(sys._base_executable)
+    if not cfg.is_file() or not PY.is_file():
+        return False
+    try:
+        original = cfg.read_bytes()
+        contents = original.decode("utf-8-sig").replace("\r\n", "\n")
+        version = ".".join(map(str, sys.version_info[:3]))
+        old_version = re.search(r"(?m)^version[ \t]*=[ \t]*(\d+\.\d+)\.", contents)
+        if old_version is None or old_version[1] != version.rsplit(".", 1)[0]:
+            return False
+        if pe_machine(PY) != pe_machine(base):
+            return False
+        if (PY.parent / "pythonw.exe").exists() and not (base.parent / "pythonw.exe").is_file():
+            return False
+        updates = {"home": str(base.parent), "executable": str(base), "version": version}
+        replacement = contents
+        for key, value in updates.items():
+            replacement, count = re.subn(rf"(?m)^{key}[ \t]*=[^\n]*", lambda _: f"{key} = {value}", replacement)
+            if count == 0:
+                replacement = replacement.rstrip("\n") + f"\n{key} = {value}\n"
+        with tempfile.NamedTemporaryFile(dir=VENV, prefix="pyvenv-", delete=False) as out:
+            staged = Path(out.name)
+            out.write(replacement.encode("utf-8"))
+        try:
+            staged.replace(cfg)
+            if venv_works():
+                ok(f"已恢复虚拟环境，保留已安装的依赖（{base}）")
+                return True
+            cfg.write_bytes(original)
+        finally:
+            staged.unlink(missing_ok=True)
+    except (OSError, ValueError) as e:
+        warn(f"无法复用旧环境：{e}")
+    return False
+
+
 def ensure_venv() -> bool:
-    if PY.exists():
-        ok("虚拟环境已存在，跳过创建")
+    if venv_works():
+        ok("虚拟环境可用")
         return True
+    if VENV.exists():
+        if reconnect_venv():
+            return True
+        try:
+            backup = VENV.with_name(f".venv.backup-{uuid4().hex[:12]}")
+            VENV.rename(backup)
+        except OSError as e:
+            fail(f"无法备份旧环境：{e}")
+            return False
+        warn(f"旧环境已备份到 {backup.name}。新环境将重新安装运行依赖。")
     line(f"  {C_DIM}正在创建虚拟环境…{C_END}")
     try:
         r = subprocess.run(
@@ -100,7 +174,7 @@ def ensure_venv() -> bool:
     except Exception as e:  # noqa: BLE001
         fail(f"创建失败：{e}")
         return False
-    if r.returncode != 0 or not PY.exists():
+    if r.returncode != 0 or not venv_works():
         fail("创建虚拟环境失败")
         if r.stderr:
             line(f"  {C_DIM}{r.stderr.strip()[-300:]}{C_END}")
@@ -226,7 +300,11 @@ def done() -> None:
 
 
 def main() -> int:
-    banner()
+    repair = "--repair" in sys.argv[1:]
+    if repair:
+        line("\n  EvoMind · 修复 Python 环境")
+    else:
+        banner()
 
     step("检查 Python")
     if not check_python():
@@ -238,6 +316,9 @@ def main() -> int:
         return 1
     if not install_deps():
         return 1
+    if repair:
+        ok("修复完成，可以从桌面图标或「① 双击这里启动.cmd」启动。")
+        return 0
 
     step("检查模型后端")
     check_ollama()

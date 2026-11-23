@@ -160,13 +160,15 @@ ollama pull bge-m3          # 向量模型
 
 ### 安装与启动（Windows）
 
+Windows 成品包在 [GitHub Releases](https://github.com/regdiliKUN/evomind/releases/latest)。
+
 **第一次用**：双击 **`⓪ 首次安装.cmd`**
 
 它会依次完成：建虚拟环境 → 装依赖 → 检查 Ollama → **问你要不要在桌面放一个 EvoMind 图标**（可以选不要）。
 
 **以后每次**：双击 **`① 双击这里启动.cmd`**，或者直接双击桌面上的图标。
 
-浏览器会自动打开控制台，约 10 秒。依赖出问题时跑 **`② 修复环境.cmd`**。
+浏览器会自动打开控制台，约 10 秒。依赖出问题，或提示找不到 `python.exe`、`pythonw.exe` 或退出码 103 时，运行 **`② 修复环境.cmd`**。如果原来的 Python 已移动，请先安装独立的 Windows x64 Python 3.13，或用 uv 安装 Python 3.13。同版本环境会尝试保留原依赖，需要重建时会备份旧的 `.venv`。知识库和设置仍在 `data/` 中。
 
 ### 桌面图标
 
