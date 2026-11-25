@@ -42,44 +42,101 @@ def _emit(on_event: Event | None, level: str, msg: str, **payload) -> None:
 # --------------------------------------------------------------------------
 # 环境检测与安装
 # --------------------------------------------------------------------------
-def _check_env_uncached() -> dict:
-    mods = {}
-    for name in ("torch", "transformers", "peft", "datasets"):
+ENV_MODULES = ("torch", "transformers", "peft", "datasets")
+
+
+def _module_versions() -> dict[str, str | None]:
+    """只查包元数据、不导入：判断「装没装、什么版本」用不着真的 import。
+
+    原来这里逐个 __import__ torch / transformers / peft / datasets：torch 有一万多个文件、
+    4GB+，放在机械盘上冷启动导入要几十秒，而 /api/status 第一次轮询就要等它，
+    仪表盘开机后半分钟都是空的；顺带还把 torch 常驻进了服务进程（多占几百 MB 内存）。
+    """
+    from importlib import metadata, util
+
+    mods: dict[str, str | None] = {}
+    for name in ENV_MODULES:
         try:
-            m = __import__(name)
-            mods[name] = getattr(m, "__version__", "ok")
-        except Exception:
+            if util.find_spec(name) is None:
+                mods[name] = None
+                continue
+            try:
+                mods[name] = metadata.version(name)
+            except metadata.PackageNotFoundError:
+                mods[name] = "ok"
+        except Exception:  # noqa: BLE001  find_spec 遇到坏包也可能抛
             mods[name] = None
-    ready = all(v for k, v in mods.items() if k != "datasets")
-    info: dict[str, Any] = {"ready": ready, "modules": mods, "cuda": None, "gpu": None}
+    return mods
+
+
+#: CUDA 探测在独立子进程里跑：导入 torch 慢且吃内存，不该落在服务进程和请求路径上。
+_CUDA_PROBE = (
+    "import json, torch\n"
+    "ok = torch.cuda.is_available()\n"
+    "out = {'cuda': ok, 'gpu': None}\n"
+    "if ok:\n"
+    "    p = torch.cuda.get_device_properties(0)\n"
+    "    out.update(gpu=torch.cuda.get_device_name(0), vram_gb=round(p.total_memory / 1024 ** 3, 1))\n"
+    "print(json.dumps(out))\n"
+)
+CUDA_PROBE_TIMEOUT = 300.0
+
+#: CUDA 探测结果。显卡与驱动不会自己变，探一次即可；装完依赖后由 _reset_env_cache 重探。
+_gpu: dict[str, Any] = {"state": "idle", "value": {"cuda": None, "gpu": None}}
+_gpu_lock = threading.Lock()
+
+
+def _probe_cuda() -> dict:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        import torch
-
-        info["cuda"] = torch.cuda.is_available()
-        if info["cuda"]:
-            info["gpu"] = torch.cuda.get_device_name(0)
-            info["vram_gb"] = round(
-                torch.cuda.get_device_properties(0).total_memory / (1024 ** 3), 1
-            )
-    except Exception:
+        p = subprocess.run([_python_exe(), "-c", _CUDA_PROBE], capture_output=True, text=True,
+                           timeout=CUDA_PROBE_TIMEOUT, creationflags=flags)
+        lines = p.stdout.strip().splitlines()
+        if p.returncode == 0 and lines:
+            return json.loads(lines[-1])
+    except (OSError, subprocess.SubprocessError, ValueError):
         pass
-    return info
+    return {"cuda": False, "gpu": None}
 
 
-#: check_env 的 TTL 缓存。环境（装了哪些包、有没有 CUDA）不会自己变，
-#: 而 /api/status 每几秒轮询一次，每次 torch.cuda.is_available() 是一次驱动调用。
+def _run_gpu_probe() -> None:
+    value = _probe_cuda()
+    with _gpu_lock:
+        _gpu.update(state="done", value=value)
+
+
+def _gpu_info(torch_installed: bool) -> tuple[dict, bool]:
+    """返回 (CUDA 信息, 是否仍在探测)。首次调用在后台启动探测，不阻塞。"""
+    if not torch_installed:
+        return {"cuda": None, "gpu": None}, False
+    with _gpu_lock:
+        if _gpu["state"] == "idle":
+            _gpu["state"] = "running"
+            threading.Thread(target=_run_gpu_probe, name="cuda-probe", daemon=True).start()
+        return dict(_gpu["value"]), _gpu["state"] == "running"
+
+
+#: 包元数据查询本身只要几毫秒，TTL 只是避免每次轮询都扫一遍 site-packages。
 _env_cache: dict[str, Any] = {"ts": 0.0, "value": None}
 CHECK_ENV_TTL = 30.0
 
 
+def _reset_env_cache() -> None:
+    _env_cache.update(ts=0.0, value=None)
+    with _gpu_lock:
+        if _gpu["state"] != "running":
+            _gpu.update(state="idle", value={"cuda": None, "gpu": None})
+
+
 def check_env() -> dict:
-    """带 30s TTL 的环境检测。安装/卸载依赖后由 install_env 主动失效。"""
+    """微调环境检测，永不阻塞：CUDA 信息未探测完时 cuda=None、cuda_checking=True。"""
     now = time.monotonic()
-    if _env_cache["value"] is not None and now - _env_cache["ts"] < CHECK_ENV_TTL:
-        return dict(_env_cache["value"])
-    val = _check_env_uncached()
-    _env_cache.update(ts=now, value=val)
-    return dict(val)
+    if _env_cache["value"] is None or now - _env_cache["ts"] >= CHECK_ENV_TTL:
+        _env_cache.update(ts=now, value=_module_versions())
+    mods = dict(_env_cache["value"])
+    gpu, checking = _gpu_info(bool(mods.get("torch")))
+    ready = all(v for k, v in mods.items() if k != "datasets")
+    return {"ready": ready, "modules": mods, **gpu, "cuda_checking": checking}
 
 
 def _python_exe() -> str:
@@ -118,7 +175,7 @@ def install_env(on_event: Event | None = None) -> dict:
             _emit(on_event, "error", f"安装异常：{e}")
             return {"ok": False, "msg": str(e)}
     # 刚装完依赖，环境检测缓存必须失效，否则界面要等最多 30s 才反映新状态
-    _env_cache.update(ts=0.0, value=None)
+    _reset_env_cache()
     ok = check_env()["ready"]
     _emit(on_event, "ok" if ok else "warn", "微调环境就绪" if ok else "依赖仍不完整")
     return {"ok": ok}

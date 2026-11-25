@@ -929,9 +929,11 @@ function paintTopbar(st) {
   $("#dot-gpu").className = "dot " + (st.finetune.cuda ? "on" : "warn");
   $("#txt-gpu").textContent = st.finetune.cuda
     ? (st.finetune.gpu || "").replace("NVIDIA GeForce ", "")
-    : st.finetune.ready
-      ? "CUDA 不可用"
-      : "微调未装";
+    : st.finetune.cuda_checking
+      ? "显卡检测中…"
+      : st.finetune.ready
+        ? "CUDA 不可用"
+        : "微调未装";
 
   $("#btn-start").disabled = running || learnStarting || !!st.rotation?.active;
   $("#btn-stop").disabled = !running && !st.rotation?.active;
@@ -2961,8 +2963,8 @@ async function loadFinetune() {
     $("#ft-env").innerHTML =
       rows +
       `<div class="kv"><span class="k">CUDA</span><span class="v ${
-        env.cuda ? "ok-mark" : "bad-mark"
-      }">${env.cuda ? "可用" : "不可用"}</span></div>
+        env.cuda ? "ok-mark" : env.cuda_checking ? "" : "bad-mark"
+      }">${env.cuda ? "可用" : env.cuda_checking ? "检测中…" : "不可用"}</span></div>
        <div class="kv"><span class="k">显卡</span><span class="v">${esc(env.gpu || "—")}</span></div>`;
 
     const outs = await api("/api/finetune/outputs");
