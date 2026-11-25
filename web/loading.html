@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>EvoMind · 正在启动</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f7f9; --fg: #1f2328; --muted: #6b7280; --accent: #3f9f74; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #16181d; --fg: #e6e8eb; --muted: #9aa1ab; } }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; align-items: center; justify-content: center; background: var(--bg); color: var(--fg);
+         font-family: "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif; }
+  .box { text-align: center; max-width: 520px; padding: 0 16px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 20px 0 8px; }
+  p { color: var(--muted); margin: 6px 0; line-height: 1.6; }
+  .spin { width: 36px; height: 36px; margin: 0 auto; border-radius: 50%;
+          border: 3px solid color-mix(in srgb, var(--accent) 25%, transparent); border-top-color: var(--accent);
+          animation: r 0.9s linear infinite; }
+  .fail .spin { display: none; }
+  code { font-size: 12px; word-break: break-all; }
+  @keyframes r { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="box" id="box">
+  <div class="spin"></div>
+  <h1 id="title">EvoMind 正在启动…</h1>
+  <p id="msg">首次启动需要检查 Ollama、加载数据，通常 10～40 秒，无需重复点击。</p>
+  <p id="elapsed"></p>
+</div>
+<script>
+  // 由 run.py 的临时服务在控制台同一端口上提供；主服务接手后，响应里不再带
+  // X-EvoMind-Splash 头，此时刷新即进入控制台。交接间隙的请求会排队或失败，继续轮询即可。
+  const t0 = Date.now();
+  const LIMIT = 180;  // 秒
+  async function poll() {
+    const sec = Math.round((Date.now() - t0) / 1000);
+    document.getElementById("elapsed").textContent = "已等待 " + sec + " 秒";
+    try {
+      const r = await fetch("/", { cache: "no-store" });
+      if (r.ok && !r.headers.has("X-EvoMind-Splash")) {
+        location.replace("/");
+        return;
+      }
+    } catch (e) { /* 交接中 */ }
+    if (sec >= LIMIT) {
+      document.getElementById("box").classList.add("fail");
+      document.getElementById("title").textContent = "启动时间过长";
+      document.getElementById("msg").innerHTML =
+        "服务一直没有响应，可能启动失败了。请关闭此窗口，查看日志 <code>data\\logs\\launcher.log</code>，" +
+        "或用「① 双击这里启动.cmd」启动以查看实时输出。";
+      return;
+    }
+    setTimeout(poll, 500);
+  }
+  poll();
+</script>
+</body>
+</html>

@@ -59,6 +59,22 @@ def _has_console() -> bool:
         return False
 
 
+def pick_log_file(log_dir: Path) -> Path:
+    """本次启动用的日志文件。
+
+    上一份 launcher.log 改名为 launcher.prev.log 保留；改名失败说明另一个实例正开着它在写
+    （Windows 下被打开的文件不能改名），这时改写 launcher.extra.log，不再用 "w" 把
+    正在运行的那个实例的日志清空。
+    """
+    log_file = log_dir / "launcher.log"
+    if log_file.exists():
+        try:
+            os.replace(log_file, log_dir / "launcher.prev.log")
+        except OSError:
+            return log_dir / "launcher.extra.log"
+    return log_file
+
+
 def main_windowed(root: Path) -> int:
     """默认模式：不开黑色控制台，界面在独立窗口里（见 backend/appwindow.py），关窗即退出。
 
@@ -68,7 +84,7 @@ def main_windowed(root: Path) -> int:
     python = pythonw if pythonw.exists() else root / ".venv" / "Scripts" / "python.exe"
     log_dir = root / "data" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "launcher.log"
+    log_file = pick_log_file(log_dir)
     env = dict(os.environ, EVOMIND_LAUNCHED_BY_EXE="1", PYTHONIOENCODING="utf-8")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
