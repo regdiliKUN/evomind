@@ -218,6 +218,29 @@ def api_turbo_set(body: dict = Body(...)) -> dict:
     return turbo.set_enabled(enabled)
 
 
+# --------------------------------------------------------------------------
+# 狂暴模式 · CPU 后台扫描（书库页的扫描卡片）
+# --------------------------------------------------------------------------
+@router.get("/api/cpu-ocr")
+def api_cpu_ocr_get() -> dict:
+    from .. import cpu_ocr
+
+    return cpu_ocr.overview()
+
+
+@router.post("/api/cpu-ocr")
+def api_cpu_ocr_set(body: dict = Body(...)) -> dict:
+    """暂停 / 继续 CPU 后台扫描（只改 turbo_cpu_ocr，不动狂暴模式本身）。"""
+    from .. import cpu_ocr
+
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(422, "enabled 必须是 true / false")
+    config.update({"turbo_cpu_ocr": enabled})
+    turbo.apply()
+    return cpu_ocr.overview()
+
+
 @router.get("/api/sessions")
 def api_sessions() -> list[dict]:
     return memory.list_sessions()

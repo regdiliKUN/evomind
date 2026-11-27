@@ -117,3 +117,47 @@ class CpuOcrTests(IsolatedTest):
         self.assertEqual(c.execute("SELECT status FROM books WHERE id='b1'").fetchone()[0], "skipped")
         self.assertTrue(self._wait(lambda: (cpu_ocr.history()["last_run"] or {}).get("image_only") == 1, 10))
         self.assertEqual(cpu_ocr.history()["last_run"]["books"], 0)
+
+
+class CpuOcrApiTests(CpuOcrTests):
+    """书库页扫描卡片用的接口：概览数据 + 暂停 / 继续。"""
+
+    def test_overview_and_pause_resume(self):
+        from fastapi.testclient import TestClient
+
+        from backend.main import app
+
+        cl = TestClient(app)
+        o = cl.get("/api/cpu-ocr").json()
+        self.assertFalse(o["turbo_on"])
+        self.assertEqual((o["pending_books"], o["pending_pages"]), (1, 3))
+        self.assertEqual(o["overall"], {"done": 0, "total": 1})
+        self.assertEqual([b["id"] for b in o["queue"]], ["b1"])
+
+        turbo.set_enabled(True)
+        c = memory.conn()
+        self.assertTrue(self._wait(lambda: c.execute(
+            "SELECT status FROM books WHERE id='b1'").fetchone()[0] == "ready"))
+        self.assertTrue(self._wait(lambda: cpu_ocr.state()["books_done"] == 1, 10))
+        o = cl.get("/api/cpu-ocr").json()
+        self.assertEqual(o["pending_books"], 0)
+        self.assertEqual(o["overall"], {"done": 1, "total": 1})
+        self.assertEqual(o["recent"][0]["title"], "测试扫描书")
+        self.assertEqual(o["recent"][0]["result"], "ok")
+        self.assertGreater(o["recent"][0]["chars"], 200)
+        self.assertTrue(o["runs"] and o["runs"][0]["updated_at"] >= o["runs"][0]["started_at"])
+
+        # 暂停只停扫描，不关狂暴模式；继续后线程重新起来
+        o = cl.post("/api/cpu-ocr", json={"enabled": False}).json()
+        self.assertFalse(o["enabled"])
+        self.assertTrue(turbo.on())
+        self.assertTrue(self._wait(lambda: not cpu_ocr.state()["running"], 60))
+        o = cl.post("/api/cpu-ocr", json={"enabled": True}).json()
+        self.assertTrue(o["enabled"])
+        self.assertTrue(self._wait(lambda: cpu_ocr.state()["running"], 10))
+        self.assertEqual(cl.post("/api/cpu-ocr", json={"enabled": "no"}).status_code, 422)
+
+    # 父类的三个用例不在这个子类里重复跑
+    test_turbo_ocrs_scanned_book_into_ready = None
+    test_disabled_by_config_or_switch = None
+    test_image_only_book_is_not_retried_forever = None

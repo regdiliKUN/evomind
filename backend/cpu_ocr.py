@@ -88,6 +88,8 @@ def _snapshot_run(ended: bool) -> dict:
         return {
             "started_at": _state["started_at"],
             "ended_at": time.time() if ended else 0.0,
+            # 直接关窗口时后台线程被杀，来不及写 ended_at；靠它推算这次跑到了几点
+            "updated_at": time.time(),
             "books": _state["books_done"] - _state["image_only"],
             "image_only": _state["image_only"],
             "pages": _state["pages_done"],
@@ -102,8 +104,64 @@ def history() -> dict:
         "totals": {
             "runs": len(runs),
             "books": sum(int(r.get("books", 0)) for r in runs),
+            "image_only": sum(int(r.get("image_only", 0)) for r in runs),
             "pages": sum(int(r.get("pages", 0)) for r in runs),
+            "hours": round(sum(max(0.0, (r.get("ended_at") or r.get("updated_at") or r.get("started_at", 0))
+                                   - r.get("started_at", 0))
+                               for r in runs if r.get("started_at")) / 3600, 1),
         },
+    }
+
+
+def overview() -> dict:
+    """书库页「CPU 后台扫描」卡片要的全部信息：状态、总进度、队列、最近完成、运行记录。"""
+    import re
+
+    from . import turbo
+
+    c = memory.conn()
+    d = state()
+    pending = c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(pages), 0) FROM books"
+        " WHERE status='skipped' AND skip_reason LIKE ?", (NEED_OCR,)).fetchone()
+    pending_books, pending_pages = int(pending[0]), int(pending[1])
+    # 正在识别的这本已做完的页不算「剩余」
+    if d.get("status") == "ocr":
+        pending_pages = max(0, pending_pages - int(d.get("done") or 0))
+    queue_rows = c.execute(
+        "SELECT id, title, pages FROM books WHERE status='skipped' AND skip_reason LIKE ?"
+        " AND id != ? ORDER BY COALESCE(NULLIF(pages, 0), 1000000), created_at LIMIT 8",
+        (NEED_OCR, d.get("book_id") or ""),
+    ).fetchall()
+    recent = []
+    for ts, kind, msg in c.execute(
+            "SELECT ts, kind, message FROM events WHERE message LIKE 'CPU 后台 OCR%'"
+            " AND message NOT LIKE '%启动%' ORDER BY id DESC LIMIT 12").fetchall():
+        m = re.search(r"《(.+?)》(?:：(\d+) 字)?", msg)
+        recent.append({
+            "ts": ts, "title": m.group(1) if m else msg[:60],
+            "chars": int(m.group(2)) if m and m.group(2) else 0,
+            "result": "ok" if kind == "ok" else ("skip" if "纯图册" in msg or "打不开" in msg else kind),
+        })
+    totals = d.get("totals") or {}
+    done_all = int(totals.get("books", 0)) + int(totals.get("image_only", 0))
+    rate = d.get("pages_per_min") or 0
+    if not rate:
+        # 不在运行时用历史平均速度估算
+        hrs = float(totals.get("hours") or 0)
+        rate = round(int(totals.get("pages", 0)) / (hrs * 60)) if hrs > 0 else 0
+    return {
+        **d,
+        "turbo_on": turbo.on(),
+        "enabled": bool(config.get("turbo_cpu_ocr", True)),
+        "workers": WORKERS, "threads_per_engine": THREADS_PER_ENGINE,
+        "pending_books": pending_books, "pending_pages": pending_pages,
+        "overall": {"done": done_all, "total": done_all + pending_books},
+        "rate_ppm": rate,
+        "eta_hours": round(pending_pages / rate / 60, 1) if rate else None,
+        "queue": [{"id": r["id"], "title": r["title"], "pages": r["pages"]} for r in queue_rows],
+        "recent": recent,
+        "runs": list(reversed(load_runs()))[:10],
     }
 
 

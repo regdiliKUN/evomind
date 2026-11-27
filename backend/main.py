@@ -201,6 +201,8 @@ from .routers.learning import (  # noqa: E402,F401
     api_auto_set,
     api_turbo_get,
     api_turbo_set,
+    api_cpu_ocr_get,
+    api_cpu_ocr_set,
     api_directions,
     api_learn_start,
     api_learn_stop,

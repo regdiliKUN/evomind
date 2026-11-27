@@ -228,7 +228,7 @@ function switchView(v, fromHash) {
   }
   if (v === "analytics") loadAnalytics();
   if (v === "digest") loadDigestView();
-  if (v === "library") loadLibrary();
+  if (v === "library") { loadLibrary(); loadCpuOcr(); watchCpuOcr(true); }
   if (v === "media") loadMediaCaps();
   if (v === "resources") loadResources();
   if (v === "finetune") loadFinetune();
@@ -1187,6 +1187,112 @@ document.addEventListener("click", (e) => {
   if (!panel.hidden && !panel.contains(e.target) && !e.target.closest("#turbo-dock")) showTurboPanel(false);
 });
 loadTurbo();
+
+/* ---------------- 书库页 · CPU 后台扫描 ---------------- */
+let cpuOcrData = null;
+let cpuOcrTimer = null;
+const coTime = (s) => { const d = new Date(s * 1000); return `${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
+const coNum = (n) => (n == null ? "—" : Number(n).toLocaleString("zh-CN"));
+function coHours(h) {
+  if (h == null) return "—";
+  if (h < 1) return `${Math.max(1, Math.round(h * 60))} 分钟`;
+  if (h < 48) return `${h.toFixed(1)} 小时`;
+  return `${(h / 24).toFixed(1)} 天`;
+}
+function paintCpuOcr(o) {
+  if (!o) return;
+  cpuOcrData = o;
+  const running = !!o.running, scanning = running && o.status === "ocr";
+  const tag = $("#co-tag"), btn = $("#btn-co-toggle");
+  let tagTxt = "未开启（狂暴模式关闭）", tagCls = "tag";
+  if (o.turbo_on && !o.enabled) { tagTxt = "已暂停"; tagCls = "tag co-pause"; }
+  else if (scanning) { tagTxt = "扫描中"; tagCls = "tag co-run"; }
+  else if (running && !o.pending_books) { tagTxt = "全部扫描完成"; tagCls = "tag co-run"; }
+  else if (running) { tagTxt = "准备中"; tagCls = "tag co-run"; }
+  else if (o.turbo_on) { tagTxt = "启动中"; tagCls = "tag co-run"; }
+  tag.textContent = tagTxt; tag.className = tagCls;
+  btn.textContent = !o.turbo_on ? "开启狂暴模式" : o.enabled ? "暂停扫描" : "继续扫描";
+  btn.className = "btn sm" + (!o.turbo_on || !o.enabled ? " primary" : "");
+  $("#cpu-ocr-card").classList.toggle("on", scanning);
+
+  $("#co-pending").textContent = `${coNum(o.pending_books)} 本`;
+  $("#co-pending-pages").textContent = `约 ${coNum(o.pending_pages)} 页`;
+  if (running) {
+    const ok = (o.books_done || 0) - (o.image_only || 0);
+    $("#co-run-books").textContent = `${coNum(ok)} 本`;
+    $("#co-run-pages").textContent = `${coNum(o.pages_done)} 页` + (o.image_only ? ` · 纯图册 ${o.image_only} 本` : "")
+      + (o.started_at ? ` · ${coTime(o.started_at)} 起` : "");
+  } else {
+    const lr = o.last_run;
+    $("#co-run-books").textContent = lr ? `${coNum(lr.books)} 本` : "—";
+    $("#co-run-pages").textContent = lr ? `上次：${coNum(lr.pages)} 页 · ${coTime(lr.started_at)} 起` : "还没运行过";
+  }
+  $("#co-rate").textContent = o.rate_ppm ? `${o.rate_ppm}` : "—";
+  $("#co-workers").textContent = (o.pages_per_min ? "本次实测" : "历史平均")
+    + ` · ${o.workers} 引擎 × ${o.threads_per_engine} 线程`;
+  $("#co-eta").textContent = o.pending_books ? coHours(o.eta_hours) : "已完成";
+
+  const ov = o.overall || { done: 0, total: 0 };
+  const pct = ov.total ? (ov.done / ov.total) * 100 : 0;
+  $("#co-overall-txt").textContent = `${coNum(ov.done)} / ${coNum(ov.total)} 本 · ${pct.toFixed(1)}%`;
+  $("#co-overall-bar").style.width = `${pct}%`;
+
+  if (scanning && o.total) {
+    $("#co-current-title").textContent = `正在识别《${o.book_title}》`;
+    $("#co-current-txt").textContent = `${o.done} / ${o.total} 页`;
+    $("#co-current-bar").style.width = `${(o.done / o.total) * 100}%`;
+  } else {
+    $("#co-current-title").textContent = !o.turbo_on ? "狂暴模式关闭中，CPU 扫描未运行"
+      : !o.enabled ? "扫描已暂停" : (o.msg || "等待开始");
+    $("#co-current-txt").textContent = "";
+    $("#co-current-bar").style.width = "0%";
+  }
+
+  const item = (l, r, cls = "") => `<div class="co-item ${cls}"><span title="${esc(l)}">${esc(l)}</span><span>${esc(r)}</span></div>`;
+  $("#co-queue").innerHTML = (o.queue || []).map((b) => item(b.title, b.pages ? `${b.pages} 页` : "页数未知")).join("")
+    || `<div class="co-empty">没有待扫描的书了</div>`;
+  $("#co-recent").innerHTML = (o.recent || []).map((r) => item(r.title,
+      r.result === "ok" ? `${coTime(r.ts)} · ${coNum(r.chars)} 字` : `${coTime(r.ts)} · 纯图册跳过`,
+      r.result === "ok" ? "" : "skip")).join("")
+    || `<div class="co-empty">还没有完成记录</div>`;
+  $("#co-runs").innerHTML = (o.runs || []).map((r) => {
+    const live = !r.ended_at && running && r.started_at === o.started_at;
+    // 没有 ended_at 又不是当前这次：程序被直接关掉了，用最后一次写盘时间当结束时间
+    const end = r.ended_at || (live ? Date.now() / 1000 : r.updated_at || 0);
+    const dur = end ? `${((end - r.started_at) / 3600).toFixed(1)} 小时` : "—";
+    const span = live ? " 起（进行中）" : end ? " – " + coTime(end) + (r.ended_at ? "" : "（程序关闭）") : "";
+    return item(`${coTime(r.started_at)}${span}`, `${dur} · ${coNum(r.books)} 本 · ${coNum(r.pages)} 页`);
+  }).join("") || `<div class="co-empty">还没有运行记录</div>`;
+}
+async function loadCpuOcr() {
+  try { paintCpuOcr(await api("/api/cpu-ocr")); } catch (_) {}
+}
+function watchCpuOcr(on) {
+  if (on && !cpuOcrTimer) {
+    cpuOcrTimer = setInterval(() => { if (state.view === "library") loadCpuOcr(); else watchCpuOcr(false); }, 3000);
+  }
+  if (!on && cpuOcrTimer) { clearInterval(cpuOcrTimer); cpuOcrTimer = null; }
+}
+$("#btn-co-toggle").addEventListener("click", async () => {
+  const o = cpuOcrData;
+  try {
+    if (!o || !o.turbo_on) {
+      await toggleTurbo();
+    } else {
+      const r = await api("/api/cpu-ocr", { method: "POST", body: { enabled: !o.enabled } });
+      paintCpuOcr(r);
+      toast(r.enabled ? "CPU 扫描已继续" : "CPU 扫描已暂停（做完手上这页就停，进度已保存）", r.enabled ? "ok" : "");
+    }
+    loadCpuOcr(); loadTurbo();
+  } catch (e) { toast(e.message, "err"); }
+});
+function gotoCpuOcr() {
+  showTurboPanel(false);
+  switchView("library");
+  setTimeout(() => $("#cpu-ocr-card").scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+}
+$("#turbo-sub").addEventListener("click", gotoCpuOcr);
+$("#btn-turbo-goto-ocr").addEventListener("click", gotoCpuOcr);
 
 /* ---------------- 学习方向自动更换（轮换） ---------------- */
 let rotationBusy = false;

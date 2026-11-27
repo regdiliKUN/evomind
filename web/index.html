@@ -43,7 +43,7 @@
           <span class="turbo-switch" aria-hidden="true"><i></i></span>
         </button>
         <div class="turbo-meta">
-          <span id="turbo-sub">全局 · 已关闭</span>
+          <span id="turbo-sub" class="turbo-sub-link" title="点击查看 CPU 后台扫描详情">全局 · 已关闭</span>
           <button class="turbo-help" id="btn-turbo-help" title="狂暴模式是怎么回事？">原理 ›</button>
         </div>
       </div>
@@ -67,6 +67,7 @@
     <p class="tp-p">GPU 忙着跑大模型时，CPU 原本基本闲着。狂暴模式会让 CPU 在后台<b>识别书库里的扫描版 PDF</b>（没有文字层、导入时被跳过的那些），识别完自动转为「可导入」，给学习补充不依赖搜索引擎的资料。它只用 CPU、不碰显卡，也不占用学习任务。</p>
     <div class="tp-sec">CPU 后台识别</div>
     <p class="tp-p" id="turbo-ocr-status">未运行</p>
+    <button class="btn sm" id="btn-turbo-goto-ocr" style="margin-top:6px">查看扫描详情（书库页）›</button>
     <table class="tp-table"><thead><tr><th></th><th>普通</th><th>狂暴</th></tr></thead><tbody id="turbo-table"></tbody></table>
     <div class="tp-sec">要注意</div>
     <ul class="tp-list">
@@ -610,6 +611,36 @@
 
       <!-- ---------- 书库 ---------- -->
       <section class="view" id="view-library">
+        <div class="card cpu-card" id="cpu-ocr-card" style="margin-bottom:16px">
+          <div class="card-title">
+            ⚡ CPU 后台扫描<span class="tag" id="co-tag">未开启</span>
+            <button class="btn sm" id="btn-co-toggle" style="margin-left:auto">开启狂暴模式</button>
+          </div>
+          <div class="co-desc" id="co-desc">
+            狂暴模式开着时，CPU 会在后台把书库里的扫描版 PDF（没有文字层、导入时被跳过的那些）识别成文字，
+            识别完自动转为「可导入」。它只用 CPU、不碰显卡，和学习任务同时进行；关掉狂暴模式或点「暂停扫描」，做完手上那一页就停，下次接着做。
+          </div>
+          <div class="grid g4 co-stats">
+            <div class="stat"><div class="k">待扫描</div><div class="v" id="co-pending">—</div><div class="s" id="co-pending-pages">—</div></div>
+            <div class="stat"><div class="k">本次已完成</div><div class="v" id="co-run-books">—</div><div class="s" id="co-run-pages">—</div></div>
+            <div class="stat"><div class="k">速度（页/分钟）</div><div class="v" id="co-rate">—</div><div class="s" id="co-workers">—</div></div>
+            <div class="stat"><div class="k">预计剩余</div><div class="v" id="co-eta">—</div><div class="s">按当前速度估算</div></div>
+          </div>
+          <div class="co-block">
+            <div class="co-line"><span>总进度（已扫描 / 需要扫描的书）</span><span id="co-overall-txt">—</span></div>
+            <div class="bar"><i id="co-overall-bar" style="width:0%"></i></div>
+          </div>
+          <div class="co-block" id="co-current-wrap">
+            <div class="co-line"><span id="co-current-title">当前没有在识别的书</span><span id="co-current-txt"></span></div>
+            <div class="bar"><i id="co-current-bar" style="width:0%"></i></div>
+          </div>
+          <div class="grid g3 co-lists">
+            <div><div class="co-sub">接下来要扫描</div><div class="co-list" id="co-queue"></div></div>
+            <div><div class="co-sub">最近完成</div><div class="co-list" id="co-recent"></div></div>
+            <div><div class="co-sub">运行记录</div><div class="co-list" id="co-runs"></div></div>
+          </div>
+        </div>
+
         <div class="grid g4" style="margin-bottom:16px">
           <div class="stat">
             <div class="k">书库目录</div>
