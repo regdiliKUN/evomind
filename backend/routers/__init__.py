@@ -26,6 +26,7 @@ from . import (
     library,
     ocr,
     review,
+    digest,
 )
 
 ROUTERS = (
@@ -43,6 +44,7 @@ ROUTERS = (
     library.router,
     ocr.router,
     review.router,
+    digest.router,
 )
 
 

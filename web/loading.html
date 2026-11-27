@@ -38,7 +38,9 @@
     try {
       const r = await fetch("/", { cache: "no-store" });
       if (r.ok && !r.headers.has("X-EvoMind-Splash")) {
-        location.replace("/");
+        // 必须带一个新查询参数：裸 "/" 会命中窗口缓存里的旧版首页（旧版服务端没给
+        // 首页发 Cache-Control），升级后重启依旧显示旧界面。保留原有 #hash 深链。
+        location.replace("/?_=" + Date.now() + location.hash);
         return;
       }
     } catch (e) { /* 交接中 */ }

@@ -288,7 +288,10 @@ def open_ui(url: str):
     from backend import appwindow, config
 
     if appwindow.wants_window():
-        proc = appwindow.open_window(url, config.DATA / "appwindow")
+        # 每次启动带一个新的查询参数：应用窗口的独立配置目录里可能缓存着旧版首页
+        # （旧版服务端没给 "/" 发 Cache-Control），换个缓存键就绕开它，升级后重启即见新界面。
+        sep = "&" if "?" in url else "?"
+        proc = appwindow.open_window(f"{url}{sep}_={int(time.time())}", config.DATA / "appwindow")
         if proc is not None:
             log("[OK] 已打开 EvoMind 窗口（关闭窗口即退出）")
             return proc
