@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from urllib.parse import quote, unquote, urlparse, parse_qs, urlencode, urlunparse, urljoin
 
+import httpx
 from bs4 import BeautifulSoup
 
 from . import config, httpc
@@ -549,6 +550,58 @@ def search_brave(query: str, limit: int = 10) -> list[Result]:
 
 
 # --------------------------------------------------------------------------
+# SearXNG（本机自建的聚合搜索，免费、无额度）
+# --------------------------------------------------------------------------
+_searx_clients: dict[str, httpx.Client] = {}
+_searx_lock = threading.Lock()
+
+
+def _searx_client(base: str) -> httpx.Client:
+    # 不走共享的 "search" 客户端：那个对内网地址做了 SSRF 拦截，还会套用户配置的
+    # 代理——本机 127.0.0.1 的 SearXNG 两样都不该有。按地址缓存，改地址自动换新。
+    with _searx_lock:
+        c = _searx_clients.get(base)
+        if c is None or c.is_closed:
+            c = httpx.Client(base_url=base, timeout=httpx.Timeout(25.0, connect=5.0),
+                             trust_env=False, headers={"Accept": "application/json"})
+            _searx_clients[base] = c
+        return c
+
+
+def search_searxng(query: str, limit: int = 10) -> list[Result]:
+    base = (config.get("searxng_url") or "").strip().rstrip("/")
+    if not base:
+        return []
+    # 中文查询指定中文结果；否则 SearXNG 按浏览器语言猜，常混进大量日文页面
+    lang = "zh-CN" if re.search(r"[一-龥]", query) else "en"
+    out: list[Result] = []
+    try:
+        r = _searx_client(base).get(
+            "/search", params={"q": query, "format": "json", "language": lang, "safesearch": 0})
+        if r.status_code != 200:
+            return out
+        seen: set[str] = set()
+        # 它本身就是多引擎聚合，给它两倍配额
+        for it in (r.json().get("results") or []):
+            url = it.get("url") or ""
+            if not url.startswith(("http://", "https://")) or url in seen:
+                continue
+            seen.add(url)
+            out.append({
+                "title": it.get("title", ""),
+                "url": url,
+                "snippet": (it.get("content") or "")[:400],
+                "source": "searxng",
+                "kind": "web",
+            })
+            if len(out) >= limit * 2:
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+# --------------------------------------------------------------------------
 # 聚合
 # --------------------------------------------------------------------------
 DOC_ROOTS = {
@@ -892,6 +945,7 @@ def search_media(
 SOURCES = {
     "docs": search_documentation,
     "brave": search_brave,
+    "searxng": search_searxng,
     "se": search_stackexchange,
     "zbc": search_zbrushcentral,
     "arxiv": search_arxiv,
@@ -902,7 +956,7 @@ SOURCES = {
 }
 
 # 通用与专用源并行；文档目录直连不依赖搜索引擎的可用性。
-DEFAULT_SOURCES = ["docs", "brave", "bing", "web", "se", "zbc", "arxiv", "github", "wiki"]
+DEFAULT_SOURCES = ["docs", "searxng", "brave", "bing", "web", "se", "zbc", "arxiv", "github", "wiki"]
 
 
 def search(

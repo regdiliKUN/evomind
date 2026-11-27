@@ -195,6 +195,7 @@ const TITLES = {
   dashboard: "总览",
   learn: "自主进化",
   knowledge: "知识库",
+  digest: "知识总结",
   analytics: "分析",
   library: "书库",
   media: "多模态",
@@ -226,6 +227,7 @@ function switchView(v, fromHash) {
     loadKnowledge(); loadRefinements(); loadCleanupState();
   }
   if (v === "analytics") loadAnalytics();
+  if (v === "digest") loadDigestView();
   if (v === "library") loadLibrary();
   if (v === "media") loadMediaCaps();
   if (v === "resources") loadResources();
@@ -614,7 +616,7 @@ function localNextSteps(st) {
     items.push({ level, icon, title, detail: desc, view, btn });
 
   if (s.scale_warn) {
-    add("warn", "!", "知识库规模提醒", s.scale_warn, "knowledge", "去整理");
+    add("warn", "!", "知识库规模提醒", s.scale_warn, "settings", "去设置");
   }
 
   if (s.points === 0) {
@@ -1115,6 +1117,76 @@ $("#btn-auto").addEventListener("click", async () => {
     toast(e.message, "err");
   }
 });
+
+/* ---------------- 狂暴模式（左下角全局开关） ---------------- */
+let turboOn = false;
+function paintTurbo(t) {
+  if (!t) return;
+  turboOn = !!t.enabled;
+  $("#turbo-dock").classList.toggle("on", turboOn);
+  $("#btn-turbo").setAttribute("aria-pressed", String(turboOn));
+  $("#turbo-sub").textContent = turboOn
+    ? (t.keep_awake ? "全局 · 运行中 · 已防睡眠" : "全局 · 运行中")
+    : "全局 · 已关闭";
+  const pt = $("#btn-turbo-panel-toggle");
+  pt.textContent = turboOn ? "关闭狂暴模式，恢复普通" : "开启狂暴模式";
+  pt.className = "btn turbo-panel-toggle" + (turboOn ? "" : " danger");
+  const o = t.cpu_ocr || {};
+  const os = $("#turbo-ocr-status");
+  const fmtT = (s) => { const d = new Date(s * 1000); return `${d.getMonth() + 1}-${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
+  const lr = o.last_run, tot = o.totals || {};
+  const lastTxt = lr && lr.started_at && lr.ended_at
+    ? `上次运行 ${fmtT(lr.started_at)} – ${fmtT(lr.ended_at)}（${((lr.ended_at - lr.started_at) / 3600).toFixed(1)} 小时）：识别完成 ${lr.books} 本、${lr.pages} 页`
+      + (lr.image_only ? `，另有 ${lr.image_only} 本纯图册跳过` : "") + "。"
+    : "";
+  const totTxt = tot.runs ? ` 历史累计 ${tot.books} 本、${tot.pages} 页。` : "";
+  if (!o.running) {
+    os.textContent = (lastTxt + totTxt).trim()
+      || (turboOn ? "未运行（可能在设置里关闭了 CPU 后台识别）" : "狂暴模式开启后自动开始");
+  } else {
+    const head = o.status === "ocr" && o.book_title
+      ? `正在识别《${o.book_title}》 ${o.done}/${o.total} 页`
+      : (o.msg || "准备中");
+    const left = o.pending_books != null ? ` · 还剩 ${o.pending_books} 本待识别` : "";
+    os.textContent = `${head} · 本次已完成 ${o.books_done} 本、${o.pages_done} 页`
+      + (o.pages_per_min ? ` · 约 ${o.pages_per_min} 页/分钟` : "") + left + totTxt;
+  }
+  if (turboOn && o.running && o.status === "ocr") {
+    $("#turbo-sub").textContent = `全局 · 运行中 · CPU 识别 ${o.done}/${o.total} 页`;
+    $("#btn-turbo").title = `CPU 正在后台识别《${o.book_title}》`;
+  } else {
+    $("#btn-turbo").title = "狂暴模式：全局开关，对所有学习任务生效";
+  }
+  if (Array.isArray(t.table)) {
+    $("#turbo-table").innerHTML = t.table.map(r =>
+      `<tr><td>${esc(r.name)}</td><td>${esc(r.normal)}</td><td class="tp-hot">${esc(r.turbo)}</td></tr>`).join("");
+  }
+}
+async function loadTurbo() {
+  try { paintTurbo(await api("/api/turbo")); } catch (_) {}
+}
+async function toggleTurbo() {
+  try {
+    const t = await api("/api/turbo", { method: "POST", body: { enabled: !turboOn } });
+    paintTurbo(t);
+    toast(t.enabled ? "狂暴模式已开启（全局）：别忘了开「持续自学」或「方向轮换」才会一直学" : "已恢复普通模式",
+      t.enabled ? "ok" : "");
+  } catch (e) { toast(e.message, "err"); }
+}
+function showTurboPanel(show) {
+  $("#turbo-panel").hidden = !show;
+  if (show) loadTurbo();
+}
+$("#btn-turbo").addEventListener("click", toggleTurbo);
+$("#btn-turbo-panel-toggle").addEventListener("click", toggleTurbo);
+$("#btn-turbo-help").addEventListener("click", (e) => { e.stopPropagation(); showTurboPanel($("#turbo-panel").hidden); });
+$("#btn-turbo-close").addEventListener("click", () => showTurboPanel(false));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") showTurboPanel(false); });
+document.addEventListener("click", (e) => {
+  const panel = $("#turbo-panel");
+  if (!panel.hidden && !panel.contains(e.target) && !e.target.closest("#turbo-dock")) showTurboPanel(false);
+});
+loadTurbo();
 
 /* ---------------- 学习方向自动更换（轮换） ---------------- */
 let rotationBusy = false;
@@ -3195,6 +3267,8 @@ async function fillSettings() {
     $("#cfg-hf").value = cfg.hf_endpoint || "";
     $("#cfg-proxy").value = cfg.proxy || "";
     $("#cfg-search-key").value = cfg.search_api_key || "";
+    $("#cfg-searxng").value = cfg.searxng_url || "";
+    $("#cfg-ann").value = cfg.vector_ann_enabled ? "1" : "0";
     $("#cfg-ft-base").value = cfg.finetune_base || "";
     // 多模态（老配置文件没有这些键时用默认值兜底，避免显示成空）
     $("#cfg-media").value = cfg.media_enabled === false ? "0" : "1";
@@ -3224,6 +3298,8 @@ $("#btn-save-cfg").addEventListener("click", async () => {
         hf_endpoint: $("#cfg-hf").value.trim(),
         proxy: $("#cfg-proxy").value.trim(),
         search_api_key: $("#cfg-search-key").value.trim(),
+        searxng_url: $("#cfg-searxng").value.trim(),
+        vector_ann_enabled: $("#cfg-ann").value === "1",
         finetune_base: $("#cfg-ft-base").value.trim(),
       },
     });
@@ -4835,6 +4911,7 @@ async function refreshAll() {
     state.status = st;
     paintTopbar(st);
     if (st.auto) { autoOn = st.auto.enabled; paintAuto(st.auto); fillAutoSettings(st.auto); }
+    if (st.turbo) paintTurbo(st.turbo);
     if (st.config) fillRotationSettings(st.config);
     // 面板只在「自主进化」页可见：其他页面每 6 秒重建几十行子方向 DOM 是白费，
     // 切回该页时 loadRotation() 会补一次。
@@ -4858,6 +4935,277 @@ async function refreshAll() {
   } catch (_) {}
   finally { refreshBusy = false; }
 }
+
+/* ---------------- 知识总结 ----------------
+   输入一个概念关键词 → 后端扩展同义词、召回、逐批核对相关性、汇总成文（SSE 推进度）。
+   总结正文是模型写的 Markdown：先整体 esc() 再做有限的块/行内转换，
+   绝不把模型输出当 HTML 直接塞进页面。 */
+const digestState = { busy: false, current: null, ctrl: null };
+
+function digestInline(s) {
+  return s
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
+    .replace(/\[(\d{1,3})\]/g, (_, n) => `<button class="dg-cite" data-cite="${n}" title="查看第 ${n} 条依据">${n}</button>`);
+}
+
+function renderDigestMd(md) {
+  const lines = esc(md || "").split(/\r?\n/);
+  const out = [];
+  let list = null;
+  const close = () => { if (list) { out.push(`</${list}>`); list = null; } };
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    let m;
+    if (!line.trim()) { close(); continue; }
+    if ((m = line.match(/^(#{1,4})\s+(.*)$/))) {
+      close();
+      const lv = Math.min(4, Math.max(2, m[1].length));
+      out.push(`<h${lv}>${digestInline(m[2])}</h${lv}>`);
+    } else if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) {
+      if (list !== "ul") { close(); out.push("<ul>"); list = "ul"; }
+      out.push(`<li>${digestInline(m[1])}</li>`);
+    } else if ((m = line.match(/^\s*\d+[.)、]\s+(.*)$/))) {
+      if (list !== "ol") { close(); out.push("<ol>"); list = "ol"; }
+      out.push(`<li>${digestInline(m[1])}</li>`);
+    } else if ((m = line.match(/^&gt;\s?(.*)$/))) {
+      close();
+      out.push(`<blockquote>${digestInline(m[1])}</blockquote>`);
+    } else if (/^-{3,}$/.test(line.trim())) {
+      close();
+      out.push("<hr />");
+    } else {
+      close();
+      out.push(`<p>${digestInline(line)}</p>`);
+    }
+  }
+  close();
+  return out.join("");
+}
+
+const DG_STATUS = { verified: "已证实", legacy: "历史未复核", unverified: "未复核" };
+
+function showDigest(d) {
+  digestState.current = d;
+  const st = d.stats || {};
+  $("#dg-title").textContent = `「${d.keyword}」知识总结`;
+  const when = new Date((d.created_at || 0) * 1000).toLocaleString();
+  $("#dg-meta").innerHTML =
+    `${esc(when)} · ${d.include_legacy ? "已证实 + 历史未复核" : "仅已证实知识"}` +
+    (d.topic ? ` · 方向：${esc(d.topic)}` : "") +
+    ` · 核对 ${esc(st.candidates ?? "-")} 条候选，确认相关 <b>${esc(st.relevant ?? (d.points || []).length)}</b> 条` +
+    (st.seconds ? ` · 用时 ${esc(st.seconds)} 秒` : "") +
+    (st.failed_batches ? ` · <span style="color:var(--amber)">${esc(st.failed_batches)} 批核对失败（只保留了字面命中）</span>` : "") +
+    `<br/>检索词：${esc((d.terms || []).join("、"))}`;
+  $("#dg-summary").innerHTML = renderDigestMd(d.summary);
+  const pts = d.points || [];
+  $("#dg-refs-wrap").hidden = !pts.length;
+  $("#dg-refs-title").textContent = `引用的知识条目（${pts.length} 条，点开看详情）`;
+  $("#dg-refs").innerHTML = pts.map((p) =>
+    `<div class="dg-ref" id="dg-ref-${p.n}" data-pid="${esc(p.id)}">` +
+    `<span class="n">[${p.n}]</span>${esc(p.claim)}` +
+    `<div class="meta">${esc(DG_STATUS[p.status] || p.status)} · ${esc(p.topic || "")}` +
+    (p.literal ? " · 字面命中" : ` · 语义命中（${esc(p.via || "")}）`) +
+    (p.source_title ? ` · ${esc(p.source_title)}` : "") + `</div></div>`).join("");
+  $("#btn-dg-copy").disabled = $("#btn-dg-export").disabled = false;
+  $$("#dg-history .dg-hist").forEach((n) => n.classList.toggle("active", n.dataset.id === d.id));
+}
+
+async function loadDigestHistory() {
+  try {
+    const r = await api("/api/digests?limit=50");
+    const box = $("#dg-history");
+    if (!r.items.length) { box.innerHTML = '<div class="hint">暂无。总结完成后会自动保存在这里。</div>'; return; }
+    box.innerHTML = r.items.map((d) =>
+      `<div class="dg-hist${digestState.current?.id === d.id ? " active" : ""}" data-id="${esc(d.id)}">` +
+      `<div class="kw">${esc(d.keyword)}</div>` +
+      `<div class="meta">${esc(new Date(d.created_at * 1000).toLocaleString())} · ${esc(d.count)} 条` +
+      `${d.include_legacy ? " · 含历史" : ""}</div>` +
+      `<button class="btn sm ghost del" data-del="${esc(d.id)}" title="删除这份总结">✕</button></div>`).join("");
+  } catch (e) {
+    $("#dg-history").innerHTML = `<div class="hint">历史加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function loadDigestView() {
+  loadDigestHistory();
+  try {
+    const r = await api("/api/knowledge?limit=1");
+    const sel = $("#dg-topic");
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">全部方向</option>' +
+      r.topics.map((t) => `<option value="${esc(t.topic)}">${esc(t.topic)}</option>`).join("");
+    sel.value = cur;
+  } catch (_) {}
+}
+
+async function startDigest() {
+  if (digestState.busy) {
+    digestState.ctrl?.abort();
+    return;
+  }
+  const keyword = $("#dg-keyword").value.trim();
+  if (!keyword) return toast("先输入一个关键词", "err");
+  digestState.busy = true;
+  const btn = $("#btn-digest");
+  btn.textContent = "停止";
+  $("#dg-progress").hidden = false;
+  const bar = $("#dg-bar");
+  bar.className = "";
+  bar.style.width = "2%";
+  $("#dg-stage").textContent = "开始…";
+  const log = $("#dg-log");
+  log.innerHTML = "";
+  const addLog = (msg) => {
+    const li = document.createElement("li");
+    li.textContent = msg;
+    log.appendChild(li);
+    log.scrollTop = log.scrollHeight;
+  };
+  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+  digestState.ctrl = ctrl;
+  let lastMsg = "";
+  let finished = false;
+  // 收尾统一处理：进度条一律收满并按结局着色，原因写进结果区，不再停在半截像卡死
+  const endWith = (kind, msg) => {
+    finished = true;
+    bar.style.width = "100%";
+    bar.className = kind === "ok" ? "" : `dg-bar-${kind}`;
+    if (kind === "ok") return;
+    digestState.current = null;
+    $("#dg-title").textContent = "总结结果";
+    $("#dg-meta").innerHTML = "";
+    $("#dg-refs-wrap").hidden = true;
+    $("#btn-dg-copy").disabled = $("#btn-dg-export").disabled = true;
+    $("#dg-summary").innerHTML =
+      `<div class="empty"><div class="big">${kind === "empty" ? "∅" : "!"}</div>${esc(msg)}</div>`;
+  };
+  try {
+    const r = await fetch("/api/digest/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        keyword,
+        topic: $("#dg-topic").value || null,
+        include_legacy: $("#dg-legacy").checked,
+        max_points: Number($("#dg-max").value) || 120,
+      }),
+      ...(ctrl ? { signal: ctrl.signal } : {}),
+    });
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try {
+        const det = (await r.json()).detail;
+        msg = typeof det === "string" ? det : (det || []).map((x) => x.msg).join("；") || msg;
+      } catch (_) {}
+      throw new Error(msg);
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        const line = chunk.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(5)); } catch (_) { continue; }
+        if (evt.stage === "tick") {
+          $("#dg-stage").textContent = `${lastMsg}（已用时 ${Math.round(evt.elapsed)} 秒）`;
+          continue;
+        }
+        if (typeof evt.progress === "number") $("#dg-bar").style.width = Math.round(evt.progress * 100) + "%";
+        if (evt.msg) { lastMsg = evt.msg; $("#dg-stage").textContent = evt.msg; addLog(evt.msg); }
+        if (evt.stage === "error") { toast(evt.msg, "err"); endWith("err", evt.msg); }
+        if (evt.stage === "empty") { toast("没有找到可总结的相关知识", "warn"); endWith("empty", evt.msg); }
+        if (evt.stage === "done" && evt.digest) {
+          endWith("ok");
+          showDigest(evt.digest);
+          loadDigestHistory();
+          toast(`「${keyword}」总结完成`, "ok");
+        }
+      }
+    }
+    if (!finished) {
+      toast("连接中断，总结未完成", "err");
+      addLog("连接中断");
+      endWith("err", "与后台的连接中断，总结未完成。可以重新点「开始总结」。");
+    }
+  } catch (e) {
+    if (e.name === "AbortError") {
+      addLog("已停止"); $("#dg-stage").textContent = "已停止";
+      endWith("stop", "已手动停止。");
+    } else {
+      toast("总结失败：" + e.message, "err"); addLog("失败：" + e.message);
+      endWith("err", "总结失败：" + e.message);
+    }
+  } finally {
+    digestState.busy = false;
+    digestState.ctrl = null;
+    btn.textContent = "开始总结";
+  }
+}
+
+$("#btn-digest").addEventListener("click", startDigest);
+// 分析页「检索解释」只给前 8 条命中；要完整报告时带着同一个关键词跳到知识总结页直接开跑
+$("#btn-an-digest")?.addEventListener("click", () => {
+  const q = $("#an-q").value.trim();
+  if (!q) return toast("先输入一个关键词", "err");
+  switchView("digest");
+  $("#dg-keyword").value = q;
+  if (!digestState.busy) startDigest();
+});
+$("#dg-keyword").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.isComposing && !digestState.busy) startDigest();
+});
+$("#btn-dg-copy").addEventListener("click", async () => {
+  const d = digestState.current;
+  if (!d) return;
+  try {
+    await navigator.clipboard.writeText(d.summary || "");
+    toast("已复制总结正文", "ok");
+  } catch (_) { toast("复制失败：浏览器不允许访问剪贴板", "err"); }
+});
+$("#btn-dg-export").addEventListener("click", () => {
+  const d = digestState.current;
+  if (d) location.href = `/api/digests/${encodeURIComponent(d.id)}/markdown`;
+});
+document.addEventListener("click", async (e) => {
+  const cite = e.target.closest?.(".dg-cite");
+  if (cite) {
+    const ref = $("#dg-ref-" + cite.dataset.cite);
+    if (!ref) return;
+    $("#dg-refs-wrap").open = true;
+    ref.scrollIntoView({ behavior: "smooth", block: "center" });
+    ref.classList.add("flash");
+    setTimeout(() => ref.classList.toggle("flash", false), 1600);
+    return;
+  }
+  const ref = e.target.closest?.(".dg-ref");
+  if (ref) return openPoint(ref.dataset.pid);
+  const del = e.target.closest?.("[data-del]");
+  if (del && del.closest("#dg-history")) {
+    e.stopPropagation();
+    if (!confirm("删除这份总结？（只删总结本身，不影响知识库）")) return;
+    try {
+      await api(`/api/digests/${encodeURIComponent(del.dataset.del)}`, { method: "DELETE" });
+      if (digestState.current?.id === del.dataset.del) digestState.current = null;
+      loadDigestHistory();
+    } catch (err) { toast("删除失败：" + err.message, "err"); }
+    return;
+  }
+  const hist = e.target.closest?.(".dg-hist");
+  if (hist) {
+    try { showDigest(await api(`/api/digests/${encodeURIComponent(hist.dataset.id)}`)); }
+    catch (err) { toast("加载失败：" + err.message, "err"); }
+  }
+});
 
 connectSSE();
 switchView(location.hash.slice(1) || "dashboard", true);

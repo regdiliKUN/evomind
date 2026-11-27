@@ -2,7 +2,7 @@
 from __future__ import annotations
 import threading
 import time
-from . import config, evolve, memory, tasks
+from . import config, evolve, memory, tasks, turbo
 
 _lock = threading.RLock()
 _state = {"enabled": False, "last_run": 0., "next_run": 0., "runs": 0,
@@ -24,7 +24,7 @@ def _loop(stop: threading.Event | None = None) -> None:
 
 
 def interval() -> int:
-    return max(1, min(30, int(config.get("idle_seconds", 15))))
+    return turbo.idle_seconds(max(1, min(30, int(config.get("idle_seconds", 15)))))
 
 
 def _tick() -> None:

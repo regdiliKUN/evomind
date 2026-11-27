@@ -10,7 +10,7 @@ from typing import Any, Iterable, Iterator
 
 import httpx
 
-from . import config, httpc
+from . import config, httpc, turbo
 
 
 class LLMError(RuntimeError):
@@ -244,6 +244,8 @@ def chat(
         payload["think"] = False
     if json_mode:
         payload["format"] = "json"
+    if turbo.keep_alive() is not None:
+        payload["keep_alive"] = turbo.keep_alive()  # 狂暴模式：模型常驻显存
     if tools:
         payload["tools"] = tools
     try:
@@ -376,7 +378,10 @@ def _embed_remote(payload: list[str], model: str, batch: int) -> list[list[float
     for i in range(0, len(payload), max(1, batch)):
         chunk = payload[i : i + max(1, batch)]
         try:
-            r = c.post("/api/embed", json={"model": model, "input": chunk}, timeout=300)
+            body = {"model": model, "input": chunk}
+            if turbo.keep_alive() is not None:
+                body["keep_alive"] = turbo.keep_alive()
+            r = c.post("/api/embed", json=body, timeout=300)
             r.raise_for_status()
             out.extend(r.json().get("embeddings") or [])
         except httpx.HTTPError as e:

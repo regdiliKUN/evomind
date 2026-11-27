@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import config, evidence, fetcher, httpc, llm, memory
+from . import config, evidence, fetcher, httpc, llm, memory, turbo
 
 Event = Callable[[str, str, dict], None]
 
@@ -1028,7 +1028,7 @@ def _extract_into_library(c, book_id: str, book: dict, p: Path, topic: str,
     # 收集所有候选，最后一次性批量入库（见 add_points_batch）：只做一次全库相似度
     # 去重 + 一次事务提交，替代原来「每条一次矩阵乘 + 一次 commit」。
     all_cands: list[dict] = []
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=turbo.workers("library", 2)) as ex:
         for data, b in ex.map(_extract, blocks):
             done_blocks += 1
             if data is None:
@@ -1389,7 +1389,7 @@ def import_url(url: str, topic: str = "", on_event: Event | None = None) -> dict
     # 收集所有候选，最后一次性批量入库（只做一次全库相似度 + 一次事务），
     # 替代原来逐条 add_point（每条一次矩阵乘 + 一次 commit）。
     all_cands: list[dict] = []
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=turbo.workers("library", 2)) as ex:
         for data, b in ex.map(_extract, blocks):
             if data is None:
                 continue

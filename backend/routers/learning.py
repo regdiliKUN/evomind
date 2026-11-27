@@ -1,11 +1,11 @@
 """学习控制：启动/停止学习、随机方向、方向轮换、知识炼化、持续自学、会话列表。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, StrictBool, StrictInt
 
-from .. import config, curriculum, directions, evolve, memory, scheduler, refinement
+from .. import config, curriculum, directions, evolve, memory, scheduler, refinement, turbo
 
 router = APIRouter()
 
@@ -200,6 +200,22 @@ def api_auto_set(body: AutoRequest) -> dict:
         return scheduler.enable(direction)
     config.update({"continuous_learning": False})
     return scheduler.disable()
+
+
+# --------------------------------------------------------------------------
+# 狂暴模式（挂机时吃满资源）
+# --------------------------------------------------------------------------
+@router.get("/api/turbo")
+def api_turbo_get() -> dict:
+    return turbo.state()
+
+
+@router.post("/api/turbo")
+def api_turbo_set(body: dict = Body(...)) -> dict:
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(422, "enabled 必须是 true / false")
+    return turbo.set_enabled(enabled)
 
 
 @router.get("/api/sessions")

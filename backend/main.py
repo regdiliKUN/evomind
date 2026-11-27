@@ -57,6 +57,11 @@ async def _local_guard(request: Request, call_next):
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     if request.url.path.startswith("/api/"):
         response.headers.setdefault("Cache-Control", "no-store")
+    elif request.url.path == "/" or request.url.path.startswith("/static/"):
+        # 首页与前端资源必须每次向本机服务确认（no-cache = 可存但每次用 ETag 复核）。
+        # 之前只给 /api/ 设了缓存头：Edge 应用窗口按启发式新鲜度直接复用旧 index.html，
+        # 旧页面又引用旧 ?v= 的 app.js —— 升级后重启多少次都看不到新功能。
+        response.headers.setdefault("Cache-Control", "no-cache")
     # /docs、/redoc 用 CDN 脚本 + 内联脚本，单独放行，不套 CSP。
     if not request.url.path.startswith(("/docs", "/redoc")):
         response.headers.setdefault("Content-Security-Policy", _CSP)
@@ -138,6 +143,13 @@ from .routers.backups import (  # noqa: E402,F401
     api_backups,
 )
 from .routers.chat import api_chat, api_chat_stream  # noqa: E402,F401
+from .routers.digest import (  # noqa: E402,F401
+    api_digest_delete,
+    api_digest_get,
+    api_digest_markdown,
+    api_digest_stream,
+    api_digests,
+)
 from .routers.events import (  # noqa: E402,F401
     api_events,
     api_events_alerts,
@@ -187,6 +199,8 @@ from .routers.learning import (  # noqa: E402,F401
     RotationRequest,
     api_auto_get,
     api_auto_set,
+    api_turbo_get,
+    api_turbo_set,
     api_directions,
     api_learn_start,
     api_learn_stop,
@@ -300,6 +314,12 @@ def _startup() -> None:
         memory.close_stale_sessions()
     except Exception as e:  # noqa: BLE001
         _startup_warn("学习会话状态恢复", e)
+    try:
+        from . import turbo
+
+        turbo.apply()  # 上次关机前开着狂暴模式：重启后防睡眠 / 优先级要重新生效
+    except Exception as e:  # noqa: BLE001
+        _startup_warn("狂暴模式", e)
     try:
         scheduler.start_auto_if_needed()
     except Exception as e:  # noqa: BLE001

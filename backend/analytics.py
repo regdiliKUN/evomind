@@ -223,7 +223,7 @@ def suggestions(limit: int = 4) -> list[dict]:
     # 规模是性能问题，优先级最高（和前端旧规则保持一致）
     warn = memory.scale_warn(total)
     if warn:
-        add("warn", "!", "知识库规模提醒", warn, "knowledge", "去整理")
+        add("warn", "!", "知识库规模提醒", warn, "settings", "去设置")
 
     if total == 0:
         add(

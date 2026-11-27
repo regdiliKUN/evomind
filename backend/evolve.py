@@ -20,7 +20,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
-from . import config, downloader, fetcher, llm, memory, search, tasks
+from . import config, downloader, fetcher, llm, memory, search, tasks, turbo
 
 Listener = Callable[[dict], None]
 
@@ -921,7 +921,7 @@ class Engine:
         self._emit("stage", f"第 {r}/{total} 轮 · 诊断知识缺口", round=r)
         plan = self._plan(direction, r, total)
         queries = [q.strip()[:240] for q in (plan.get("queries") or []) if isinstance(q, str) and q.strip()][
-            : int(config.get("queries_per_round", 4))
+            : turbo.per_round("queries_per_round", 4)
         ]
         self._gaps = plan.get("gaps") or []
         self.state["focus"] = plan.get("focus", "")
@@ -1054,7 +1054,7 @@ class Engine:
                     round_no=r,
                     total_rounds=total,
                     stage_hint=stage_hint + "\n优先补充缺口：" + "；".join(str(g) for g in self._gaps[:6]),
-                    qnum=int(config.get("queries_per_round", 4)),
+                    qnum=turbo.per_round("queries_per_round", 4),
                     avoid_hint=_avoid_hint(),
                 ),
             )
@@ -1092,7 +1092,7 @@ class Engine:
 
         self._emit("info", "检索式：" + " ｜ ".join(queries))
 
-        with ThreadPoolExecutor(max_workers=min(4, len(queries))) as ex:
+        with ThreadPoolExecutor(max_workers=min(turbo.workers("search", 4), len(queries))) as ex:
             for res in ex.map(one, queries):
                 all_results.extend(res)
 
@@ -1116,7 +1116,7 @@ class Engine:
         if not config.get("media_enabled", True):
             return []
         kinds = [k for k in (config.get("media_kinds") or []) if k in ("image", "audio", "video")]
-        if not kinds or int(config.get("media_per_round", 2)) <= 0:
+        if not kinds or turbo.per_round("media_per_round", 2) <= 0:
             return []
         try:
             got = search.search_media(query, kinds=kinds, limit=6)
@@ -1138,8 +1138,8 @@ class Engine:
         没有这道预筛，检索到的产品页、安装教程、新闻会把抓取配额占满，
         提炼阶段全是无关内容，最后一条知识都入不了库。
         """
-        limit = int(config.get("fetch_per_round", 8))
-        media_limit = int(config.get("media_per_round", 2)) if config.get("media_enabled", True) else 0
+        limit = turbo.per_round("fetch_per_round", 8)
+        media_limit = turbo.per_round("media_per_round", 2) if config.get("media_enabled", True) else 0
         allowed_kinds = set(config.get("media_kinds") or [])
         topic = self.state.get("direction", "")
         # 一次查完「这些 URL 在本方向下是不是已经提炼过」，而不是每个候选打一次库。
@@ -1296,7 +1296,7 @@ class Engine:
                 )
             return doc
 
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        with ThreadPoolExecutor(max_workers=turbo.workers("fetch", 4)) as ex:
             return list(ex.map(one, targets))
 
     def _sections(self, docs: list[dict], direction: str, focus: str) -> list[tuple[int, dict]]:
@@ -1408,7 +1408,7 @@ class Engine:
         # 用 submit + as_completed 而不是 ex.map：map 在迭代时遇到任何一个
         # worker 抛异常就会中断整轮，已经提炼好的其他段落跟着丢。单个段落出问题
         # 只该损失它自己。
-        with ThreadPoolExecutor(max_workers=2) as ex:
+        with ThreadPoolExecutor(max_workers=turbo.workers("extract", 2)) as ex:
             futures = {ex.submit(one, item): item for item in sections}
             for fut in as_completed(futures):
                 _, section_doc = futures[fut]

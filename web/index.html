@@ -7,7 +7,7 @@
 <meta name="color-scheme" content="dark" />
 <title>EvoMind · 自进化学习引擎</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236c8cff'/><text x='16' y='23' font-size='18' font-family='sans-serif' font-weight='700' fill='%23fff' text-anchor='middle'>E</text></svg>" />
-<link rel="stylesheet" href="/static/style.css?v=22" />
+<link rel="stylesheet" href="/static/style.css?v=23" />
 </head>
 <body>
 <div class="app">
@@ -25,6 +25,7 @@
       <div class="nav-item active" data-view="dashboard" role="tab" tabindex="0" aria-current="page"><span class="ico">◈</span>总览</div>
       <div class="nav-item" data-view="learn" role="tab" tabindex="0"><span class="ico">◐</span>自主进化</div>
       <div class="nav-item" data-view="knowledge" role="tab" tabindex="0"><span class="ico">▤</span>知识库</div>
+      <div class="nav-item" data-view="digest" role="tab" tabindex="0"><span class="ico">✦</span>知识总结</div>
       <div class="nav-item" data-view="analytics" role="tab" tabindex="0"><span class="ico">❖</span>分析</div>
       <div class="nav-item" data-view="library" role="tab" tabindex="0"><span class="ico">▦</span>书库</div>
       <div class="nav-item" data-view="media" role="tab" tabindex="0"><span class="ico">◫</span>多模态</div>
@@ -35,11 +36,47 @@
     </nav>
 
     <div class="sidebar-foot">
+      <div class="turbo-dock" id="turbo-dock">
+        <button class="turbo-btn" id="btn-turbo" aria-pressed="false" title="狂暴模式：全局开关，对所有学习任务生效">
+          <span class="turbo-ico">⚡</span>
+          <b class="turbo-name">狂暴模式</b>
+          <span class="turbo-switch" aria-hidden="true"><i></i></span>
+        </button>
+        <div class="turbo-meta">
+          <span id="turbo-sub">全局 · 已关闭</span>
+          <button class="turbo-help" id="btn-turbo-help" title="狂暴模式是怎么回事？">原理 ›</button>
+        </div>
+      </div>
       <div class="pill"><span class="dot" id="dot-llm"></span><span id="txt-llm">检测中</span></div>
       <div class="pill"><span class="dot" id="dot-gpu"></span><span id="txt-gpu">—</span></div>
       <button class="pill pill-btn" id="btn-guide" title="重新查看新手上路引导">⦿ 新手上路</button>
     </div>
   </aside>
+
+  <!-- 狂暴模式说明面板（固定定位，切换页面不受影响） -->
+  <div class="turbo-panel" id="turbo-panel" hidden role="dialog" aria-labelledby="turbo-panel-title">
+    <div class="tp-head">
+      <span id="turbo-panel-title">⚡ 狂暴模式 · 全局开关</span>
+      <button class="tp-close" id="btn-turbo-close" title="关闭">×</button>
+    </div>
+    <p class="tp-lead">晚上挂机、电脑只跑 EvoMind 时用：让它把 CPU、显卡和网络尽量用满。</p>
+    <div class="tp-sec">对哪些功能生效</div>
+    <p class="tp-p"><b>全部后台学习任务</b>，不分页面：手动「开始进化学习」、持续自学、方向轮换（自动更换方向）、书库导入提炼。开着它时，这些任务不管从哪里启动，都按狂暴参数跑。</p>
+    <div class="tp-sec">原理</div>
+    <p class="tp-p">学习一轮 = <b>搜索 → 抓网页 → 大模型提炼 → 入库</b>。普通模式为了不卡你的电脑，每一步只同时处理几份，两段学习之间还会歇一会儿。狂暴模式把每一步同时处理的数量放大、取消歇息、让模型一直留在显存里，并阻止电脑睡眠。</p>
+    <p class="tp-p">GPU 忙着跑大模型时，CPU 原本基本闲着。狂暴模式会让 CPU 在后台<b>识别书库里的扫描版 PDF</b>（没有文字层、导入时被跳过的那些），识别完自动转为「可导入」，给学习补充不依赖搜索引擎的资料。它只用 CPU、不碰显卡，也不占用学习任务。</p>
+    <div class="tp-sec">CPU 后台识别</div>
+    <p class="tp-p" id="turbo-ocr-status">未运行</p>
+    <table class="tp-table"><thead><tr><th></th><th>普通</th><th>狂暴</th></tr></thead><tbody id="turbo-table"></tbody></table>
+    <div class="tp-sec">要注意</div>
+    <ul class="tp-list">
+      <li>它<b>只负责提速，本身不会开始学习</b>。要挂一整夜，请同时开「持续自学」或「方向轮换」。</li>
+      <li>大模型提炼那一步受显卡限制，提速有限；省下的主要是网络等待和空歇时间。</li>
+      <li>搜索太快可能被搜索引擎限流，程序会自动暂停几分钟再继续。</li>
+      <li>白天要用电脑干别的，记得关掉。</li>
+    </ul>
+    <button class="btn turbo-panel-toggle" id="btn-turbo-panel-toggle">开启狂暴模式</button>
+  </div>
 
   <!-- ============ 主区 ============ -->
   <main class="main">
@@ -172,6 +209,7 @@
                 <button class="btn sm" id="btn-auto-save">保存</button>
               </div>
             </div>
+
 
             <div class="hint">
               引擎会自己判断「还缺什么」，每轮检索式都不重复。遇到合适的模型或数据集，会在预算内自主下载。
@@ -370,6 +408,50 @@
       </section>
 
       <!-- ---------- 分析 ---------- -->
+      <!-- ---------- 知识总结 ---------- -->
+      <section class="view" id="view-digest">
+        <div class="card" style="margin-bottom:14px">
+          <div class="card-title">按关键词总结所学<span class="tag">默认只用已证实知识</span></div>
+          <p class="hint">输入一个你感兴趣的概念（例如「负形」），EvoMind 会扩展同义检索词、从知识库召回相关条目、让模型逐条核对是否真的在讲这个概念，再把确认相关的知识整理成一份带引用编号的总结。</p>
+          <div class="rowflex" style="flex-wrap:wrap;margin-top:12px">
+            <input id="dg-keyword" placeholder="输入关键词，例如：负形" maxlength="60" style="flex:1;min-width:200px" />
+            <select id="dg-topic" style="max-width:240px"><option value="">全部方向</option></select>
+            <select id="dg-max" style="max-width:150px" title="进入核对的候选上限：越多越全，越慢">
+              <option value="60">候选 60 条（快）</option>
+              <option value="120" selected>候选 120 条</option>
+              <option value="200">候选 200 条（全）</option>
+            </select>
+            <button class="btn primary" id="btn-digest">开始总结</button>
+          </div>
+          <label class="hint dg-legacy"><input type="checkbox" id="dg-legacy" /> 同时包含历史未复核（legacy）知识——已证实知识太少时可勾选，结果会标注出处状态</label>
+          <div id="dg-progress" hidden style="margin-top:12px">
+            <div class="bar"><i id="dg-bar" style="width:0%"></i></div>
+            <div class="hint" id="dg-stage" role="status" aria-live="polite"></div>
+            <ol class="dg-log" id="dg-log"></ol>
+          </div>
+        </div>
+        <div class="grid dg-grid">
+          <div class="card" id="dg-result-card">
+            <div class="card-title"><span id="dg-title">总结结果</span>
+              <span class="dg-actions">
+                <button class="btn sm" id="btn-dg-copy" disabled>复制</button>
+                <button class="btn sm" id="btn-dg-export" disabled>导出 Markdown</button>
+              </span>
+            </div>
+            <div id="dg-meta" class="hint"></div>
+            <div id="dg-summary" class="dg-md"><div class="empty"><div class="big">✦</div>还没有总结。输入关键词后点「开始总结」。</div></div>
+            <details id="dg-refs-wrap" hidden style="margin-top:14px">
+              <summary class="hint" id="dg-refs-title">引用的知识条目</summary>
+              <div id="dg-refs"></div>
+            </details>
+          </div>
+          <div class="card">
+            <div class="card-title">历史总结</div>
+            <div id="dg-history"><div class="hint">暂无</div></div>
+          </div>
+        </div>
+      </section>
+
       <section class="view" id="view-analytics">
         <div class="an-bar">
           <div class="an-bar-l">
@@ -518,6 +600,7 @@
           <div class="an-search-row">
             <input id="an-q" placeholder="输入一个查询，看它命中了哪些知识点、匹配度多少" maxlength="200" />
             <button class="btn primary" id="btn-an-search">检索并解释</button>
+            <button class="btn" id="btn-an-digest" title="把这个关键词相关的全部已证实知识整理成一份完整报告">生成完整总结报告</button>
           </div>
           <div id="an-search" class="chart"></div>
           <div id="an-search-graph" class="chart an-search-graph"></div>
@@ -817,7 +900,24 @@ https://archive.org/details/lecture-2024"></textarea>
               调小更容易发现更新，但会重复付抓取与提炼的代价。
             </div>
             <label class="field">
-              <span>Brave 搜索 API Key（可选，强烈建议填）</span>
+              <span>向量近似索引（FAISS HNSW）</span>
+              <select id="cfg-ann">
+                <option value="0">关闭 · 全量精确比对（10 万条以下推荐）</option>
+                <option value="1">开启 · 近似检索（10 万条以上推荐）</option>
+              </select>
+            </label>
+            <div class="hint" style="margin-top:-6px">
+              实测 2.6 万条知识全量比对一次约 2 毫秒，暂时不需要开；到 10 万条量级再开，开启后会在后台建索引。
+            </div>
+            <label class="field">
+              <span>SearXNG 地址（本机免费聚合搜索，推荐）</span>
+              <input id="cfg-searxng" placeholder="例如 http://127.0.0.1:8888，留空则不用" />
+            </label>
+            <div class="hint" style="margin-top:-6px">
+              自己在 Docker 里跑的聚合搜索：同时问百度、搜狗、360、Google 等多个引擎，不要 Key、没有额度，被单个引擎限流时还有其他引擎顶上。
+            </div>
+            <label class="field">
+              <span>Brave 搜索 API Key（可选，付费）</span>
               <input id="cfg-search-key" placeholder="留空则只用免 Key 源（质量差一些）" />
             </label>
             <div class="hint" style="margin-top:-6px">
@@ -987,6 +1087,6 @@ https://archive.org/details/lecture-2024"></textarea>
     <div class="pdrawer-body" id="pt-body"></div>
   </aside>
 
-<script src="/static/app.js?v=21"></script>
+<script src="/static/app.js?v=23"></script>
 </body>
 </html>

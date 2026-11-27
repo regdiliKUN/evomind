@@ -152,8 +152,12 @@ class MemoryTests(IsolatedTest):
     def test_scale_warn_single_source_of_truth(self):
         """stats 与学习建议共用同一套阈值（重构后不能各写一份）"""
         self.assertEqual(memory.scale_warn(0), "")
-        self.assertIn("开始变慢", memory.scale_warn(5000))
-        self.assertIn("明显变慢", memory.scale_warn(20000))
+        # 实测 2.6 万条全量比对约 2ms：10 万条以下不再提示
+        self.assertEqual(memory.scale_warn(26074), "")
+        self.assertIn("近似索引", memory.scale_warn(100000))
+        config.update({"vector_ann_enabled": True})
+        self.assertEqual(memory.scale_warn(150000), "")
+        config.update({"vector_ann_enabled": False})
         stats = memory.stats()
         self.assertEqual(stats["scale_warn"], memory.scale_warn(stats["points"]))
 

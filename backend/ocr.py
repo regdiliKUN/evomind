@@ -381,9 +381,9 @@ def render_page(doc, page_no: int, dpi: int = DEFAULT_DPI,
     return (pix.tobytes("png") if need_png else b""), _pix_to_array(pix)
 
 
-def ocr_rapid(img_array) -> str:
-    """RapidOCR：按 y 坐标排序后合并成段落文本。"""
-    ocr = _rapid()
+def ocr_rapid(img_array, engine=None) -> str:
+    """RapidOCR：按 y 坐标排序后合并成段落文本。engine 不传就用全局单例。"""
+    ocr = engine or _rapid()
     res, _ = ocr(img_array)
     if not res:
         return ""
@@ -601,6 +601,57 @@ def ocr_page(book_id: str, page_no: int, engine: str = "rapid", dpi: int = DEFAU
     return {"ok": True, "page": page_no, "chars": len(text), "elapsed": round(elapsed, 1), "text": text}
 
 
+def finalize_book(c, book_id: str, engine: str, on_event: Event | None = None,
+                  *, quiet: bool = False) -> int:
+    """把已识别的页拼成章节；有效文字够多就把书目转为可导入状态。返回总字数。
+
+    整书 OCR 与狂暴模式的 CPU 后台 OCR 共用这一段，两边判定口径保持一致。
+    quiet=True 时只回调 on_event，不写进 OCR 页面的任务日志（后台任务用）。
+    """
+    def say(level: str, msg: str) -> None:
+        if quiet:
+            if on_event:
+                on_event(level, msg, {})
+        else:
+            _emit(on_event, level, msg)
+
+    # 汇总：把有文字的页拼成章节，让书目变成可导入状态
+    rows = c.execute(
+        "SELECT page_no, text FROM ocr_pages WHERE book_id=? AND chars>0 ORDER BY page_no",
+        (book_id,),
+    ).fetchall()
+    total_chars = sum(len(r["text"]) for r in rows)
+    avg = total_chars / max(1, len(rows))
+    if total_chars > 200:
+        c.execute("DELETE FROM book_chapters WHERE book_id=?", (book_id,))
+        # 每 10 页合并为一章，便于分段提炼
+        for idx, start in enumerate(range(0, len(rows), 10)):
+            group = rows[start:start + 10]
+            text = "\n\n".join(g["text"] for g in group)
+            title = f"第 {group[0]['page_no']+1}-{group[-1]['page_no']+1} 页"
+            c.execute(
+                "INSERT INTO book_chapters(book_id,idx,title,chars) VALUES (?,?,?,?)",
+                (book_id, idx, title, len(text)),
+            )
+        c.execute(
+            "UPDATE books SET status='ready', chars=?, skip_reason='' WHERE id=?",
+            (total_chars, book_id),
+        )
+        msg = f"识别完成：{len(rows)} 页有效，共 {total_chars} 字（平均 {avg:.0f} 字/页），已转为可导入状态"
+        say("ok", msg)
+        # 字数明显偏低，说明引擎可能识别不足（日文、表格、复杂版面尤其明显）
+        if avg < 150 and engine == "rapid":
+            say(
+                "warn",
+                f"平均每页只有 {avg:.0f} 字，识别可能不完整。"
+                "这本书建议改用「精细引擎」重识别，质量会明显更好",
+            )
+    else:
+        say("warn", f"识别完成但有效文字只有 {total_chars} 字，可能是纯图册")
+    c.commit()
+    return total_chars
+
+
 @tasks.exclusive("OCR")
 def ocr_book_async(
     book_id: str,
@@ -793,39 +844,7 @@ def ocr_book_async(
         if _task["stop"]:
             _emit(on_event, "warn", "收到停止指令，已中断（进度已保存，可续做）")
 
-        # 汇总：把有文字的页拼成章节，让书目变成可导入状态
-        rows = c.execute(
-            "SELECT page_no, text FROM ocr_pages WHERE book_id=? AND chars>0 ORDER BY page_no",
-            (book_id,),
-        ).fetchall()
-        total_chars = sum(len(r["text"]) for r in rows)
-        avg = total_chars / max(1, len(rows))
-        if total_chars > 200:
-            c.execute("DELETE FROM book_chapters WHERE book_id=?", (book_id,))
-            # 每 10 页合并为一章，便于分段提炼
-            for idx, start in enumerate(range(0, len(rows), 10)):
-                group = rows[start:start + 10]
-                text = "\n\n".join(g["text"] for g in group)
-                title = f"第 {group[0]['page_no']+1}-{group[-1]['page_no']+1} 页"
-                c.execute(
-                    "INSERT INTO book_chapters(book_id,idx,title,chars) VALUES (?,?,?,?)",
-                    (book_id, idx, title, len(text)),
-                )
-            c.execute(
-                "UPDATE books SET status='ready', chars=?, skip_reason='' WHERE id=?",
-                (total_chars, book_id),
-            )
-            msg = f"识别完成：{len(rows)} 页有效，共 {total_chars} 字（平均 {avg:.0f} 字/页），已转为可导入状态"
-            _emit(on_event, "ok", msg)
-            # 字数明显偏低，说明引擎可能识别不足（日文、表格、复杂版面尤其明显）
-            if avg < 150 and engine == "rapid":
-                _emit(
-                    on_event, "warn",
-                    f"平均每页只有 {avg:.0f} 字，识别可能不完整。"
-                    "这本书建议改用「精细引擎」重识别，质量会明显更好",
-                )
-        else:
-            _emit(on_event, "warn", f"识别完成但有效文字只有 {total_chars} 字，可能是纯图册")
+        finalize_book(c, book_id, engine, on_event)
         c.commit()
 
         with _task_lock:

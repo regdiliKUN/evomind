@@ -90,6 +90,12 @@ DEFAULTS: dict[str, Any] = {
     "rotation_boundary_check": True,       # 换方向前校验是否仍属于母方向语义范围
     "rotation_replenish": True,            # 子方向用尽时自动补充新的合法子方向
     "rotation_max_failures": 2,            # 连续多少批没推进就暂停（1-10）
+    # ---- 狂暴模式（挂机专用）----
+    # True = 检索/抓取/提炼并发放大、每轮数量翻倍、自学间隔 1 秒、模型常驻显存、
+    # 阻止系统睡眠并提高进程优先级。详见 backend/turbo.py。
+    "turbo_mode": False,
+    # 狂暴模式下是否让 CPU 在后台识别书库里的扫描版 PDF（见 backend/cpu_ocr.py）
+    "turbo_cpu_ocr": True,
     # ---- 资源自主下载 ----
     "auto_download": True,
     "disk_budget_gb": 200,           # 模型/数据集总占用上限
@@ -111,6 +117,9 @@ DEFAULTS: dict[str, Any] = {
     # 填一个免费 Key（2000 次/月）能显著提升检索质量。
     "search_api_key": "",
     "hf_endpoint": "",               # 可选 HF 镜像，如 https://hf-mirror.com
+    # 本机 SearXNG 聚合搜索（免费、无额度）。填了就作为检索源之一，
+    # 例如 http://127.0.0.1:8888；必须开启 JSON 输出（settings.yml 的 search.formats）。
+    "searxng_url": "",
     # ---- 多模态摄取（图片 / 音频 / 视频 / PDF）----
     # 默认开启：学习时除网页正文外，也会读 PDF、图表示意图、讲座音频与演示视频。
     # 关掉就回到纯文本模式，行为与改造前一致。
@@ -215,7 +224,7 @@ def _validated(patch: dict[str, Any]) -> dict[str, Any]:
             items = [x for x in value if isinstance(x, str)]
             clean[key] = [k for k in dict.fromkeys(items) if k in allowed]
             continue
-        if key in ("ollama_url", "proxy", "hf_endpoint") and value:
+        if key in ("ollama_url", "proxy", "hf_endpoint", "searxng_url") and value:
             from urllib.parse import urlsplit
 
             u = urlsplit(str(value))

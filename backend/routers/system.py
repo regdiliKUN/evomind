@@ -5,7 +5,7 @@ import time
 
 from fastapi import APIRouter, Body, HTTPException
 
-from .. import config, curriculum, downloader, evolve, finetune, llm, memory, scheduler, refinement
+from .. import config, curriculum, downloader, evolve, finetune, llm, memory, scheduler, refinement, turbo
 from ._common import APP_REVISION
 
 router = APIRouter()
@@ -31,6 +31,7 @@ def api_status() -> dict:
         "rotation": curriculum.state(),
         "refinement": refinement.state(),
         "auto": scheduler.state(),
+        "turbo": turbo.state(),
         "stats": memory.stats(),
         # checking=True 表示首次探测还没回来（Ollama 没启动时它会等满连接超时）。
         # 前端据此显示「检测中…」而不是直接判定「未连接」，避免第一帧误报。
@@ -61,9 +62,12 @@ def api_config_set(patch: dict = Body(...)) -> dict:
     clean = {k: v for k, v in patch.items()
              if k in allowed and not (k in config.SECRET_KEYS and v == config.SECRET_MASK)}
     try:
-        return config.update(clean)
+        out = config.update(clean)
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
+    if {"turbo_mode", "turbo_cpu_ocr"} & set(clean):
+        turbo.apply()  # 走通用配置接口改开关时，防睡眠 / 优先级也要跟着变
+    return out
 
 
 # --------------------------------------------------------------------------

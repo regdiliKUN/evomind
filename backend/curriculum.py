@@ -862,7 +862,15 @@ def _loop() -> None:
             return
         if _stop_evt.is_set() or not _state["active"]:
             break
-        _wake_evt.wait(0.5)
+        # 检索源被限流时等冷却结束再开下一批。原来批次一结束 0.5 秒就开新批，
+        # 新批第 1 轮又不看冷却（引擎只在 r>1 时检查），等于每隔几秒撞一次墙，
+        # 反而把退避越拉越长；实测 4 分钟里有 3 次「全部检索源返回空」。
+        cooldown = evolve.search_cooldown()
+        if cooldown > 0:
+            _emit("info", f"检索源限流冷却中，约 {int(cooldown // 60) + 1} 分钟后继续下一批")
+            _wake_evt.wait(cooldown)
+        else:
+            _wake_evt.wait(0.5)
         _wake_evt.clear()
 
     if _state["active"]:
